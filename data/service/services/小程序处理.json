@@ -1,0 +1,15 @@
+{
+    "service": "\u5c0f\u7a0b\u5e8f\u5904\u7406",
+    "docs": "\u5565b\u817e\u8baf\u5c0f\u7a0b\u5e8f\u7ed9\ud83d\udc74\u722a\u5df4\n\u76ee\u524d\u53ea\u6574\u4e86b\u7ad9\u7684\n",
+    "cmd_list": {
+        "\u5c0f\u7a0b\u5e8f\u68c0\u6d4b-onmsg": {
+            "type": "message",
+            "docs": "\u5c0f\u7a0b\u5e8f\u722a\u5df4",
+            "aliases": []
+        }
+    },
+    "enabled": true,
+    "only_admin": false,
+    "disable_user": [],
+    "disable_group": []
+}

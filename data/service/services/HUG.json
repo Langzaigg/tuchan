@@ -1,0 +1,15 @@
+{
+    "service": "HUG",
+    "docs": "",
+    "cmd_list": {
+        "hughug-onmsg": {
+            "type": "message",
+            "docs": "",
+            "aliases": []
+        }
+    },
+    "enabled": false,
+    "only_admin": false,
+    "disable_user": [],
+    "disable_group": []
+}

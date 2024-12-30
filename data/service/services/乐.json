@@ -1,0 +1,30 @@
+{
+    "service": "\u4e50",
+    "docs": "\n\u4e501\u4e50\uff0c\u83ab\u5f53\u771f\n",
+    "cmd_list": {
+        "\u6765\u53e5\u7b11\u8bdd": {
+            "type": "command",
+            "docs": "\u9690\u6666\u7684\u7b11\u8bdd...",
+            "aliases": []
+        },
+        "\u6211": {
+            "type": "regex",
+            "docs": "\u6211\u4e5f\u4e0d\u61c2\u548b\u89e3\u91ca",
+            "aliases": []
+        },
+        "/fakemsg": {
+            "type": "command",
+            "docs": "\u4f2a\u9020\u5047\u8f6c\u53d1\u5185\u5bb9\uff0c\u683c\u5f0f\uff1aqq-name-content\n\u53ef\u6784\u9020\u591a\u6761\uff0c\u4f7f\u7528\u7a7a\u683c\u9694\u5f00\uff0c\u4ec5\u9650\u7fa4\u804a",
+            "aliases": []
+        },
+        "\u5927?[\u4eca\u660e\u540e]\u5929(.*?)\u5403[\u4ec0\u5565]\u4e48?": {
+            "type": "regex",
+            "docs": "\u6211\u6765\u51b3\u5b9a\u4f60\u5403\u4ec0\u4e48\uff01",
+            "aliases": []
+        }
+    },
+    "enabled": false,
+    "only_admin": false,
+    "disable_user": [],
+    "disable_group": []
+}

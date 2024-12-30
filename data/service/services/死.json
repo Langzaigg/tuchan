@@ -1,0 +1,20 @@
+{
+    "service": "\u6b7b",
+    "docs": "\u7ed9\u6211\u6b7b",
+    "cmd_list": {
+        "\u6b7b-onmsg": {
+            "type": "message",
+            "docs": "",
+            "aliases": []
+        },
+        "cmm1cmm1-onmsg": {
+            "type": "message",
+            "docs": "",
+            "aliases": []
+        }
+    },
+    "enabled": false,
+    "only_admin": false,
+    "disable_user": [],
+    "disable_group": []
+}

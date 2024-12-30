@@ -1,0 +1,30 @@
+{
+    "service": "\u5c0f\u5de5\u5177",
+    "docs": "\n\u975e\u5e38\u5b9e\u7528\uff08\uff1f\uff09\u7684\u5de5\u5177\u4eec\uff01\n",
+    "cmd_list": {
+        "/roll": {
+            "type": "command",
+            "docs": "\u9ab0\u5b50~\u7528\u6cd5\uff1a1d10 \u6216 2d10+2d10+more",
+            "aliases": []
+        },
+        "\u52a0\u5bc6": {
+            "type": "command",
+            "docs": "\u6211\u4eec\u4e4b\u95f4\u7684\u79d8\u5bc6\u2764",
+            "aliases": []
+        },
+        "\u89e3\u5bc6": {
+            "type": "command",
+            "docs": "\u89e3\u5f00\u6211\u4eec\u7684\u79d8\u5bc6\u2764",
+            "aliases": []
+        },
+        "\u6da9\u6279\u4e00\u4e0b": {
+            "type": "command",
+            "docs": "\u5c06\u6b63\u5e38\u7684\u53e5\u5b50\u6da9\u4e00\u6da9~",
+            "aliases": []
+        }
+    },
+    "enabled": false,
+    "only_admin": false,
+    "disable_user": [],
+    "disable_group": []
+}
