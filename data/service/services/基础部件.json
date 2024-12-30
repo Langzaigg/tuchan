@@ -1,0 +1,50 @@
+{
+    "service": "\u57fa\u7840\u90e8\u4ef6",
+    "docs": "\n\u5bf9bot\u57fa\u7840/\u5fc5\u987b\u8bf7\u6c42\u8fdb\u884c\u5904\u7406\n",
+    "cmd_list": {
+        "\u597d\u53cb\u6dfb\u52a0-onreq": {
+            "type": "request",
+            "docs": "\u597d\u53cb\u6dfb\u52a0\u68c0\u6d4b",
+            "aliases": []
+        },
+        "\u9080\u8bf7\u5165\u7fa4-onreq": {
+            "type": "request",
+            "docs": "\u88ab\u9080\u8bf7\u5165\u7fa4\u68c0\u6d4b",
+            "aliases": []
+        },
+        "\u7fa4\u6210\u5458\u53d8\u52a8-onntc": {
+            "type": "notice",
+            "docs": "\u7fa4\u6210\u5458\u53d8\u52a8\u68c0\u6d4b",
+            "aliases": []
+        },
+        "\u7fa4\u7ba1\u7406\u53d8\u52a8-onntc": {
+            "type": "notice",
+            "docs": "\u7fa4\u7ba1\u7406\u53d8\u52a8\u68c0\u6d4b",
+            "aliases": []
+        },
+        "\u7fa4\u7981\u8a00\u53d8\u52a8-onntc": {
+            "type": "notice",
+            "docs": "\u7fa4\u7981\u8a00\u53d8\u52a8\u68c0\u6d4b",
+            "aliases": []
+        },
+        "\u64a4\u56de\u4e8b\u4ef6-onntc": {
+            "type": "notice",
+            "docs": "\u64a4\u56de\u4e8b\u4ef6\u68c0\u6d4b",
+            "aliases": []
+        },
+        "\u62d2\u7edd\u64a4\u56de": {
+            "type": "command",
+            "docs": "\u62d2\u7edd\u64a4\u56de\u4fe1\u606f",
+            "aliases": []
+        },
+        "\u63a5\u53d7\u64a4\u56de": {
+            "type": "command",
+            "docs": "\u63a5\u53d7\u64a4\u56de\u4fe1\u606f",
+            "aliases": []
+        }
+    },
+    "enabled": true,
+    "only_admin": false,
+    "disable_user": [],
+    "disable_group": []
+}

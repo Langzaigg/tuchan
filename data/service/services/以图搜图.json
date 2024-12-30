@@ -1,0 +1,15 @@
+{
+    "service": "\u4ee5\u56fe\u641c\u56fe",
+    "docs": "\n\u4ee5\u56fe\u641c\u56fe\uff0c\u4ec5\u9650\u4e8c\u523a\u8788\n",
+    "cmd_list": {
+        "\u4ee5\u56fe\u641c\u56fe": {
+            "type": "command",
+            "docs": "\u900f\u8fc7\u4e00\u5f20\u56fe\u641c\u7d22\u53ef\u80fd\u7684\u6765\u6e90",
+            "aliases": []
+        }
+    },
+    "enabled": true,
+    "only_admin": false,
+    "disable_user": [],
+    "disable_group": []
+}

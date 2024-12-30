@@ -1,0 +1,97 @@
+{
+    "service": "\u7ba1\u7406",
+    "docs": "\u63a7\u5236bot\u7684\u5404\u9879\u670d\u52a1",
+    "cmd_list": {
+        "\u5c01\u7981\u7528\u6237": {
+            "type": "command",
+            "docs": "\u5bf9\u76ee\u6807\u7528\u6237\u8fdb\u884c\u5c01\u7981",
+            "aliases": []
+        },
+        "\u89e3\u5c01\u7528\u6237": {
+            "type": "command",
+            "docs": "\u5bf9\u76ee\u6807\u7528\u6237\u8fdb\u884c\u89e3\u5c01",
+            "aliases": []
+        },
+        "\u5c01\u7981\u7fa4": {
+            "type": "command",
+            "docs": "\u5bf9\u76ee\u6807\u7fa4\u8fdb\u884c\u5c01\u7981",
+            "aliases": []
+        },
+        "\u89e3\u5c01\u7fa4": {
+            "type": "command",
+            "docs": "\u5bf9\u76ee\u6807\u7fa4\u8fdb\u884c\u89e3\u5c01",
+            "aliases": []
+        },
+        "\u5168\u5c40\u7981\u7528": {
+            "type": "command",
+            "docs": "\u5168\u5c40\u7981\u7528\u67d0\u670d\u52a1",
+            "aliases": []
+        },
+        "\u5168\u5c40\u542f\u7528": {
+            "type": "command",
+            "docs": "\u5168\u5c40\u542f\u7528\u67d0\u670d\u52a1",
+            "aliases": []
+        },
+        "\u5bf9\u7528\u6237(.*?)\u7981\u7528(.*)": {
+            "type": "regex",
+            "docs": "\u9488\u5bf9\u67d0\u4e00\u7528\u6237\u7981\u7528\u670d\u52a1",
+            "aliases": []
+        },
+        "\u5bf9\u7528\u6237(.*?)\u542f\u7528(.*)": {
+            "type": "regex",
+            "docs": "\u9488\u5bf9\u67d0\u4e00\u7528\u6237\u542f\u7528\u670d\u52a1",
+            "aliases": []
+        },
+        "\u7981\u7528": {
+            "type": "command",
+            "docs": "\u9488\u5bf9\u6240\u5728\u7fa4\u7981\u7528\u67d0\u670d\u52a1",
+            "aliases": []
+        },
+        "\u542f\u7528": {
+            "type": "command",
+            "docs": "\u9488\u5bf9\u6240\u5728\u7fa4\u542f\u7528\u67d0\u670d\u52a1",
+            "aliases": []
+        },
+        "\u83b7\u53d6\u597d\u53cb\u7533\u8bf7": {
+            "type": "command",
+            "docs": "\u83b7\u53d6\u597d\u53cb\u7533\u8bf7\u5217\u8868",
+            "aliases": []
+        },
+        "\u540c\u610f\u597d\u53cb": {
+            "type": "command",
+            "docs": "\u540c\u610f\u597d\u53cb\u7533\u8bf7",
+            "aliases": []
+        },
+        "\u62d2\u7edd\u597d\u53cb": {
+            "type": "command",
+            "docs": "\u62d2\u7edd\u597d\u53cb\u7533\u8bf7",
+            "aliases": []
+        },
+        "\u83b7\u53d6\u9080\u8bf7\u5217\u8868": {
+            "type": "command",
+            "docs": "\u83b7\u53d6\u7fa4\u9080\u8bf7\u5217\u8868",
+            "aliases": []
+        },
+        "\u540c\u610f\u9080\u8bf7": {
+            "type": "command",
+            "docs": "\u540c\u610f\u7fa4\u804a\u9080\u8bf7",
+            "aliases": []
+        },
+        "\u62d2\u7edd\u9080\u8bf7": {
+            "type": "command",
+            "docs": "\u62d2\u7edd\u7fa4\u804a\u9080\u8bf7",
+            "aliases": []
+        },
+        "\u8ffd\u8e2a": {
+            "type": "command",
+            "docs": "\u83b7\u53d6\u62a5\u9519\u4fe1\u606f\uff0c\u4f20\u5165\u8ffd\u8e2a\u7801",
+            "aliases": [
+                "/track"
+            ]
+        }
+    },
+    "enabled": true,
+    "only_admin": true,
+    "disable_user": [],
+    "disable_group": []
+}

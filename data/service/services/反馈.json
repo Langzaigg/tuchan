@@ -1,0 +1,18 @@
+{
+    "service": "\u53cd\u9988",
+    "docs": "\u5411\u7ef4\u62a4\u8005\u53d1\u9001\u6d88\u606f",
+    "cmd_list": {
+        "\u6765\u676f\u7ea2\u8336": {
+            "type": "command",
+            "docs": "\u5411\u7ef4\u62a4\u8005\u53d1\u9001\u6d88\u606f",
+            "aliases": [
+                "\u53cd\u9988",
+                "\u62a5\u544a"
+            ]
+        }
+    },
+    "enabled": false,
+    "only_admin": false,
+    "disable_user": [],
+    "disable_group": []
+}
