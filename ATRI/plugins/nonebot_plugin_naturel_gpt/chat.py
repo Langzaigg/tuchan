@@ -54,7 +54,7 @@ class Chat:
             prompt = (  # 以机器人的视角总结对话历史
                 f"{prev_summarized}[Chat]\n"
                 f"{history_str}"
-                f"\n\n{self.chat_preset.bot_self_introl}\nSummarize the chat in one paragraph from the perspective of '{self.chat_preset.preset_key}' and record as much important information as possible from the conversation:"
+                f"\n\n{self.chat_preset.bot_self_introl}\nSummarize the chat in one paragraph from the perspective of '{self.chat_preset.preset_key}' and record as much important information as possible from the conversation briefly within 80 words:"
             )
             # if config.DEBUG_LEVEL > 0: logger.info(f"生成对话历史摘要prompt: {prompt}")
             res, success = await tg.get_response(prompt, type='summarize')  # 生成新的对话历史摘要
@@ -90,7 +90,7 @@ class Chat:
             prompt = (   # 以机器人的视角总结对话
                 f"{prev_summarized}[Chat]\n"
                 f"{history_str}"
-                f"\n\n{self.chat_preset.bot_self_introl}\nUpdate {username} impressions from the perspective of {self.chat_preset.preset_key}:"
+                f"\n\n{self.chat_preset.bot_self_introl}\nUpdate {username} impressions from the perspective of {self.chat_preset.preset_key} briefly, only need to output new impressions within 80 words"
             )
             # if config.DEBUG_LEVEL > 0: logger.info(f"生成对话历史摘要prompt: {prompt}")
             res, success = await tg.get_response(prompt, type='summarize')  # 生成新的对话历史摘要
@@ -99,7 +99,7 @@ class Chat:
             else:
                 logger.error(f"生成对话印象摘要失败: {res}")
                 return
-            # logger.info(f"生成对话印象摘要: {global_preset_userdata[self.preset_key][userid]['chat_impression']}")
+            logger.info(f"生成对话印象摘要: {self.chat_preset.chat_impressions[userid]}")
             if config.DEBUG_LEVEL > 0: logger.info(f"印象生成消耗token数: {tg.cal_token_count(prompt + impression_data.chat_impression)}")
             # impression_data.chat_history = impression_data.chat_history[-config.CHAT_MEMORY_SHORT_LENGTH:]
             impression_data.chat_history = []   # 直接清空对话历史
@@ -218,7 +218,7 @@ class Chat:
         # say_prompt = f"(Multiple segment replies are separated by '*;', single quotes are not included, please only give the details of {self.chat_presets['preset_key']} response and do not give any irrelevant information)" if config.NG_ENABLE_MSG_SPLIT else ''
 
         rules = [   # 规则提示
-            "If the content of a reply is too long, please segment it in the appropriate place, use '*;' delimited(single quotes are not included)",
+            "If the reply includes many sentences, please segment it into up to 4 paragraphs in the appropriate place, use '*;' delimited(single quotes are not included)",
             # f"Only give the response content of {self.chat_presets['preset_key']} and do not carry any irrelevant information or the speeches of other members"
             # f"Please play the {self.chat_presets['preset_key']} role and only give the reply content of the {self.chat_presets['preset_key']} role, response needs to follow the role's setting and habits(Provided by the user)"
             (
