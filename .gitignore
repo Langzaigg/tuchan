@@ -149,3 +149,6 @@ requirements_*.txt
 *.ipynb
 (1)
 config.yml
+ATRI/plugins/nonebot_plugin_fortune/resource/out/*.png
+ATRI/plugins/nonebot_plugin_fortune/resource/*.json
+data/kalive/kalive.json
