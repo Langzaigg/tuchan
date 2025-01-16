@@ -72,14 +72,31 @@ async def response_zb(bot: Bot, event: MessageEvent, args: Message = CommandArg(
     if isinstance(event, GroupMessageEvent) and event.get_session_id().split("_")[1] == live_group:
         global kalive_dic
         if text := args.extract_plain_text():
-            p = text.split(maxsplit=2)
+            p = text.split(' ', 1)
             if len(p) == 2:
-                pl = kalive_dic['tv'].get(p[0],[0,'',0])
-                pl[1] = p[1]
-                pl[2] = 0
-                kalive_dic['tv'][p[0]] = pl
-                await bot.send_private_msg(user_id=event.get_session_id().split("_")[2], message=f"推流地址：rtmp://legend503.site:5005/live\n推流码：{p[0]}")
-                await talk_handle.finish(f"已将{p[0]}频道的标题设置为{p[1]}")
+                if p[1] == 'del':
+                    if p[0] in kalive_dic['tv']:
+                        del kalive_dic['tv'][p[0]]
+                        await talk_handle.finish(f"已删除{p[0]}频道信息")
+                    else:
+                        await talk_handle.finish(f"{p[0]}频道不存在")
+                else:
+                    if p[0] in kalive_dic['tv']:
+                        pl = kalive_dic['tv'].get(p[0],[0,'',0])
+                        pl[1] = p[1]
+                        if pl[0]:
+                            pl[2] = time.time()
+                        else:
+                            pl[2] = 0
+                        kalive_dic['tv'][p[0]] = pl
+                        await talk_handle.finish(f"已将{p[0]}频道的标题设置为{p[1]}")
+                    else:
+                        pl = kalive_dic['tv'].get(p[0],[0,'',0])
+                        pl[1] = p[1]
+                        pl[2] = 0
+                        kalive_dic['tv'][p[0]] = pl
+                        await bot.send_private_msg(user_id=event.get_session_id().split("_")[2], message=f"推流地址：rtmp://legend503.site:5005/live\n推流码：{p[0]}")
+                        await talk_handle.finish(f"已将{p[0]}频道的标题设置为{p[1]}")
             else:
                 await talk_handle.finish("请输入频道代码和频道标题名")
         else:
