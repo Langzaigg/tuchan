@@ -44,6 +44,8 @@ class Config(BaseModel, extra=Extra.ignore):
     """忽略前缀 以该前缀开头的消息将不会被处理"""
     CHAT_MODEL: str
     """OpenAI 模型"""
+    CHAT_MODEL_MINI: str
+    """OpenAI MINI模型"""
     CHAT_TOP_P: int
     CHAT_TEMPERATURE: float
     """温度越高越随机"""
@@ -216,7 +218,8 @@ CONFIG_TEMPLATE = {
         },
     },
     'IGNORE_PREFIX': '#',   # 忽略前缀 以该前缀开头的消息将不会被处理
-    'CHAT_MODEL': "gpt-3.5-turbo",
+    'CHAT_MODEL': "gpt-4o",
+    'CHAT_MODEL_MINI': "gpt-4o-mini",
     'CHAT_TOP_P': 1,
     'CHAT_TEMPERATURE': 0.4,    # 温度越高越随机
     'CHAT_PRESENCE_PENALTY': 0.4,   # 主题重复惩罚

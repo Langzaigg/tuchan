@@ -202,8 +202,8 @@ class CustomExtension(Extension):
                     f"This image was posted on Pixiv. "
                     f"{ai_pic_tip}"
                     f"In your response, you should provide a summary of the image information{output_tip}.\n"
-                    f"Title: pic.title"
-                    f"Author: pic.author"
+                    f"Title: {pic.title}"
+                    f"Author: {pic.author}"
                     f"{tags_tip}"
                 ),
             },
