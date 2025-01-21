@@ -42,6 +42,7 @@ if not config.CHAT_ENABLE_SUMMARY_CHAT:
 """ ======== 初始化对话文本生成器 ======== """
 TextGenerator.instance.init(api_keys=api_keys, config={
         'model': config.CHAT_MODEL,
+        'model_mini': config.CHAT_MODEL_MINI,
         'max_tokens': config.REPLY_MAX_TOKENS,
         'temperature': config.CHAT_TEMPERATURE,
         'top_p': config.CHAT_TOP_P,

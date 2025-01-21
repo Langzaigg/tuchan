@@ -77,7 +77,7 @@ class TextGenerator(Singleton["TextGenerator"]):
         """对话文本生成"""
         openai.api_key = key
         try:
-            if self.config['model'].startswith('gpt-3.5-turbo') or self.config['model'].startswith('gpt-4') or self.config['model'].startswith('claude') or self.config['model'].startswith('o1') or self.config['model'].startswith('gemini'):
+            if self.config['model'].startswith('gpt-3.5-turbo') or self.config['model'].startswith('gpt-4') or self.config['model'].startswith('claude') or self.config['model'].startswith('o1') or self.config['model'].startswith('gemini') or self.config['model'].startswith('deepseek'):
                 response = openai.ChatCompletion.create(
                     model=self.config['model'],
                     messages=prompt if isinstance(prompt, list) else [  # 如果是列表则直接使用，否则按照以下格式转换
@@ -132,7 +132,7 @@ class TextGenerator(Singleton["TextGenerator"]):
         openai.api_key = key
         try:
             response = openai.ChatCompletion.create(
-                model='gpt-4o-mini',
+                model= self.config['model_mini'],
                 messages=[
                     {'role': 'user', 'content': prompt},
                 ],
@@ -173,7 +173,7 @@ class TextGenerator(Singleton["TextGenerator"]):
         openai.api_key = key
         try:
             response = openai.ChatCompletion.create(
-                model='gpt-4o-mini',
+                model= self.config['model_mini'],
                 messages=[
                     {'role': 'user', 'content': prompt},
                 ],
