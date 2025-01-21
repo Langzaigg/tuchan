@@ -101,10 +101,11 @@ async def response_zb(bot: Bot, event: MessageEvent, args: Message = CommandArg(
                 await talk_handle.finish("请输入频道代码和频道标题名")
         else:
             res = ''
+            kalive_dic['ch'] = dict(sorted(kalive_dic['ch'].items(), key=lambda item: (item[1]['isLive'], item[1]['watcher'], item[1]['time']), reverse = True))
             for i in kalive_dic['ch'].keys():
                 if kalive_dic['ch'][i]['isLive']:
                     if kalive_dic['ch'][i]['watcher']:
-                        res += f"{kalive_dic['ch'][i]['watcher']}人正在观看，{i}频道直播了{get_time_interval(kalive_dic['ch'][i]['time'])}{kalive_dic['ch'][i]['title']}:http://legend503.site:5007/live/?id={i}\n"
+                        res += f"{i}频道直播了{get_time_interval(kalive_dic['ch'][i]['time'])}{kalive_dic['ch'][i]['title']}，{kalive_dic['ch'][i]['watcher']}人正在观看:http://legend503.site:5007/live/?id={i}\n"
                     else:
                         res += f"{i}频道直播了{get_time_interval(kalive_dic['ch'][i]['time'])}{kalive_dic['ch'][i]['title']}:http://legend503.site:5007/live/?id={i}\n"
                 elif kalive_dic['ch'][i]['time']:
