@@ -41,7 +41,7 @@ kalive_dic['last_time'] = time.time()
 
 driver = ATRI.driver()
 
-kalive_dic['tv'] = {'tv': [0,'卡动漫',time.time()]}
+kalive_dic['ch'] = {'tv': {'isLive': False, 'title': '卡动漫', 'time': time.time(), 'watcher': 0}}
 live_group = '149378291'
 live_admin = ['448489320', '1104155706', '619227931']
 
@@ -51,11 +51,11 @@ async def kalive_startup():
     try:
         with open(json_path, 'r', encoding="utf-8") as f:
             data = json.load(f)
-            if not isinstance(data, dict):
+            if not isinstance(data, dict) or 'ch' not in data:
                 log.info("已读取1条数据")
             else:
                 kalive_dic = data
-                log.info(f"已读取{len(kalive_dic['tv'])}条数据")
+                log.info(f"已读取{len(kalive_dic['ch'])}条数据")
     except:
         log.info("卡直播已初始化！")
 
@@ -64,7 +64,7 @@ async def kalive_shutdown():
     global kalive_dic
     with open(json_path, 'w', encoding="utf-8") as f:
         json.dump(kalive_dic, f)
-        log.info(f"已保存{len(kalive_dic['tv'])}条数据")
+        log.info(f"已保存{len(kalive_dic['ch'])}条数据")
 
 talk_handle = on_command('。直播', aliases={'.直播','。zb', '.zb'}, priority=9, block=True)
 @talk_handle.handle()
@@ -75,39 +75,42 @@ async def response_zb(bot: Bot, event: MessageEvent, args: Message = CommandArg(
             p = text.split(' ', 1)
             if len(p) == 2:
                 if p[1] == 'del':
-                    if p[0] in kalive_dic['tv']:
-                        del kalive_dic['tv'][p[0]]
+                    if p[0] in kalive_dic['ch']:
+                        del kalive_dic['ch'][p[0]]
                         await talk_handle.finish(f"已删除{p[0]}频道信息")
                     else:
                         await talk_handle.finish(f"{p[0]}频道不存在")
                 else:
-                    if p[0] in kalive_dic['tv']:
-                        pl = kalive_dic['tv'].get(p[0],[0,'',0])
-                        pl[1] = p[1]
-                        if pl[0]:
-                            pl[2] = time.time()
+                    if p[0] in kalive_dic['ch']:
+                        pl = kalive_dic['ch'].get(p[0],{'isLive': False, 'title': '', 'time': time.time(), 'watcher': 0})
+                        pl['title'] = p[1]
+                        if pl['isLive']:
+                            pl['time'] = time.time()
                         else:
-                            pl[2] = 0
-                        kalive_dic['tv'][p[0]] = pl
+                            pl['time'] = 0
+                        kalive_dic['ch'][p[0]] = pl
                         await talk_handle.finish(f"已将{p[0]}频道的标题设置为{p[1]}")
                     else:
-                        pl = kalive_dic['tv'].get(p[0],[0,'',0])
-                        pl[1] = p[1]
-                        pl[2] = 0
-                        kalive_dic['tv'][p[0]] = pl
+                        pl = kalive_dic['ch'].get(p[0],{'isLive': False, 'title': '', 'time': time.time(), 'watcher': 0})
+                        pl['title'] = p[1]
+                        pl['time'] = 0
+                        kalive_dic['ch'][p[0]] = pl
                         await bot.send_private_msg(user_id=event.get_session_id().split("_")[2], message=f"推流地址：rtmp://legend503.site:5005/live\n推流码：{p[0]}")
                         await talk_handle.finish(f"已将{p[0]}频道的标题设置为{p[1]}")
             else:
                 await talk_handle.finish("请输入频道代码和频道标题名")
         else:
             res = ''
-            for i in kalive_dic['tv'].keys():
-                if kalive_dic['tv'][i][0]:
-                    res += f"{i}频道直播了{get_time_interval(kalive_dic['tv'][i][2])}{kalive_dic['tv'][i][1]}:http://legend503.site:5007/live/?id={i}\n"
-                elif kalive_dic['tv'][i][2]:
-                    res += f"{i}频道的{kalive_dic['tv'][i][1]}直播结束于{get_time_interval(kalive_dic['tv'][i][2])}前\n"
+            for i in kalive_dic['ch'].keys():
+                if kalive_dic['ch'][i]['isLive']:
+                    if kalive_dic['ch'][i]['watcher']:
+                        res += f"{kalive_dic['ch'][i]['watcher']}人正在观看，{i}频道直播了{get_time_interval(kalive_dic['ch'][i]['time'])}{kalive_dic['ch'][i]['title']}:http://legend503.site:5007/live/?id={i}\n"
+                    else:
+                        res += f"{i}频道直播了{get_time_interval(kalive_dic['ch'][i]['time'])}{kalive_dic['ch'][i]['title']}:http://legend503.site:5007/live/?id={i}\n"
+                elif kalive_dic['ch'][i]['time']:
+                    res += f"{i}频道的{kalive_dic['ch'][i]['title']}直播结束于{get_time_interval(kalive_dic['ch'][i]['time'])}前\n"
                 else:
-                    res += f"{i}频道的{kalive_dic['tv'][i][1]}直播未开始\n"
+                    res += f"{i}频道的{kalive_dic['ch'][i]['title']}直播未开始\n"
             await talk_handle.finish(res.strip())
 
 
@@ -123,29 +126,52 @@ async def watch_live_log(bot: Bot, event: GroupMessageEvent):
     for line in new_lines if len(new_lines) < 50 else []:
         if 'rtmp publish' in line and 'New stream' in line:
             live_id = line.split('streamPath=/live/')[-1].split()[0]
-            pl = kalive_dic['tv'].get(live_id,[0,'',time.time()])
-            pl[2] = time.time()
-            pl[0] = 1
-            kalive_dic['tv'][live_id] = pl
-            await bot.send_group_msg(group_id=live_group, message=f"{live_id}频道开始直播{kalive_dic['tv'][live_id][1]}:http://legend503.site:5007/live/?id={live_id}")
+            pl = kalive_dic['ch'].get(live_id,{'isLive': False, 'title': '', 'time': time.time(), 'watcher': 0})
+            pl['time'] = time.time()
+            pl['isLive'] = True
+            kalive_dic['ch'][live_id] = pl
+            await bot.send_group_msg(group_id=live_group, message=f"{live_id}频道开始直播{kalive_dic['ch'][live_id]['title']}:http://legend503.site:5007/live/?id={live_id}")
 
         elif 'rtmp publish' in line and 'Close stream' in line:
             live_id = line.split('streamPath=/live/')[-1].split()[0]
-            pl = kalive_dic['tv'].get(live_id,[0,'',time.time()])
-            pl[2] = time.time()
-            if pl[0]:
-                pl[0] = 0
-                await bot.send_group_msg(group_id=live_group, message=f"{live_id}频道的{kalive_dic['tv'][live_id][1]}直播结束了")
-            kalive_dic['tv'][live_id] = pl
+            pl = kalive_dic['ch'].get(live_id,{'isLive': False, 'title': '', 'time': time.time(), 'watcher': 0})
+            pl['time'] = time.time()
+            if pl['isLive']:
+                pl['isLive'] = False
+                pl['watcher'] = 0
+                await bot.send_group_msg(group_id=live_group, message=f"{live_id}频道的{kalive_dic['ch'][live_id]['title']}直播结束了")
+            kalive_dic['ch'][live_id] = pl
+
+        elif 'play] Join stream' in line:
+            live_id = line.split('streamPath=/live/')[-1].split()[0]
+            pl = kalive_dic['ch'].get(live_id,{'isLive': True, 'title': '', 'time': time.time(), 'watcher': 0})
+            pl['watcher'] += 1
+            pl['isLive'] = True
+            kalive_dic['ch'][live_id] = pl
+
+        elif 'play] Close stream' in line:
+            live_id = line.split('streamPath=/live/')[-1].split()[0]
+            pl = kalive_dic['ch'].get(live_id,{'isLive': True, 'title': '', 'time': time.time(), 'watcher': 0})
+            if pl['isLive'] and pl['watcher']:
+                pl['watcher'] -= 1
+                kalive_dic['ch'][live_id] = pl
+
 
             
 
 def read_new_lines(file_path, start_position):
-    with open(file_path, 'r', encoding='utf-8') as file:
-        file.seek(start_position)  # 从上次读取的位置开始
-        lines = file.readlines()  # 读取所有行
-        current_position = file.tell()  # 获取当前位置
-        return lines, current_position
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            file.seek(start_position)  # 从上次读取的位置开始
+            lines = file.readlines()  # 读取所有行
+            current_position = file.tell()  # 获取当前位置
+            return lines, current_position
+    except:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            lines = file.readlines()  # 读取所有行
+            current_position = file.tell()  # 获取当前位置
+            return lines, current_position
+
     
 def get_time_interval(timestamp):
     # 获取当前时间
