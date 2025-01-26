@@ -45,6 +45,10 @@ class SauceNAO:
     key: str = config.get("key", "")
 
 
+class KaLiveConfig:
+    config: dict = config["KaLive"]
+
+
 class Setu:
     config: dict = config["Setu"]
 

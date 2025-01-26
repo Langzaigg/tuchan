@@ -268,7 +268,7 @@ async def do_msg_response(trigger_userid:str, trigger_text:str, is_tome:bool, ma
     # 判断是否需要回复
     if (    # 如果不是 bot 相关的信息，则直接返回
         wake_up or \
-        (config.REPLY_ON_NAME_MENTION and (chat.preset_key.lower() in trigger_text.lower())) or \
+        (random.random() < config.REPLY_ON_NAME_MENTION_PROBABILITY and (chat.preset_key.lower() in trigger_text.lower())) or \
         (config.REPLY_ON_AT and is_tome and '全体成员' not in trigger_text.lower())
     ):
         # 更新全局对话历史记录
