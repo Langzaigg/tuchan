@@ -63,7 +63,7 @@ class Config(BaseModel, extra=Extra.ignore):
     REQ_MAX_TOKENS: int
     """单次请求最大token数"""
 
-    REPLY_ON_NAME_MENTION: bool
+    REPLY_ON_NAME_MENTION_PROBABILITY: float
     """是否在被提及时回复"""
     REPLY_ON_AT: bool
     """是否在被at时回复"""
@@ -230,7 +230,7 @@ CONFIG_TEMPLATE = {
     'REPLY_MAX_TOKENS': 1024,   # 单次回复最大token数
     'REQ_MAX_TOKENS': 3072,  # 单次请求最大token数
 
-    'REPLY_ON_NAME_MENTION': True,  # 是否在被提及时回复
+    'REPLY_ON_NAME_MENTION_PROBABILITY': 0,  # 被提及时回复概率
     'REPLY_ON_AT': True,            # 是否在被at时回复
     'REPLY_ON_WELCOME': True,       # 是否在新成员加入时回复
 

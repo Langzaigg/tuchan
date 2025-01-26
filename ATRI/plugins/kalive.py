@@ -24,14 +24,15 @@ import ATRI
 import time, json
 from collections import deque
 from ATRI.log import logger as log
+from ATRI.config import KaLiveConfig
 from ATRI.utils.apscheduler import scheduler
 from nonebot.adapters.onebot.v11 import Adapter
 
 
 # 设置文件路径和读取间隔
-file_path = "D:\\nms\\server-logs\\nms-service.out.log"
+file_path = KaLiveConfig.config['log_path']
 json_path = './data/kalive/kalive.json'
-interval = 5  # 间隔5秒
+interval = KaLiveConfig.config['interval']  # 间隔5秒
 
 # 记录上次读取的位置
 global kalive_dic
@@ -42,8 +43,10 @@ kalive_dic['last_time'] = time.time()
 driver = ATRI.driver()
 
 kalive_dic['ch'] = {'tv': {'isLive': False, 'title': '卡动漫', 'time': time.time(), 'watcher': 0}}
-live_group = '149378291'
-live_admin = ['448489320', '1104155706', '619227931']
+live_group = KaLiveConfig.config['live_group']
+live_admin = KaLiveConfig.config['live_admin']
+live_url = KaLiveConfig.config['live_url']
+watch_url = KaLiveConfig.config['watch_url']
 
 @driver.on_startup
 async def kalive_startup():
@@ -95,7 +98,7 @@ async def response_zb(bot: Bot, event: MessageEvent, args: Message = CommandArg(
                         pl['title'] = p[1]
                         pl['time'] = 0
                         kalive_dic['ch'][p[0]] = pl
-                        await bot.send_private_msg(user_id=event.get_session_id().split("_")[2], message=f"推流地址：rtmp://legend503.site:5005/live\n推流码：{p[0]}")
+                        await bot.send_private_msg(user_id=event.get_session_id().split("_")[2], message=f"推流地址：{live_url}\n推流码：{p[0]}")
                         await talk_handle.finish(f"已将{p[0]}频道的标题设置为{p[1]}")
             else:
                 await talk_handle.finish("请输入频道代码和频道标题名")
@@ -105,9 +108,9 @@ async def response_zb(bot: Bot, event: MessageEvent, args: Message = CommandArg(
             for i in kalive_dic['ch'].keys():
                 if kalive_dic['ch'][i]['isLive']:
                     if kalive_dic['ch'][i]['watcher']:
-                        res += f"{i}频道直播了{get_time_interval(kalive_dic['ch'][i]['time'])}{kalive_dic['ch'][i]['title']}，{kalive_dic['ch'][i]['watcher']}人正在观看:http://legend503.site:5007/live/?id={i}\n"
+                        res += f"{i}频道直播了{get_time_interval(kalive_dic['ch'][i]['time'])}{kalive_dic['ch'][i]['title']}，{kalive_dic['ch'][i]['watcher']}人正在观看:{watch_url}/?id={i}\n"
                     else:
-                        res += f"{i}频道直播了{get_time_interval(kalive_dic['ch'][i]['time'])}{kalive_dic['ch'][i]['title']}:http://legend503.site:5007/live/?id={i}\n"
+                        res += f"{i}频道直播了{get_time_interval(kalive_dic['ch'][i]['time'])}{kalive_dic['ch'][i]['title']}:{watch_url}/?id={i}\n"
                 elif kalive_dic['ch'][i]['time']:
                     res += f"{i}频道的{kalive_dic['ch'][i]['title']}直播结束于{get_time_interval(kalive_dic['ch'][i]['time'])}前\n"
                 else:
@@ -131,7 +134,7 @@ async def watch_live_log(bot: Bot, event: GroupMessageEvent):
             pl['time'] = time.time()
             pl['isLive'] = True
             kalive_dic['ch'][live_id] = pl
-            await bot.send_group_msg(group_id=live_group, message=f"{live_id}频道开始直播{kalive_dic['ch'][live_id]['title']}:http://legend503.site:5007/live/?id={live_id}")
+            await bot.send_group_msg(group_id=live_group, message=f"{live_id}频道开始直播{kalive_dic['ch'][live_id]['title']}:{watch_url}/?id={live_id}")
 
         elif 'rtmp publish' in line and 'Close stream' in line:
             live_id = line.split('streamPath=/live/')[-1].split()[0]
