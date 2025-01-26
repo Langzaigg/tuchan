@@ -211,11 +211,11 @@ async def _group_invite(bot: Bot, event: GroupRequestEvent):
 group_member_event = Essential().on_notice("群成员变动", "群成员变动检测")
 
 
-@group_member_event.handle()
-async def _group_member_join(bot: Bot, event: GroupIncreaseNoticeEvent):
-    await asyncio.sleep(randint(1, 6))
-    msg = "好欸！事新人！\n" f"在下 {choice(list(BotSelfConfig.nickname))} 哒!w!"
-    await group_member_event.finish(msg)
+# @group_member_event.handle()
+# async def _group_member_join(bot: Bot, event: GroupIncreaseNoticeEvent):
+#     await asyncio.sleep(randint(1, 6))
+#     msg = "好欸！事新人！\n" f"在下 {choice(list(BotSelfConfig.nickname))} 哒!w!"
+#     await group_member_event.finish(msg)
 
 
 @group_member_event.handle()
