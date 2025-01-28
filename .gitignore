@@ -152,3 +152,5 @@ config.yml
 ATRI/plugins/nonebot_plugin_fortune/resource/out/*.png
 ATRI/plugins/nonebot_plugin_fortune/resource/*.json
 data/kalive/kalive.json
+data/database/essential/*.json
+data/database/manege/*.json
