@@ -5,13 +5,14 @@ from nonebot.adapters import Message
 from nonebot.params import CommandArg
 import requests
 
-default_api = 'fastgpt-b9cqyYtmwcjznDToughbDzkBD24e2G5s1CjzwKyF7z0iVNI6H8AX'
+default_api = 'app-SkEnMkojTE9AruVQqo9nWKAL'
 api_dic = {'dnd':'fastgpt-zamtZ3rk5w4OSm5EAmFAt8krK3QjShAG5cZLRiDQs5As2lk8xn6PtWWDvy0Gt',
            '旮旯':'fastgpt-r49xAjzWWMzYgmOTcGEwNFkhPcwv4MTzZ30EDW10rwNoQUv0MxQP',
            '5e':'fastgpt-nRhwhRcGIqWDmzdcXt95UeRfJUj7YoYf4RKTPKkBlVjVmjDkn1ib',
            '测试':'fastgpt-jnlpcbXrQLHoTKqBGe1bovpgryk4if33WNJt9KLvHbILhbdRezsy3ApRRJfqdbM',
            'bing': 'fastgpt-nzcYPcwIs5sLCx5I2CJFY8L9YenYQFdgHn2RKTYwFje02dU1AgtlbbX94W'}
 group_api = {}
+cid_dic = {}
 
 # talk_handle = on_command('.t',aliases={'.T',"。t","。T"}, priority=7, block=True)
 # @talk_handle.handle()
@@ -44,9 +45,45 @@ group_api = {}
 #             await ts_handle.finish(f'已设置对话{chat_key}的预设为{text}')
 #     else:
 #         await ts_handle.finish("请输入APIKEY或者预设名")
+    
+
+
+talk_handle = on_command('.t',aliases={'.T',"。t","。T"}, priority=7, block=True)
+@talk_handle.handle()
+async def response_a_talk(event: MessageEvent, args: Message = CommandArg()):
+    if isinstance(event, GroupMessageEvent):
+        chat_key = 'group_' + event.get_session_id().split("_")[1]
+    elif isinstance(event, PrivateMessageEvent):
+        chat_key = 'private_' + event.get_user_id()
+    if text := args.extract_plain_text():
+        api_key = group_api.get(chat_key, default_api)
+        cid = cid_dic.get(chat_key, '')
+        ans, cid = dify(text, chat_key, api_key, cid)
+        cid_dic[chat_key] = cid
+        await talk_handle.finish(remove_markers(ans))
+    else:
+        await talk_handle.finish("你想说什么")
+
+ts_handle = on_command('.ts',aliases={'.Ts',"。ts","。Ts"}, priority=8, block=True)
+@ts_handle.handle()
+async def response_a_ts(event: MessageEvent, args: Message = CommandArg()):
+    if isinstance(event, GroupMessageEvent):
+        chat_key = 'group_' + event.get_session_id().split("_")[1]
+    elif isinstance(event, PrivateMessageEvent):
+        chat_key = 'private_' + event.get_user_id()
+    global group_api
+    if text := args.extract_plain_text():
+        if 'fastgpt' in text:
+            group_api[chat_key] = text
+            await ts_handle.finish(f'已设置对话{chat_key}的APIKEY为{text}')
+        else:
+            group_api[chat_key] = api_dic.get(text, default_api)
+            await ts_handle.finish(f'已设置对话{chat_key}的预设为{text}')
+    else:
+        await ts_handle.finish("请输入APIKEY或者预设名")
 
 def remove_markers(text):
-    return text.replace('**', '').replace('###', '')
+    return text.replace('**', '').replace('###', '').replace('---', '').strip()
 
 def fastgpt(question, id = '1234', apikey = default_api, apiurl='http://localhost:3000/api/v1/chat/completions'):
     headers = {
@@ -70,3 +107,22 @@ def fastgpt(question, id = '1234', apikey = default_api, apiurl='http://localhos
     if isinstance(res, str):
         return res
     return res[-1].get('text').get('content')
+
+
+def dify(question, user = '1234', apikey = default_api, cid = '', apiurl='http://localhost:4080/v1/chat-messages'):
+    headers = {
+        'Authorization': f'Bearer {apikey}',
+        'Content-Type': 'application/json'
+    }
+    data = {
+        "inputs" : {},
+        "query": question,
+        "user": user,
+        "conversation_id": cid,
+        "response_mode": "blocking",
+    }
+    response = requests.post(apiurl, headers=headers, json=data)
+    print(response.json())
+    res = response.json().get('answer')
+    cid = response.json().get('conversation_id')
+    return res, cid
