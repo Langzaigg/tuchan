@@ -1,4 +1,4 @@
-from nonebot import on_command, on_regex, on_message
+from nonebot import on_command, on_regex, on_message, get_bot, require
 import nonebot
 from nonebot.permission import SUPERUSER
 from nonebot.message import run_preprocessor
@@ -118,13 +118,62 @@ async def response_zb(bot: Bot, event: MessageEvent, args: Message = CommandArg(
             await talk_handle.finish(res.strip())
 
 
-watch = on_message(priority=80, block=False)
-@watch.handle()
-async def watch_live_log(bot: Bot, event: GroupMessageEvent):
-    # 读取新行和更新位置
-    if time.time() - kalive_dic['last_time'] < 10:
-        return
-    kalive_dic['last_time'] = time.time()
+# watch = on_message(priority=80, block=False)
+# @watch.handle()
+# async def watch_live_log(bot: Bot, event: GroupMessageEvent):
+#     # 读取新行和更新位置
+#     if time.time() - kalive_dic['last_time'] < 10:
+#         return
+#     kalive_dic['last_time'] = time.time()
+#     new_lines, kalive_dic['last_position'] = read_new_lines(file_path, kalive_dic['last_position'])
+#     # 更新deque
+#     for line in new_lines if len(new_lines) < 50 else []:
+#         if 'rtmp publish' in line and 'New stream' in line:
+#             live_id = line.split('streamPath=/live/')[-1].split()[0]
+#             pl = kalive_dic['ch'].get(live_id,{'isLive': False, 'title': '', 'time': time.time(), 'watcher': 0})
+#             pl['time'] = time.time()
+#             pl['isLive'] = True
+#             kalive_dic['ch'][live_id] = pl
+#             await bot.send_group_msg(group_id=live_group, message=f"{live_id}频道开始直播{kalive_dic['ch'][live_id]['title']}:{watch_url}/?id={live_id}")
+
+#         elif 'rtmp publish' in line and 'Close stream' in line:
+#             live_id = line.split('streamPath=/live/')[-1].split()[0]
+#             pl = kalive_dic['ch'].get(live_id,{'isLive': False, 'title': '', 'time': time.time(), 'watcher': 0})
+#             pl['time'] = time.time()
+#             if pl['isLive']:
+#                 pl['isLive'] = False
+#                 pl['watcher'] = 0
+#                 await bot.send_group_msg(group_id=live_group, message=f"{live_id}频道的{kalive_dic['ch'][live_id]['title']}直播结束了")
+#             kalive_dic['ch'][live_id] = pl
+
+#         elif 'play] Join stream' in line:
+#             live_id = line.split('streamPath=/live/')[-1].split()[0]
+#             pl = kalive_dic['ch'].get(live_id,{'isLive': True, 'title': '', 'time': time.time(), 'watcher': 0})
+#             pl['watcher'] += 1
+#             pl['isLive'] = True
+#             kalive_dic['ch'][live_id] = pl
+
+#         elif 'play] Close stream' in line:
+#             live_id = line.split('streamPath=/live/')[-1].split()[0]
+#             pl = kalive_dic['ch'].get(live_id,{'isLive': True, 'title': '', 'time': time.time(), 'watcher': 0})
+#             if pl['isLive'] and pl['watcher']:
+#                 pl['watcher'] -= 1
+#                 kalive_dic['ch'][live_id] = pl
+
+async def watch_kalive_log() -> None:
+    """
+    @description  :
+    检查数据库中所有主播的开播状态
+    如果关注的主播开播，则通知所有关注的用户
+    如果主播开播状态改变,则更新数据库
+    ---------
+    @param  :
+    -------
+    @Returns  :
+    -------
+    """
+    
+    sched_bot = nonebot.get_bot()
     new_lines, kalive_dic['last_position'] = read_new_lines(file_path, kalive_dic['last_position'])
     # 更新deque
     for line in new_lines if len(new_lines) < 50 else []:
@@ -134,7 +183,7 @@ async def watch_live_log(bot: Bot, event: GroupMessageEvent):
             pl['time'] = time.time()
             pl['isLive'] = True
             kalive_dic['ch'][live_id] = pl
-            await bot.send_group_msg(group_id=live_group, message=f"{live_id}频道开始直播{kalive_dic['ch'][live_id]['title']}:{watch_url}/?id={live_id}")
+            await sched_bot.send_group_msg(group_id=live_group, message=f"{live_id}频道开始直播{kalive_dic['ch'][live_id]['title']}:{watch_url}/?id={live_id}")
 
         elif 'rtmp publish' in line and 'Close stream' in line:
             live_id = line.split('streamPath=/live/')[-1].split()[0]
@@ -143,7 +192,7 @@ async def watch_live_log(bot: Bot, event: GroupMessageEvent):
             if pl['isLive']:
                 pl['isLive'] = False
                 pl['watcher'] = 0
-                await bot.send_group_msg(group_id=live_group, message=f"{live_id}频道的{kalive_dic['ch'][live_id]['title']}直播结束了")
+                await sched_bot.send_group_msg(group_id=live_group, message=f"{live_id}频道的{kalive_dic['ch'][live_id]['title']}直播结束了")
             kalive_dic['ch'][live_id] = pl
 
         elif 'play] Join stream' in line:
@@ -159,13 +208,14 @@ async def watch_live_log(bot: Bot, event: GroupMessageEvent):
             if pl['isLive'] and pl['watcher']:
                 pl['watcher'] -= 1
                 kalive_dic['ch'][live_id] = pl
-
-
+                
             
 
 def read_new_lines(file_path, start_position):
     try:
         with open(file_path, 'r', encoding='utf-8') as file:
+            if file.seek(0,2) < start_position:
+                start_position = 0
             file.seek(start_position)  # 从上次读取的位置开始
             lines = file.readlines()  # 读取所有行
             current_position = file.tell()  # 获取当前位置
@@ -175,6 +225,12 @@ def read_new_lines(file_path, start_position):
             lines = file.readlines()  # 读取所有行
             current_position = file.tell()  # 获取当前位置
             return lines, current_position
+
+
+
+require("nonebot_plugin_apscheduler")
+from nonebot_plugin_apscheduler import scheduler
+scheduler.add_job(watch_kalive_log, "interval", minutes=0.1, id="kalive_watch", misfire_grace_time=10)
 
     
 def get_time_interval(timestamp):
