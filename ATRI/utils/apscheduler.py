@@ -26,9 +26,9 @@ async def _start_scheduler():
 if apscheduler_autostart:
     driver.on_startup(_start_scheduler)
 
-aps_logger = logging.getLogger("apscheduler")
-aps_logger.setLevel(logging.DEBUG)
-aps_logger.handlers.clear()
-aps_logger.addHandler(LoguruHandler())
+# aps_logger = logging.getLogger("apscheduler")
+# aps_logger.setLevel(logging.DEBUG)
+# aps_logger.handlers.clear()
+# aps_logger.addHandler(LoguruHandler())
 
 from apscheduler.triggers.date import DateTrigger
