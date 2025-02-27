@@ -10,7 +10,7 @@ from .Extension import Extension
 # 扩展的配置信息，用于 AI 理解扩展的功能
 ext_config = {
     # 扩展名称，用于标识扩展，尽量简短
-    "name": "lolicon_search",
+    "name": "pixiv_search",
     # 填写期望的参数类型，尽量使用简单类型，便于 AI 理解含义使用
     # 注意：实际接收到的参数类型为 str (由 AI 生成)，需要自行转换
     "arguments": {
@@ -22,8 +22,8 @@ ext_config = {
         "Retrieve anime image details through Lolicon API. "
         "Call this extension when you want to send an image. "
         'You can specify succinct precise Chinese tags (without "#") to search for a specific image, '
-        'such as "/#lolicon_search&萝莉,白丝|黑丝#/" for images with "萝莉" AND ("白丝" OR "黑丝") tags. '
-        'Alternatively, use "/#lolicon_search&random#/" to obtain a random image.'
+        'such as "/#pixiv_search&萝莉,白丝|黑丝#/" for images with "萝莉" AND ("白丝" OR "黑丝") tags. '
+        'Alternatively, use "/#pixiv_search&random#/" to obtain a random image.'
     ),
     # 参考词，用于上下文参考使用，为空则每次都会被参考 (消耗 token)
     "refer_word": ['图','setu'],
@@ -135,7 +135,7 @@ class CustomExtension(Extension):
                         "https://api.lolicon.app/setu/v2",
                         json=dict_del_none(
                             {
-                                "tag": tags[0],
+                                "tag": tags[-1],
                                 "num": 1,
                                 "r18": self.r18,
                                 "proxy": self.pic_proxy,

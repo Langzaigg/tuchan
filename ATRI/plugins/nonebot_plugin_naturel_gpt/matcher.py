@@ -379,7 +379,7 @@ async def do_msg_response(trigger_userid:str, trigger_text:str, is_tome:bool, ma
     if config.NG_ENABLE_MSG_SPLIT:
         # 提取后去除所有扩展调用指令并切分信息，剩余部分为对话结果 多行匹配
         talk_res = re.sub(r"/.?#(.+?)#.?/", '*;', talk_res)
-        reply_list.extend(talk_res.split('*;'))
+        reply_list.extend(talk_res.replace('*；','*;').split('*;'))
     else:
         # 提取后去除所有扩展调用指令，剩余部分为对话结果 多行匹配
         talk_res = re.sub(r"/.?#(.+?)#.?/", '', talk_res)
