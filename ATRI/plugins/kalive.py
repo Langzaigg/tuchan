@@ -173,7 +173,6 @@ async def watch_kalive_log() -> None:
     -------
     """
     
-    sched_bot = nonebot.get_bot()
     new_lines, kalive_dic['last_position'] = read_new_lines(file_path, kalive_dic['last_position'])
     # 更新deque
     for line in new_lines if len(new_lines) < 50 else []:
@@ -183,6 +182,7 @@ async def watch_kalive_log() -> None:
             pl['time'] = time.time()
             pl['isLive'] = True
             kalive_dic['ch'][live_id] = pl
+            sched_bot = nonebot.get_bot()
             await sched_bot.send_group_msg(group_id=live_group, message=f"{live_id}频道开始直播{kalive_dic['ch'][live_id]['title']}:{watch_url}/?id={live_id}")
 
         elif 'rtmp publish' in line and 'Close stream' in line:
@@ -192,6 +192,7 @@ async def watch_kalive_log() -> None:
             if pl['isLive']:
                 pl['isLive'] = False
                 pl['watcher'] = 0
+                sched_bot = nonebot.get_bot()
                 await sched_bot.send_group_msg(group_id=live_group, message=f"{live_id}频道的{kalive_dic['ch'][live_id]['title']}直播结束了")
             kalive_dic['ch'][live_id] = pl
 

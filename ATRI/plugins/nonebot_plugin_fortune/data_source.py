@@ -3,6 +3,8 @@ import random
 from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
+from PIL import Image
+import io
 
 from .config import DateTimeEncoder, FortuneThemesDict, fortune_config
 from .utils import drawing, theme_flag_check
@@ -77,16 +79,27 @@ class FortuneManager:
         if not self._multi_divine_check(gid, uid, now_time):
             try:
                 img_path = drawing(gid, uid, theme, spec_path)
+                pimg = Image.open(img_path)
+                img_bytes = io.BytesIO()
+                pimg.save(img_bytes, format="PNG")
+
             except Exception as e:
                 print('----------',e)
                 return True, None
 
             # Record the sign-in time
             self._end_data_handle(gid, uid, now_time)
-            return True, img_path
+            return True, img_bytes
         else:
-            img_path: Path = fortune_config.fortune_path / "out" / f"{gid}_{uid}.png"
-            return False, img_path
+            try:
+                img_path: Path = fortune_config.fortune_path / "out" / f"{gid}_{uid}.png"
+                pimg = Image.open(img_path)
+                img_bytes = io.BytesIO()
+                pimg.save(img_bytes, format="PNG")
+                return False, img_bytes
+            except Exception as e:
+                    print('----------',e)
+                    return False, None
 
     @staticmethod
     def clean_out_pics() -> None:
