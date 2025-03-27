@@ -135,7 +135,7 @@ class CustomExtension(Extension):
                         "https://api.lolicon.app/setu/v2",
                         json=dict_del_none(
                             {
-                                "tag": tags[-1],
+                                "tag": tags[0],
                                 "num": 1,
                                 "r18": self.r18,
                                 "proxy": self.pic_proxy,
