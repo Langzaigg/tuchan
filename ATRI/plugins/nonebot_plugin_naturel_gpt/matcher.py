@@ -445,7 +445,7 @@ async def do_msg_response(trigger_userid:str, trigger_text:str, is_tome:bool, ma
         # 判断回复内容是否为str
         if isinstance(reply, str):
             # 判断文本内容是否为纯符号(包括空格，换行、英文标点、中文标点)并且长度小于3
-            reply_text = str(reply).strip()
+            reply_text = str(reply).strip().rstrip('。')
             if re.match(r'^[^\u4e00-\u9fa5\w]{1}$', reply_text) or len(reply_text) < 1:
                 if config.DEBUG_LEVEL > 0: logger.info(f"检测到纯符号或空文本: {reply_text}，跳过发送...")
                 continue
@@ -460,7 +460,7 @@ async def do_msg_response(trigger_userid:str, trigger_text:str, is_tome:bool, ma
                     continue
                 
                 reply_content = reply.get(key)
-                reply_text = str(reply_content).strip() if isinstance(reply_content, str) else ''
+                reply_text = str(reply_content).strip().rstrip('。') if isinstance(reply_content, str) else ''
                 if key == 'text': # 发送普通文本
                     # 判断文本内容是否为纯符号(包括空格，换行、英文标点、中文标点)并且长度为1
                     if re.match(r'^[^\u4e00-\u9fa5\w]{1}$', reply_text):

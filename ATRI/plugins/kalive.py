@@ -21,7 +21,9 @@ from nonebot.adapters.onebot.v11 import (
 )
 
 import ATRI
-import time, json
+import time, json, random, os, io, datetime
+
+from PIL import Image
 from collections import deque
 from ATRI.log import logger as log
 from ATRI.config import KaLiveConfig
@@ -32,7 +34,9 @@ from nonebot.adapters.onebot.v11 import Adapter
 # 设置文件路径和读取间隔
 file_path = KaLiveConfig.config['log_path']
 json_path = './data/kalive/kalive.json'
+jrlp_path = 'Z:/upload/图片/今日老婆'
 interval = KaLiveConfig.config['interval']  # 间隔5秒
+ddns_url = KaLiveConfig.config['ddns_url']
 
 # 记录上次读取的位置
 global kalive_dic
@@ -47,6 +51,61 @@ live_group = KaLiveConfig.config['live_group']
 live_admin = KaLiveConfig.config['live_admin']
 live_url = KaLiveConfig.config['live_url']
 watch_url = KaLiveConfig.config['watch_url']
+
+def jrlp(folder_path, c = ''):
+    # 定义支持的图片后缀
+    image_extensions = {'.jpg', '.jpeg', '.png'}
+    characters = []
+    chadic = {}
+
+    # 遍历文件夹中的文件
+    for filename in os.listdir(folder_path):
+        # 分割文件名与扩展名
+        basename, ext = os.path.splitext(filename)
+        ext = ext.lower()
+        if ext not in image_extensions:
+            continue  # 跳过非图片文件 [[12]]
+
+        # 分割角色名和后缀（按第一个下划线分割）
+        parts = basename.split('_', 1)
+        character = parts[0]
+        chapath = os.path.join(folder_path, filename)
+
+        if character in characters:
+            chadic[character].append(chapath)
+        else:
+            characters.append(character)
+            chadic[character]=[chapath]
+
+    if not characters:
+        return None  # 没有符合条件的文件
+
+    # 随机选择一个条目
+    selected = random.choice(characters)
+    if c and c in characters:
+        selected = c
+    return random.choice(chadic[selected]), selected
+
+global jrlp_dic
+jrlp_dic = {}
+
+jrlp_handle = on_command('。jrlp', aliases={'.jrlp','。今日老婆', '.今日老婆'}, priority=8, block=True)
+@jrlp_handle.handle()
+async def response_jrlp(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+    uid = event.user_id
+    now = datetime.datetime.now()
+    if c:= args.extract_plain_text():
+        img_path, cha = jrlp(jrlp_path, c)
+    elif uid in jrlp_dic and jrlp_dic[uid][1] == now.day:
+        img_path, cha = jrlp(jrlp_path, jrlp_dic[uid][0])
+    else:
+        img_path, cha = jrlp(jrlp_path)
+    jrlp_dic[uid]= [cha, now.day]
+    res = f'今天的你是{cha}粉丝！\n'
+    await jrlp_handle.finish(MessageSegment.text(res) + MessageSegment.image(img_path), at_sender = True)
+
+
+
 
 @driver.on_startup
 async def kalive_startup():
@@ -264,6 +323,17 @@ async def response_sbhsk(bot: Bot, event: MessageEvent, args: Message = CommandA
                 res += f"\n\n内存总量：{memo_info['memory_total']}，已使用：{memo_info['memory_used']}，使用率：{memo_info['memory_percent']}%"
                 res += f"\n\n上次登录用户：{log_info[-1]['name']}，登录ip：{log_info[-1]['host']}，时间：{log_info[-1]['started']}"
                 await bot.send_private_msg(user_id=event.get_session_id().split("_")[2], message=res.strip())
+            if 'ddns' in text:
+                ip, status =  ip_ddns()
+                res = f"IP:{ip}"
+                if status == 'good':
+                    res += '\nDDNS已更新'
+                elif status == 'nochg':
+                    res += '\nDDNS未变化'
+                else:
+                    res += f'\n花生壳报错{status}'
+                await bot.send_private_msg(user_id=event.get_session_id().split("_")[2], message=res.strip())
+
             
         else:
             res = ip_ad()
@@ -374,5 +444,9 @@ def logined_users():
 
 import requests
 def ip_ad():
-    res = requests.get('http://myip.ipip.net', timeout=5).text
+    res = requests.get('http://myip.ipip.net', timeout=1).text
     return res
+
+def ip_ddns():
+    res = requests.get(ddns_url, timeout=1).text.split()
+    return res[-1], res[0]

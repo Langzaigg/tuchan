@@ -108,10 +108,10 @@ async def _track_error(
         track_id = _save_error(prompt, format_exc())
 
     logger.debug(f"A bug has been cumming!!! Track ID: {track_id}")
-    msg = f"呜——出错了...追踪: {track_id}"
+    # msg = f"呜——出错了...追踪: {track_id}"
 
-    for superusers in BotSelfConfig.superusers:
-        try:
-            await bot.send_private_msg(user_id=superusers, message=msg)
-        except BaseBotException:
-            return
+    # for superusers in BotSelfConfig.superusers:
+    #     try:
+    #         await bot.send_private_msg(user_id=superusers, message=msg)
+    #     except BaseBotException:
+    #         return
