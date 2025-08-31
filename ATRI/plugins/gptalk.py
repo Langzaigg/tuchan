@@ -8,9 +8,10 @@ import requests, re, asyncio
 default_api = 'REDACTED_DIFY_KEY'
 api_dic = {'研究':'REDACTED_DIFY_KEY',
            '简洁':'REDACTED_DIFY_KEY',
-           '5e':'REDACTED_FASTGPT_KEY',
+           '旮旯':'REDACTED_DIFY_KEY',
            '深入':'REDACTED_DIFY_KEY',
-           'bing': 'REDACTED_DIFY_KEY'}
+           '自动':'REDACTED_DIFY_KEY',
+           '画画': 'REDACTED_DIFY_KEY'}
 # default_api = 'REDACTED_DIFY_KEY'
 # api_dic = {'dnd':'REDACTED_FASTGPT_KEY',
 #            '旮旯':'REDACTED_FASTGPT_KEY',
@@ -69,7 +70,7 @@ async def response_a_talk(event: MessageEvent, args: Message = CommandArg()):
         res_list = remove_markdown_and_split_images(ans)
         for res in res_list:
             if res:
-                if res.startswith('http') and res.endswith('.jpg'):
+                if res.startswith('http') and (res.endswith('.jpg') or res.endswith('.jpeg') or res.endswith('.png')):
                     await talk_handle.send(MessageSegment.image(file = res or ''))
                 else:
                     await talk_handle.send(res)
@@ -177,7 +178,8 @@ def remove_markdown_and_split_images(text):
         
         # 修复列表符号（严格匹配格式）
         cleaned = re.sub(r'^\s*[-*+]\s+', '', cleaned, flags=re.MULTILINE)  # 关键修改点2
-        
+        cleaned = cleaned.replace("<span style='font-size:12px'>[AI生成]</span>",'')
+        cleaned = cleaned.replace("<span style='font-size:12px'>[AI生]</span>",'')
         if cleaned.strip():
             cleaned_parts.append(cleaned.strip())
     

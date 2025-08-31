@@ -19,14 +19,12 @@ ext_config = {
     # 扩展的描述信息，用于提示 AI 理解扩展的功能，尽量简短
     # 使用英文更节省 token，添加使用示例可提高 bot 调用的准确度
     "description": (
-        "Retrieve anime image details through Lolicon API. "
-        "Call this extension when you want to send an image. "
-        'You can specify succinct precise Chinese tags (without "#") to search for a specific image, '
-        'such as "/#pixiv_search&萝莉,白丝|黑丝#/" for images with "萝莉" AND ("白丝" OR "黑丝") tags. '
-        'Alternatively, use "/#pixiv_search&random#/" to obtain a random image.'
+        '你可以定简洁且精确的中文标签（不带“#”），以搜索特定的图片，把角色名放在第一个关键词（如有），例如："/#pixiv_search&萝莉,白丝|黑丝#/"，'
+        '用于查找带有“萝莉”标签，并且同时包含“白丝”或“黑丝”标签的图片。或者，也可以使用"/#pixiv_search&random#/"来获取一张随机图片。'
+        '关键词必须忠实于用户输入，不得有主观假设！'
     ),
     # 参考词，用于上下文参考使用，为空则每次都会被参考 (消耗 token)
-    "refer_word": ['图','setu'],
+    "refer_word": ['图','setu','来张'],
     # 每次消息回复中最大调用次数，不填则默认为 99
     "max_call_times_per_msg": 1,
     # 作者信息
@@ -92,7 +90,7 @@ class CustomExtension(Extension):
         tags = (
             None
             if (not tag_str) or tag_str == "random" or "随机" in tag_str
-            else ([x for x in tag_str.split(",") if x not in ['涩图', '可爱', '萝莉', '动漫', '萌系', '高质量', '清纯', '少女']] or None)
+            else ([x for x in tag_str.split(",") if x not in ['涩图', '可爱', '萝莉', '动漫', '萌系', '高质量', '清纯', '少女', '涩', 'R-18']] or None)
         )
         tag_str = ",".join(tags) if tags else ""
 
@@ -155,7 +153,7 @@ class CustomExtension(Extension):
                         "msg": (
                             "[来张好兔]\n"
                             f"Search Failed: {e!r}. "
-                            "Please explain this error message to the user."
+                            "向用户解释报错."
                         ),
                     },
                     "wake_up": True,
@@ -168,8 +166,8 @@ class CustomExtension(Extension):
                         "msg": (
                             "[来张好兔]\n"
                             f"No picture found for `{tag_str}`. "
-                            "You should remind the user of this message. "
-                            "You can also adjust the tag text and search again using this extension."
+                            "向用户提示找不到图片。"
+                            "也可以尝试调整关键词来放宽搜索范围（不超过2次）。"
                         ),
                     },
                     "wake_up": True,
@@ -202,8 +200,8 @@ class CustomExtension(Extension):
                     f"This image was posted on Pixiv. "
                     f"{ai_pic_tip}"
                     f"In your response, you should provide a summary of the image information{output_tip}.\n"
-                    f"Title: {pic.title}"
-                    f"Author: {pic.author}"
+                    f"标题: {pic.title}"
+                    f"画师: {pic.author}"
                     f"{tags_tip}"
                 ),
             },

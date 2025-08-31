@@ -89,7 +89,7 @@ def jrlp(folder_path, c = ''):
 global jrlp_dic
 jrlp_dic = {}
 
-jrlp_handle = on_command('。jrlp', aliases={'.jrlp','。今日老婆', '.今日老婆'}, priority=8, block=True)
+jrlp_handle = on_command('。jrlp', aliases={'.jrlp','今日老婆'}, priority=8, block=True)
 @jrlp_handle.handle()
 async def response_jrlp(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
     uid = event.user_id

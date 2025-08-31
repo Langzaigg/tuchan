@@ -570,10 +570,10 @@ class BiliClient():
             cookies = httpx.Cookies({'_uuid': f'{str(uuid.uuid4()).upper()}{randint(0, 99999):05d}infoc'})
             
             response = client.get(
-                'https://www.bilibili.com/1/dynamic',
+                'https://www.bilibili.com/2/dynamic',
                 cookies=cookies
             )
-            spm_prefix = re.search(r'<meta name="spm_prefix" content="([^"]+?)">', response.text).group(1)
+            spm_prefix = re.search(r'name="spm_prefix" content="([^"]+?)"', response.text).group(1)
             cookies.update(response.cookies)
 
             data = {
