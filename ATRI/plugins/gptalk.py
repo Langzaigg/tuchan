@@ -8,9 +8,10 @@ import requests, re, asyncio
 default_api = 'app-Uk03IYYgrFueliwe0xo7XJf6'
 api_dic = {'研究':'app-s9ggihmZ7cTzQaTdGe7s7BSq',
            '简洁':'app-Uk03IYYgrFueliwe0xo7XJf6',
-           '5e':'fastgpt-nRhwhRcGIqWDmzdcXt95UeRfJUj7YoYf4RKTPKkBlVjVmjDkn1ib',
+           '旮旯':'app-Iha412dvjnXaSELowilyy5CY',
            '深入':'app-62VOZUdNdLsRDA1rrycicnyP',
-           'bing': 'app-SkEnMkojTE9AruVQqo9nWKAL'}
+           '自动':'app-lEE1HmSp3aImmIspoWQmAk4x',
+           '画画': 'app-It59ZYcAWAkOG7TjJAj6WBje'}
 # default_api = 'app-SkEnMkojTE9AruVQqo9nWKAL'
 # api_dic = {'dnd':'fastgpt-zamtZ3rk5w4OSm5EAmFAt8krK3QjShAG5cZLRiDQs5As2lk8xn6PtWWDvy0Gt',
 #            '旮旯':'fastgpt-r49xAjzWWMzYgmOTcGEwNFkhPcwv4MTzZ30EDW10rwNoQUv0MxQP',
@@ -69,7 +70,7 @@ async def response_a_talk(event: MessageEvent, args: Message = CommandArg()):
         res_list = remove_markdown_and_split_images(ans)
         for res in res_list:
             if res:
-                if res.startswith('http') and res.endswith('.jpg'):
+                if res.startswith('http') and (res.endswith('.jpg') or res.endswith('.jpeg') or res.endswith('.png')):
                     await talk_handle.send(MessageSegment.image(file = res or ''))
                 else:
                     await talk_handle.send(res)
@@ -177,7 +178,8 @@ def remove_markdown_and_split_images(text):
         
         # 修复列表符号（严格匹配格式）
         cleaned = re.sub(r'^\s*[-*+]\s+', '', cleaned, flags=re.MULTILINE)  # 关键修改点2
-        
+        cleaned = cleaned.replace("<span style='font-size:12px'>[AI生成]</span>",'')
+        cleaned = cleaned.replace("<span style='font-size:12px'>[AI生]</span>",'')
         if cleaned.strip():
             cleaned_parts.append(cleaned.strip())
     

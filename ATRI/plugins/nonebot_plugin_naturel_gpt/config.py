@@ -46,7 +46,7 @@ class Config(BaseModel, extra=Extra.ignore):
     """OpenAI 模型"""
     CHAT_MODEL_MINI: str
     """OpenAI MINI模型"""
-    CHAT_TOP_P: int
+    CHAT_TOP_P: float
     CHAT_TEMPERATURE: float
     """温度越高越随机"""
     CHAT_PRESENCE_PENALTY: float
