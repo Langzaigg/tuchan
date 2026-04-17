@@ -131,6 +131,9 @@ venv.bak/
 .dmypy.json
 dmypy.json
 
+.workbuddy
+
+
 # Pyre type checker
 .pyre/
 
@@ -141,7 +144,7 @@ dmypy.json
 
 /accounts/*
 /data/errors
-/data/naturel_gpt/*.json
+/data/naturel_gpt/*
 /config/*
 
 requirements_*.txt
@@ -149,8 +152,11 @@ requirements_*.txt
 *.ipynb
 (1)
 config.yml
-ATRI/plugins/nonebot_plugin_fortune/resource/out/*.png
+ATRI/plugins/nonebot_plugin_fortune/resource/out/*
 ATRI/plugins/nonebot_plugin_fortune/resource/*.json
 data/kalive/kalive.json
 data/database/essential/*.json
 data/database/manege/*.json
+
+AGENT.md
+old

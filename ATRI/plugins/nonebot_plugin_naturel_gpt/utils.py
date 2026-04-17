@@ -1,5 +1,5 @@
 ﻿import hashlib
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 import asyncio
 import requests
 import aiohttp
@@ -82,6 +82,22 @@ async def gen_chat_text(event: MessageEvent, bot:Bot) -> Tuple[str, bool]:
                         if user_name:
                             msg += f'@{user_name}' # 保持给bot看到的内容与真实用户看到的一致
         return msg, wake_up
+
+
+async def gen_chat_payload(event: MessageEvent, bot: Bot) -> Tuple[str, bool, List[str]]:
+    """生成会话文本和图片 URL。保留 gen_chat_text 兼容旧调用。"""
+    chat_text, wake_up = await gen_chat_text(event, bot)
+    image_urls: List[str] = []
+    if not config.MULTIMODAL_ENABLE:
+        return chat_text, wake_up, image_urls
+
+    for seg in event.message:
+        if seg.type != "image":
+            continue
+        url = seg.data.get("url") or seg.data.get("file")
+        if url:
+            image_urls.append(str(url))
+    return chat_text, wake_up, image_urls
     
 
 async def get_user_name(event: Union[MessageEvent, GroupIncreaseNoticeEvent], bot:Bot, user_id:int) -> Optional[str]:

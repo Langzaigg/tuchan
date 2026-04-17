@@ -132,9 +132,13 @@ async def fortune_check() -> None:
     if not copywriting_path.parent.exists():
         copywriting_path.parent.mkdir(parents=True, exist_ok=True)
 
-    ret = await download_resource(copywriting_path, "copywriting.json", "fortune")
-    if not ret and not copywriting_path.exists():
-        raise ResourceError("Resource copywriting.json is missing! Please check!")
+    # Skip download if local copywriting.json already exists
+    if copywriting_path.exists():
+        logger.info("Local copywriting.json found, skip downloading")
+    else:
+        ret = await download_resource(copywriting_path, "copywriting.json", "fortune")
+        if not ret and not copywriting_path.exists():
+            raise ResourceError("Resource copywriting.json is missing! Please check!")
 
     """
 		Check rules and data files

@@ -57,6 +57,10 @@ def jrlp(folder_path, c = ''):
     image_extensions = {'.jpg', '.jpeg', '.png'}
     characters = []
     chadic = {}
+    c_pre = []
+    c_end = []
+    c_in = []
+
 
     # 遍历文件夹中的文件
     for filename in os.listdir(folder_path):
@@ -68,22 +72,35 @@ def jrlp(folder_path, c = ''):
 
         # 分割角色名和后缀（按第一个下划线分割）
         parts = basename.split('_', 1)
-        character = parts[0]
+        character = str(parts[0])
         chapath = os.path.join(folder_path, filename)
 
         if character in characters:
             chadic[character].append(chapath)
         else:
             characters.append(character)
+            if character.startswith(c):
+                c_pre.append(character)
+            elif character.endswith(c):
+                c_end.append(character)
+            elif c in character:
+                c_in.append(character)
             chadic[character]=[chapath]
 
     if not characters:
         return None  # 没有符合条件的文件
 
-    # 随机选择一个条目
-    selected = random.choice(characters)
     if c and c in characters:
         selected = c
+    elif c_end:
+        selected = random.choice(c_end)
+    elif c_pre:
+        selected = random.choice(c_pre)
+    elif c_in:
+        selected = random.choice(c_in)
+    # 随机选择一个条目
+    else:
+        selected = random.choice(characters)
     return random.choice(chadic[selected]), selected
 
 global jrlp_dic
