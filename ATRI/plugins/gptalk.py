@@ -70,7 +70,7 @@ async def response_a_talk(event: MessageEvent, args: Message = CommandArg()):
         res_list = remove_markdown_and_split_images(ans)
         for res in res_list:
             if res:
-                if res.startswith('http') and (res.endswith('.jpg') or res.endswith('.jpeg') or res.endswith('.png')):
+                if res.startswith('http') and (res.endswith('.jpg') or res.endswith('.jpeg') or res.endswith('.png') or res.endswith('.webp')):
                     await talk_handle.send(MessageSegment.image(file = res or ''))
                 else:
                     await talk_handle.send(res)
@@ -180,7 +180,10 @@ def remove_markdown_and_split_images(text):
         cleaned = re.sub(r'^\s*[-*+]\s+', '', cleaned, flags=re.MULTILINE)  # 关键修改点2
         cleaned = cleaned.replace("<span style='font-size:12px'>[AI生成]</span>",'')
         cleaned = cleaned.replace("<span style='font-size:12px'>[AI生]</span>",'')
-        if cleaned.strip():
-            cleaned_parts.append(cleaned.strip())
+        cleaned = cleaned.replace("<span style='font-size:12px'>[AI成]</span>",'')
+        cl = cleaned.split('\n\n\n')
+        for cleaned in cl:
+            if cleaned.strip():
+                cleaned_parts.append(cleaned.strip())
     
     return cleaned_parts

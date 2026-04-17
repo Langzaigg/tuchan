@@ -11,9 +11,9 @@ if 'repeater_min_message_times' not in config:
 if 'repeater_blacklist' not in config:
     logger.warning('[复读姬] 未发现配置项 `repeater_blacklist` , 采用默认值: []')
 
-repeater_group = config.get('repeater_group', ['149378291','726905061'])
+repeater_group = config.get('repeater_group', ['149378291','726905061','922408993'])
 shortest_length = config.get('repeater_min_message_length', 1)
 shortest_times = config.get('repeater_min_message_times', 3)
 blacklist = config.get('repeater_blacklist', [])
-whitelist = config.get('repeater_whitelist', ['149378291'])
+whitelist = config.get('repeater_whitelist', ['149378291','922408993'])
 repeat_probability = config.get('repeater_probability', 0.05)

@@ -17,10 +17,8 @@ from .utils import *
 from .chat import Chat
 from .persistent_data_manager import PersistentDataManager
 from .chat_manager import ChatManager
-from .Extension import global_extensions
 from .openai_func import TextGenerator
 from .command_func import cmd
-from .MCrcon.mcrcon import MCRcon   # fork from: https://github.com/Uncaught-Exceptions/MCRcon
 
 try:
     from .text_to_image import md_to_img, text_to_img
@@ -89,8 +87,9 @@ async def handler(matcher_:Matcher, event: MessageEvent, bot:Bot) -> None:
     )
     if config.DEBUG_LEVEL > 1: logger.info(resTmplate)
 
-    # 如果是忽略前缀 或者 消息为空，则跳过处理
-    if event.get_plaintext().strip().startswith(config.IGNORE_PREFIX) or not event.get_plaintext():   
+    has_image = any(seg.type == "image" for seg in event.message)
+    # 如果是忽略前缀 或者消息为空且没有图片，则跳过处理
+    if event.get_plaintext().strip().startswith(config.IGNORE_PREFIX) or (not event.get_plaintext() and not has_image):
         if config.DEBUG_LEVEL > 1: logger.info("忽略前缀或消息为空，跳过处理...") # 纯图片消息也会被判定为空消息
         return
 
@@ -105,7 +104,7 @@ async def handler(matcher_:Matcher, event: MessageEvent, bot:Bot) -> None:
         if config.DEBUG_LEVEL > 0: logger.info("未知消息来源: " + event.get_session_id())
         return
     
-    chat_text, wake_up = await gen_chat_text(event=event, bot=bot)
+    chat_text, wake_up, image_urls = await gen_chat_payload(event=event, bot=bot)
 
     # 进行消息响应
     await do_msg_response(
@@ -117,6 +116,7 @@ async def handler(matcher_:Matcher, event: MessageEvent, bot:Bot) -> None:
         chat_key,
         sender_name,
         bot=bot,
+        image_urls=image_urls,
     )
 
 """ ======== 注册通知响应器 ======== """
@@ -226,7 +226,25 @@ async def _(matcher_:Matcher, event: MessageEvent, bot:Bot, arg: Message = Comma
 
 
 """ ======== 消息响应方法 ======== """
-async def do_msg_response(trigger_userid:str, trigger_text:str, is_tome:bool, matcher: Type[Matcher], chat_type: str, chat_key: str, sender_name: Optional[str] = None, wake_up: bool = False, loop_times=0, loop_data={}, bot:Bot = None): # type: ignore
+def _strip_markdown(text: str) -> str:
+    text = re.sub(r"```.*?```", "", text, flags=re.S)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"(^|\n)\s{0,3}#{1,6}\s*", r"\1", text)
+    text = re.sub(r"(^|\n)\s*[-*+]\s+", r"\1", text)
+    text = re.sub(r"(^|\n)\s*\d+\.\s+", r"\1", text)
+    text = text.replace("**", "").replace("__", "").replace("~~", "")
+    return text
+
+
+def _normalize_reply_segment(text: str) -> str:
+    text = _strip_markdown(text)
+    text = re.sub(r"\n{2,}", "\n", text)
+    return text.strip().strip("*';；").rstrip("。").strip()
+
+
+async def do_msg_response(trigger_userid:str, trigger_text:str, is_tome:bool, matcher: Type[Matcher], chat_type: str, chat_key: str, sender_name: Optional[str] = None, wake_up: bool = False, loop_times=0, loop_data={}, bot:Bot = None, image_urls: Optional[List[str]] = None): # type: ignore
     """消息响应方法"""
 
     sender_name = sender_name or 'anonymous'
@@ -243,14 +261,20 @@ async def do_msg_response(trigger_userid:str, trigger_text:str, is_tome:bool, ma
             if config.DEBUG_LEVEL > 0: logger.info(f"检测到违禁词 {w}，拒绝处理...")
             return
 
-    # 唤醒词检测
+    # 唤醒词检测（支持当前激活角色名，仅在句首出现时无条件唤醒）
+    text_head = trigger_text.lower().lstrip()
+    wake_prefix = False
+    if chat.preset_key.lower() and text_head.startswith(chat.preset_key.lower()):
+        wake_prefix = True
     for w in config.WORD_FOR_WAKE_UP:
-        if str(w).lower() in trigger_text.lower():
-            wake_up = True
+        if str(w).lower() and text_head.startswith(str(w).lower()):
+            wake_prefix = True
             break
+    if wake_prefix:
+        wake_up = True
 
-    # 随机回复判断
-    if random.random() < config.RANDOM_CHAT_PROBABILITY:
+    # 随机回复判断（唤醒词不在句首时，也通过随机概率触发）
+    if not wake_up and random.random() < config.RANDOM_CHAT_PROBABILITY:
         wake_up = True
 
     # 其它人格唤醒判断
@@ -269,18 +293,18 @@ async def do_msg_response(trigger_userid:str, trigger_text:str, is_tome:bool, ma
     # 判断是否需要回复
     if (    # 如果不是 bot 相关的信息，则直接返回
         wake_up or \
-        (random.random() < config.REPLY_ON_NAME_MENTION_PROBABILITY and (random.choice(list(BotSelfConfig.nickname)).lower() in trigger_text.lower())) or \
+        (random.random() < config.REPLY_ON_NAME_MENTION_PROBABILITY and (any(n.lower() in trigger_text.lower() for n in list(BotSelfConfig.nickname) + [chat.preset_key]))) or \
         (config.REPLY_ON_AT and is_tome and '全体成员' not in trigger_text.lower())
     ):
         # 更新全局对话历史记录
         # chat.update_chat_history_row(sender=sender_name, msg=trigger_text, require_summary=True)
         await chat.update_chat_history_row(sender=sender_name,
                                     msg=f"@{chat.preset_key} {trigger_text}" if is_tome and chat_type=='group' else trigger_text,
-                                    require_summary=False, record_time=True)    # 只有在需要回复时才记录时间，用于节流
+                                    require_summary=False, record_time=True, images=image_urls)    # 只有在需要回复时才记录时间，用于节流
         logger.info("符合 bot 发言条件，进行回复...")
     else:
         if config.CHAT_ENABLE_RECORD_ORTHER:
-            await chat.update_chat_history_row(sender=sender_name, msg=trigger_text, require_summary=False, record_time=False)
+            await chat.update_chat_history_row(sender=sender_name, msg=trigger_text, require_summary=False, record_time=False, images=image_urls)
             if config.DEBUG_LEVEL > 1: logger.info("不是 bot 相关的信息，记录但不进行回复")
         else:
             if config.DEBUG_LEVEL > 1: logger.info("不是 bot 相关的信息，不进行回复")
@@ -317,6 +341,9 @@ async def do_msg_response(trigger_userid:str, trigger_text:str, is_tome:bool, ma
 
     # 生成对话 prompt 模板
     prompt_template = chat.get_chat_prompt_template(userid=trigger_userid, chat_type=chat_type)
+    tg = TextGenerator.instance
+    req_tokens = tg.cal_token_count(str(prompt_template))
+    logger.info(f"生成 prompt 完成，请求 token 数: {req_tokens}")
     # 生成 log 输出用的 prompt 模板
     log_prompt_template = '\n'.join([f"[{m['role']}]\n{m['content']}\n" for m in prompt_template]) if isinstance(prompt_template, list) else prompt_template
     if config.DEBUG_LEVEL > 0:
@@ -328,19 +355,65 @@ async def do_msg_response(trigger_userid:str, trigger_text:str, is_tome:bool, ma
 
     chat.update_gen_time()  # 更新上次生成时间
     time_before_request = time.time()
-    tg = TextGenerator.instance
-    raw_res, success = await tg.get_response(prompt=prompt_template, type='chat', custom={'bot_name': chat.preset_key, 'sender_name': sender_name})  # 生成对话结果
-    if not success:  # 如果生成对话结果失败，则直接返回
-        logger.warning("生成对话结果失败，跳过处理...")
-        await matcher.finish(raw_res)
+    reply_prefix = f'<{chat.preset_key}> ' if (chat_type == 'server') else ''
+    raw_parts: List[str] = []
+    stream_buffer = ""
+    sent_segments = 0
+    last_send_time = 0.0
 
-    # 如果生成对话结果过程中启动了新的消息生成，则放弃本次生成结果
-    if chat.last_gen_time > time_before_request:
-        logger.warning("生成对话结果过程中启动了新的消息生成，放弃本次生成结果...")
+    async def send_segment(segment: str) -> None:
+        nonlocal sent_segments, last_send_time
+        reply_text = _normalize_reply_segment(segment)
+        if not reply_text:
+            return
+        if re.match(r'^[^\u4e00-\u9fa5\w]{1}$', reply_text):
+            return
+        now = time.time()
+        wait_time = max(0.0, float(config.REPLY_SEGMENT_INTERVAL) - (now - last_send_time))
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+        await matcher.send(f"{reply_prefix}{reply_text}")
+        sent_segments += 1
+        last_send_time = time.time()
+
+    async def on_text_chunk(chunk: str) -> None:
+        nonlocal stream_buffer
+        raw_parts.append(chunk)
+        stream_buffer += chunk
+        if not config.NG_ENABLE_MSG_SPLIT:
+            return
+        while sent_segments < max(1, config.REPLY_MAX_SEGMENTS) - 1 and "\n\n" in stream_buffer:
+            segment, stream_buffer = stream_buffer.split("\n\n", 1)
+            await send_segment(segment)
+
+    async def on_reasoning_chunk(chunk: str) -> None:
+        if config.LLM_SHOW_REASONING:
+            await on_text_chunk(chunk)
+
+    raw_res, success = await tg.stream_response(
+        prompt=prompt_template,
+        type='chat',
+        custom={'bot_name': chat.preset_key, 'sender_name': sender_name},
+        plugin_config=config,
+        on_text=on_text_chunk,
+        on_reasoning=on_reasoning_chunk,
+    )  # 生成对话结果
+
+    # 工具产生的图片（如pixiv搜图）始终发送，不受后续错误影响
+    for tool_output in tg.consume_tool_outputs():
+        if tool_output.get("type") == "image" and tool_output.get("url"):
+            await matcher.send(MessageSegment.image(file=tool_output["url"]))
+
+    if not success:
+        logger.warning("生成对话结果失败，跳过处理...")
+        if not raw_parts and raw_res:
+            await send_segment(raw_res)
         return
 
-    # 输出对话原始响应结果
-    if config.DEBUG_LEVEL > 0: logger.info(f"原始回应: {raw_res}")
+    raw_res = raw_res or ''.join(raw_parts)
+
+    if stream_buffer:
+        await send_segment(stream_buffer)
 
     if time.time() - time_before_request > config.OPENAI_TIMEOUT:
         logger.warning(f'OpenAI响应超过timeout值[{config.OPENAI_TIMEOUT}]，停止处理')
@@ -350,251 +423,12 @@ async def do_msg_response(trigger_userid:str, trigger_text:str, is_tome:bool, ma
         if config.DEBUG_LEVEL > 0: logger.warning(f'等待OpenAI响应返回的过程中人格预设由[{current_preset_key}]切换为[{chat.preset_key}],当前消息不再继续处理.2')
         return
 
-    # 用于存储最终回复顺序内容的列表
-    reply_list:List[Union[str, dict]] = []
-
-    # 预检一次响应内容，如果响应内容中包含了需要打断的扩展调用指令，则直接截断原始响应中该扩展调用指令后的内容
-    pre_check_calls = re.findall(r"/#(.+?)#/", raw_res, re.S) + re.findall(r"#/(.+?)#/", raw_res, re.S) + re.findall(r"/#(.+?)/#", raw_res, re.S)
-    if pre_check_calls:
-        for call_str in pre_check_calls:
-            ext_name, *ext_args = call_str.split('&')
-            ext_name = ext_name.strip().lower()
-            if ext_name in global_extensions and global_extensions[ext_name].get_config().get('interrupt', False):
-                # 获取该扩展调用指令结束在原始响应中的位置
-                call_end_pos = raw_res.find(call_str) + len(call_str) + 2
-                # 截断原始响应内容
-                raw_res = raw_res[:call_end_pos]
-                if config.DEBUG_LEVEL > 0: logger.warning(f"检测到需要打断的扩展调用指令: {call_str}, 已截断原始响应内容")
-                break
-
-    # 提取markdown格式的代码块
-    re.findall(r"```(.+?)```", raw_res, re.S)
-    # 提取后去除所有markdown格式的代码块，剩余部分为对话结果
-    talk_res = re.sub(r"```(.+?)```", '', raw_res)
-
-    # 分割对话结果提取出所有 "/#扩展名&参数1&参数2#/" 格式的扩展调用指令 参数之间用&分隔 多行匹配
-    ext_calls = re.findall(r"/.?#(.+?)#.?/", talk_res, re.S)
-
-    # 对分割后的对话根据 '*;' 进行分割，表示对话结果中的分句，处理结果为列表，其中每个元素为一句话
-    if config.NG_ENABLE_MSG_SPLIT:
-        # 提取后去除所有扩展调用指令并切分信息，剩余部分为对话结果 多行匹配
-        talk_res = re.sub(r"/.?#(.+?)#.?/", '*;', talk_res)
-        reply_list.extend(talk_res.replace(';*','*;').replace('；*','*;').replace('*；','*;').split('*;'))
-    else:
-        # 提取后去除所有扩展调用指令，剩余部分为对话结果 多行匹配
-        talk_res = re.sub(r"/.?#(.+?)#.?/", '', talk_res)
-        reply_list.append(talk_res)
-
-    # if config.DEBUG_LEVEL > 0: logger.info("分割响应结果: " + str(reply_list))
-
-    # 重置所有扩展调用次数
-    for ext_name in global_extensions.keys():
-        global_extensions[ext_name].reset_call_times()
-
-    # 遍历所有扩展调用指令
-    for ext_call_str in ext_calls:  
-        ext_name, *ext_args = ext_call_str.split('&')
-        ext_name = ext_name.strip().lower().strip('{}')
-        if ext_name in global_extensions.keys():
-            # 提取出扩展调用指令中的参数为字典
-            ext_args_dict:dict = {}
-            # 按照参数顺序依次提取参数值
-            arguments = global_extensions[ext_name].get_config().get('arguments')
-            if arguments and isinstance(arguments, dict):
-                for arg_name in arguments.keys():
-                    if len(ext_args) > 0:
-                        ext_args_dict[arg_name] = ext_args.pop(0)
-                    else:
-                        ext_args_dict[arg_name] = None
-
-            logger.info(f"检测到扩展调用指令: {ext_name} {ext_args_dict} | 正在调用扩展模块...")
-            try:    # 调用扩展的call方法
-                ext_res = await global_extensions[ext_name].call(ext_args_dict, {
-                    'bot_name': chat.preset_key,
-                    'user_send_raw_text': trigger_text,
-                    'bot_send_raw_text': raw_res
-                })
-                if config.DEBUG_LEVEL > 1: logger.info(f"扩展 {ext_name} 返回结果: {ext_res}")
-                if ext_res is not None:
-                    # 将扩展返回的结果插入到回复列表的最后
-                    reply_list.append(ext_res)
-            except Exception as e:
-                logger.error(f"调用扩展 {ext_name} 时发生错误: {e!r}")
-                if config.DEBUG_LEVEL > 0: logger.opt(exception=e).exception(f"[扩展 {ext_name}] 错误详情:")
-                ext_res = {}
-                # 将错误的调用指令从原始回复中去除，避免bot从上下文中学习到错误的指令用法
-                raw_res = re.sub(r"/.?#(.+?)#.?/", '', raw_res)
-        else:
-            logger.error(f"未找到扩展 {ext_name}，跳过调用...")
-            logger.error(str(global_extensions))
-            # 将错误的调用指令从原始回复中去除，避免bot从上下文中学习到错误的指令用法
-            raw_res = re.sub(r"/.?#(.+?)#.?/", '', raw_res)
-
-    # # 代码块插入到回复列表的最后
-    # for code_block in code_blocks:
-    #     reply_list.append({'code_block': code_block})
-
-    if config.DEBUG_LEVEL > 1: logger.info(f"回复序列内容: {reply_list}")
-
-    # 回复前缀
-    reply_prefix = f'<{chat.preset_key}> ' if (chat_type == 'server') else ''
-
-    res_times = config.NG_MAX_RESPONSE_PER_MSG  # 获取每条消息最大回复次数
-    # 根据回复内容列表逐条发送回复
-    for idx, reply in enumerate(reply_list):
-        # 判断回复内容是否为str
-        if isinstance(reply, str):
-            # 判断文本内容是否为纯符号(包括空格，换行、英文标点、中文标点)并且长度小于3
-            reply_text = str(reply).strip().rstrip('。')
-            if re.match(r'^[^\u4e00-\u9fa5\w]{1}$', reply_text) or len(reply_text) < 1:
-                if config.DEBUG_LEVEL > 0: logger.info(f"检测到纯符号或空文本: {reply_text}，跳过发送...")
-                continue
-            if config.ENABLE_MSG_TO_IMG:
-                img = await md_to_img(reply_text)
-                await matcher.send(MessageSegment.image(img))
-            else:
-                await matcher.send(f"{reply_prefix}{reply_text}")
-        elif isinstance(reply, dict):
-            for key in reply:   # 遍历回复内容类型字典
-                if not reply.get(key):
-                    continue
-                
-                reply_content = reply.get(key)
-                reply_text = str(reply_content).strip().rstrip('。') if isinstance(reply_content, str) else ''
-                if key == 'text': # 发送普通文本
-                    # 判断文本内容是否为纯符号(包括空格，换行、英文标点、中文标点)并且长度为1
-                    if re.match(r'^[^\u4e00-\u9fa5\w]{1}$', reply_text):
-                        if config.DEBUG_LEVEL > 1: logger.info(f"检测到纯符号文本: {reply_text}，跳过发送...")
-                        continue
-                    if not reply_text.strip():
-                        continue
-                    await matcher.send(f"{reply_prefix}{reply_text}")
-
-                elif key == 'image': # 发送图片
-                    await matcher.send(MessageSegment.image(file=reply_content or ''))
-                    logger.info(f"回复图片消息: {reply_content}")
-
-                elif key == 'file':  # 发送文件
-                    # await matcher.send(MessageSegment.file(file=reply_content or ''))
-                    try:
-                        await bot.call_api('upload_group_file', group_id=chat.chat_key.split('_')[1], file=reply_content, name=reply_content.split('/')[-1])    # type: ignore
-                    except Exception as e:
-                        logger.error(f"尝试上传文件失败: {e}")
-                    logger.info(f"回复文件消息: {reply_content}")
-
-                elif key == 'voice': # 发送语音
-                    logger.info(f"回复语音消息: {reply_content}")
-                    await matcher.send(Message(MessageSegment.record(file=reply_content, cache=False))) # type: ignore
-
-                elif key == 'code_block':  # 发送代码块
-                    await matcher.send(Message(reply_text))
-
-                elif key == 'memory':  # 记忆存储
-                    logger.info(f"存储记忆: {reply_content}")
-                    if isinstance(reply_content, dict):
-                        memory:Dict[str, str] = reply_content
-                        chat.set_memory(memory.get('key', ''), memory.get('value', ''))
-                        if config.DEBUG_LEVEL > 0:
-                            if memory.get('key') and memory.get('value'):
-                                await matcher.send(f"[debug]: 记住了 {memory.get('key')} = {memory.get('value')}")
-                            elif memory.get('key') and memory.get('value') is None:
-                                await matcher.send(f"[debug]: 忘记了 {memory.get('key')}")
-
-                elif key == 'notify':  # 通知消息
-                    if isinstance(reply_content, dict):
-                        if 'sender' in reply_content and 'msg' in reply_content:
-                            loop_data['notify'] = reply_content
-                        else:
-                            logger.warning(f"通知消息格式错误: {reply_content}")
-
-                elif key == 'wake_up':  # 重新调用对话
-                    logger.info(f"重新调用对话: {reply_content}")
-                    wake_up = bool(reply_content)
-
-                elif key == 'timer':  # 定时器
-                    logger.info(f"设置定时器: {reply_content}")
-                    loop_data['timer'] = reply_content
-
-                elif key == 'preset':  # 更新对话预设
-                    original_preset = chat.active_preset.bot_self_introl[:]
-                    origin_snippet = reply_content.get('origin') # type: ignore
-                    new_snippet = reply_content.get('new') # type: ignore
-                    if origin_snippet == '[empty]': # 如果原始内容为空，则直接追加新内容
-                        new_bot_self_introl = f"{original_preset}; {new_snippet}"
-                    else:   # 否则替换原始内容
-                        new_bot_self_introl = original_preset.replace(origin_snippet, new_snippet)
-                    if chat.update_preset(preset_key=chat.preset_key, bot_self_introl=new_bot_self_introl):
-                        logger.info(f"更新对话预设: {chat.preset_key} 成功")
-                    else:
-                        logger.warning(f"更新对话预设: {chat.preset_key} 失败")
-
-                elif key == 'rcon':  # RCON指令
-                    try:
-                        with MCRcon(config.MC_RCON_HOST, config.MC_RCON_PASSWORD, int(config.MC_RCON_PORT), timeout=10) as mcr:
-                            resp = mcr.command(reply_content)
-                            resp = resp if resp else '无'
-                            loop_data['end_notify'] = {'sender': '[Minecraft Rcon]', 'msg': f"执行 \"{reply_content}\" | 结果: {resp}"}
-                            if config.DEBUG_LEVEL > 0:  logger.info(f"发送MC-RCON指令: {reply_content} | 响应: {resp}")
-                    except:
-                        logger.warning(f"发送MC-RCON指令: {reply_content} 失败")
-
-                res_times -= 1
-                if res_times < 1:  # 如果回复次数超过限制，则跳出循环
-                    break
-        else:
-            logger.error(f'unknown reply type:{type(reply)}, content:{reply}')
-        await asyncio.sleep(1)  # 每条回复之间间隔1秒
-
-    cost_token = tg.cal_token_count(str(prompt_template) + raw_res)  # 计算对话结果的 token 数量
-
-    # while time.time() - sta_time < 1.5:   # 限制对话响应最短时间
-    #     time.sleep(0.1)
-
+    cost_token = tg.cal_token_count(str(prompt_template) + raw_res)
     if config.DEBUG_LEVEL > 0: logger.info(f"token消耗: {cost_token} | 对话响应: \"{raw_res}\"")
-    await chat.update_chat_history_row(sender=chat.preset_key, msg=raw_res, require_summary=True, record_time=False)  # 更新全局对话历史记录
-    chat.update_send_time() # 更新对话发送时间
-    # 更新对用户的对话信息
+    await chat.update_chat_history_row(sender=chat.preset_key, msg=raw_res, require_summary=True, record_time=False)
+    chat.update_send_time()
     await chat.update_chat_history_row_for_user(sender=chat.preset_key, msg=raw_res, userid=trigger_userid, username=sender_name, require_summary=True)
-    PersistentDataManager.instance.save_to_file()  # 保存数据
-
-    # 如果存在响应结束通知消息，则发送通知
-    if 'end_notify' in loop_data:
-        await chat.update_chat_history_row(sender=loop_data['end_notify'].get('sender', 'System'), msg=loop_data['end_notify'].get('msg'), require_summary=False)  # 更新全局对话历史记录
-        loop_data.pop('end_notify')  # 移除end_notify
-
+    PersistentDataManager.instance.save_to_file()
     if config.DEBUG_LEVEL > 0: logger.info(f"对话响应完成 | 耗时: {time.time() - sta_time}s")
-    
-    # 检查是否再次触发对话
-    if wake_up and loop_times < 5:
-        if 'timer' in loop_data and 'notify' in loop_data:  # 如果存在定时器和通知消息，将其作为触发消息再次调用对话
-            time_diff = loop_data['timer']
-            loop_data.pop('timer')  # 移除timer
-            if time_diff > 0:
-                if config.DEBUG_LEVEL > 0: logger.info(f"等待 {time_diff}s 后再次调用对话...")
-                await asyncio.sleep(time_diff)
-            if config.DEBUG_LEVEL > 0: logger.info("再次调用对话...")
-            await do_msg_response(
-                matcher=matcher,
-                trigger_text=loop_data.get('notify', {}).get('msg', ''),
-                trigger_userid=trigger_userid,
-                sender_name=loop_data.get('notify', {}).get('sender', '[system]'),
-                wake_up=wake_up,
-                loop_times=loop_times + 1,
-                chat_type=chat_type,
-                is_tome=is_tome,
-                chat_key=chat_key,
-                bot=bot,
-            )
-        elif 'notify' in loop_data:   # 如果存在通知消息，将其作为触发消息再次调用对话
-            await do_msg_response(
-                matcher=matcher,
-                trigger_text=loop_data.get('notify', {}).get('msg', ''),
-                trigger_userid=trigger_userid,
-                sender_name=loop_data.get('notify', {}).get('sender', '[system]'),
-                wake_up=wake_up,
-                loop_times=loop_times + 1,
-                chat_type=chat_type,
-                is_tome=is_tome,
-                chat_key=chat_key,
-                bot=bot,
-            )
+    return
+

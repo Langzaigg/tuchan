@@ -1,278 +1,324 @@
-import re
+import asyncio
+import json
 import os
-from typing import Tuple, Dict
-from .logger import logger
-from nonebot.utils import run_sync
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+
 from tiktoken import Encoding, encoding_for_model
 
-
-from openai import OpenAI
-# from transformers import GPT2TokenizerFast
+from .llm_tools import execute_tool, get_tool_schemas
+from .logger import logger
 from .singleton import Singleton
 
 enc_cache: Dict[str, Encoding] = {}
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+ChunkCallback = Callable[[str], Awaitable[None]]
 
-# tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+
+def _get(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _message_to_dict(message: Any) -> Dict[str, Any]:
+    if isinstance(message, dict):
+        return dict(message)
+    if hasattr(message, "model_dump"):
+        return message.model_dump(exclude_none=True)
+    if hasattr(message, "dict"):
+        return message.dict(exclude_none=True)
+    return {
+        "role": _get(message, "role", "assistant"),
+        "content": _get(message, "content", ""),
+        "tool_calls": _get(message, "tool_calls", None),
+    }
+
 
 class TextGenerator(Singleton["TextGenerator"]):
-    def init(self, api_keys: list, config: dict, proxy = None, base_url = ''):
-        self.api_keys = api_keys
+    def init(self, api_keys: list, config: dict, proxy=None, base_url=""):
+        self.api_keys = api_keys or [""]
         self.key_index = 0
         self.config = config
-        
-        self.client = OpenAI(
-            # 从环境变量中读取您的方舟API Key
-            api_key=api_keys[0],
-            base_url=base_url,
-            # 深度思考模型耗费时间会较长，请您设置较大的超时时间，避免超时，推荐30分钟以上
-            timeout=180,
-        )
-    
-    @run_sync
-    def get_response(self, prompt, type: str = 'chat', custom: dict = {}) -> Tuple[str, bool]:
-        """获取文本生成"""
-        res, success = ('', False)
-        for _ in range(len(self.api_keys)):
-            if type == 'chat':
-                res, success = self.get_chat_response(self.api_keys[self.key_index], prompt, custom)
-            elif type == 'summarize':
-                res, success = self.get_summarize_response(self.api_keys[self.key_index], prompt, custom)
-            elif type == 'impression':
-                res, success = self.get_impression_response(self.api_keys[self.key_index], prompt, custom)
-            else:
-                res, success = (f'未知类型:{type}', False)
-            if success:
-                return res, True
+        self.proxy = proxy
+        self.base_url = base_url
+        self.last_tool_outputs: List[Dict[str, Any]] = []
 
-            # 请求错误处理
-            if "Rate limit" in res:
-                reason = res
-                res = '超过每分钟请求次数限制，喝杯茶休息一下吧 (´；ω；`)'
-                break
-            elif "module 'openai' has no attribute 'ChatCompletion'" in res:
-                reason = res
-                res = '当前 openai 库版本过低，无法使用 gpt-3.5-turbo 模型 (´；ω；`)'
-                break
-            elif "Error communicating with OpenAI" in res:
-                reason = res
-                res = '与 OpenAi 通信时发生错误 (´；ω；`)'
-            else:
-                reason = res
-                res = '哎呀，发生了未知错误 (´；ω；`)'
-            self.key_index = (self.key_index + 1) % len(self.api_keys)
-            logger.warning(f"当前 Api Key({self.key_index}): [{self.api_keys[self.key_index][:4]}...{self.api_keys[self.key_index][-4:]}] 请求错误，尝试使用下一个...")
-            logger.error(f"错误原因: {res} => {reason}")
-        logger.error("请求 OpenAi 发生错误，请检查 Api Key 是否正确或者查看控制台相关日志")
-        return res, False
+    def _current_key(self) -> str:
+        return self.api_keys[self.key_index % len(self.api_keys)]
 
-    def get_chat_response(self, key:str, prompt, custom:dict = {})->Tuple[str, bool]:
-        """对话文本生成"""
-        self.client.api_key = key
-        try:
-            if self.config['model']:
-                response = self.client.chat.completions.create(
-                    model=self.config['model'],
-                    messages=prompt if isinstance(prompt, list) else [  # 如果是列表则直接使用，否则按照以下格式转换
-                        {'role': 'system', 'content': f"You must strictly follow the user's instructions to give {custom.get('bot_name', 'bot')}'s response. /no_think"},
-                        {'role': 'user', 'content': prompt},
-                    ],
-                    temperature=self.config['temperature'],
-                    max_tokens=self.config['max_tokens'],
-                    # top_p=self.config['top_p'],
-                    frequency_penalty=self.config['frequency_penalty'],
-                    presence_penalty=self.config['presence_penalty'],
-                    # top_k=20,
-                    # min_p=0,
-                    timeout=self.config.get('timeout', 30),
-                    extra_body={
-                        "thinking": {
-                            "type": "disabled",  # 不使用深度思考能力
-                            # "type": "enabled", # 使用深度思考能力
-                            # "type": "auto", # 模型自行判断是否使用深度思考能力
-                        }
-                    },
-                    stop=[f"\n{custom.get('bot_name', 'AI')}:", f"\n{custom.get('sender_name', 'Human')}:"]
+    def _rotate_key(self) -> None:
+        self.key_index = (self.key_index + 1) % len(self.api_keys)
+
+    def _completion_kwargs(self, messages: List[Dict[str, Any]], type: str, stream: bool, tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        model_key = "model_mini" if type in {"summarize", "impression"} else "model"
+        kwargs: Dict[str, Any] = {
+            "model": self.config[model_key],
+            "messages": messages,
+            "temperature": self.config.get("temperature", 0.6),
+            "max_tokens": self.config.get("max_summary_tokens" if type in {"summarize", "impression"} else "max_tokens", 1024),
+            "timeout": self.config.get("timeout", 30),
+            "stream": stream,
+        }
+        if self.base_url:
+            kwargs["base_url"] = self.base_url
+        if self.proxy:
+            kwargs["proxy"] = self.proxy
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        return kwargs
+
+    def _normalize_prompt(self, prompt, custom: dict = {}) -> List[Dict[str, Any]]:
+        if isinstance(prompt, list):
+            return prompt
+        return [
+            {"role": "system", "content": f"You must strictly follow the user's instructions to give {custom.get('bot_name', 'bot')}'s response."},
+            {"role": "user", "content": prompt},
+        ]
+
+    async def _request_openai_compatible(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """直接调用 OpenAI-compatible API，不依赖 litellm"""
+        import httpx
+
+        model = kwargs.pop("model")
+        messages = kwargs.pop("messages")
+        stream = kwargs.pop("stream", False)
+        base_url = kwargs.pop("base_url", "https://api.openai.com/v1")
+        proxy = kwargs.pop("proxy", None)
+        timeout = kwargs.pop("timeout", 30)
+        tools = kwargs.pop("tools", None)
+        tool_choice = kwargs.pop("tool_choice", None)
+
+        # 构建 URL
+        url = f"{base_url.rstrip('/')}/chat/completions"
+
+        # 构建请求头
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._current_key()}",
+        }
+
+        # 构建请求体
+        body: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+        }
+
+        # 添加可选参数
+        if "temperature" in kwargs:
+            body["temperature"] = kwargs["temperature"]
+        if "max_tokens" in kwargs:
+            body["max_tokens"] = kwargs["max_tokens"]
+        if tools:
+            body["tools"] = tools
+            if tool_choice:
+                body["tool_choice"] = tool_choice
+
+        # 构建 httpx 客户端
+        client_kwargs: Dict[str, Any] = {
+            "timeout": httpx.Timeout(timeout),
+        }
+        if proxy:
+            client_kwargs["proxy"] = proxy
+
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            response = await client.post(url, headers=headers, json=body)
+            response.raise_for_status()
+            return response.json()
+
+    async def _stream_iter_openai(self, kwargs: Dict[str, Any]):
+        """流式调用 OpenAI-compatible API YIELD 每个 SSE chunk"""
+        import httpx
+
+        model = kwargs.pop("model")
+        messages = kwargs.pop("messages")
+        base_url = kwargs.pop("base_url", "https://api.openai.com/v1")
+        proxy = kwargs.pop("proxy", None)
+        timeout = kwargs.pop("timeout", 30)
+        tools = kwargs.pop("tools", None)
+        tool_choice = kwargs.pop("tool_choice", None)
+
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._current_key()}",
+        }
+
+        body: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+        }
+
+        if "temperature" in kwargs:
+            body["temperature"] = kwargs["temperature"]
+        if "max_tokens" in kwargs:
+            body["max_tokens"] = kwargs["max_tokens"]
+        if tools:
+            body["tools"] = tools
+            if tool_choice:
+                body["tool_choice"] = tool_choice
+
+        client_kwargs: Dict[str, Any] = {
+            "timeout": httpx.Timeout(timeout),
+        }
+        if proxy:
+            client_kwargs["proxy"] = proxy
+
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            async with client.stream("POST", url, headers=headers, json=body) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("data: "):
+                        line = line[6:]
+                    if line == "[DONE]":
+                        break
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+    async def _acompletion(self, **kwargs) -> Dict[str, Any]:
+        return await self._request_openai_compatible(kwargs)
+
+    async def _stream_once(
+        self,
+        messages: List[Dict[str, Any]],
+        type: str,
+        tools: Optional[List[Dict[str, Any]]],
+        on_text: Optional[ChunkCallback],
+        on_reasoning: Optional[ChunkCallback],
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        kwargs = self._completion_kwargs(messages, type, True, tools)
+        content_parts: List[str] = []
+        tool_call_chunks: Dict[int, Dict[str, Any]] = {}
+
+        async for chunk in self._stream_iter_openai(kwargs):
+            choices = _get(chunk, "choices", [])
+            if not choices:
+                continue
+            delta = _get(choices[0], "delta", {})
+
+            reasoning = _get(delta, "reasoning_content") or _get(delta, "reasoning") or ""
+            if reasoning and on_reasoning:
+                await on_reasoning(str(reasoning))
+
+            content = _get(delta, "content") or ""
+            if content:
+                content = str(content)
+                content_parts.append(content)
+                if on_text:
+                    await on_text(content)
+
+            for tool_call in _get(delta, "tool_calls", []) or []:
+                idx = int(_get(tool_call, "index", 0))
+                state = tool_call_chunks.setdefault(
+                    idx,
+                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
                 )
-                res:str = ''
-                for choice in response.choices: # type: ignore
-                    res += choice.message.content.split('</think>')[-1].strip()
-                res = res.strip()
-                # 去掉头尾引号（如果有）
-                if res.startswith('"') and res.endswith('"'):
-                    res = res[1:-1]
-                if res.startswith("'") and res.endswith("'"):
-                    res = res[1:-1]
-                # 去掉可能存在的开头起始标志
-                if res.startswith(f"{custom.get('bot_name', 'AI')}:"):
-                    res = res[len(f"{custom.get('bot_name', 'AI')}:"):]
-                # 去掉可能存在的开头起始标志 (中文)
-                if res.startswith(f"{custom.get('bot_name', 'AI')}："):
-                    res = res[len(f"{custom.get('bot_name', 'AI')}："):]
-                # 替换多段回应中的回复起始标志
-                res = res.replace(f"\n\n{custom.get('bot_name', 'AI')}:", "*;")
-                # 正则匹配去掉多余的诸如 "[hh:mm:ss aa] bot_name:" 的形式
-                res = re.sub(r"\[\d{2}:\d{2}:\d{2} [AP]M\] ?" + custom.get('bot_name', 'AI') + r":", "", res)
-            else:
-                response = self.client.chat.completions.create(
-                    model=self.config['model'],
-                    prompt=prompt,
-                    temperature=self.config['temperature'],
-                    max_tokens=self.config['max_tokens'],
-                    # top_p=self.config['top_p'],
-                    # top_k=20,
-                    # min_p=0,
-                    frequency_penalty=self.config['frequency_penalty'],
-                    presence_penalty=self.config['presence_penalty'],
-                    extra_body={
-                        "thinking": {
-                            "type": "disabled",  # 不使用深度思考能力
-                            # "type": "enabled", # 使用深度思考能力
-                            # "type": "auto", # 模型自行判断是否使用深度思考能力
-                        }
-                    },
-                    stop=[f"\n{custom.get('bot_name', 'AI')}:", f"\n{custom.get('sender_name', 'Human')}:"]
-                )
-                res = response['choices'][0]['text'].split('</think>')[-1].strip() # type: ignore
-            return res, True
-        except Exception as e:
-            return f"请求 OpenAi Api 时发生错误: {e}", False
+                if _get(tool_call, "id"):
+                    state["id"] = _get(tool_call, "id")
+                function = _get(tool_call, "function", {}) or {}
+                if _get(function, "name"):
+                    state["function"]["name"] += str(_get(function, "name"))
+                if _get(function, "arguments"):
+                    state["function"]["arguments"] += str(_get(function, "arguments"))
 
-    def get_summarize_response(self, key:str, prompt:str, custom:dict = {})->Tuple[str, bool]:
-        """总结文本生成"""
-        self.client.api_key = key
-        try:
-            if 'qwen' in self.config['model_mini']:
-                prompt += '/no_think'
-            response = self.client.chat.completions.create(
-                model= self.config['model_mini'],
-                messages=[
-                    {'role': 'user', 'content': prompt},
-                ],
-                temperature=0.6,
-                max_tokens=self.config.get('max_summary_tokens', 512),
-                # top_p=0.8,
-                # top_k=20,
-                # min_p=0,
-                frequency_penalty=0.2,
-                presence_penalty=0.2,
-                extra_body={
-                    "thinking": {
-                        "type": "disabled",  # 不使用深度思考能力
-                        # "type": "enabled", # 使用深度思考能力
-                        # "type": "auto", # 模型自行判断是否使用深度思考能力
-                    }
-                },
-                timeout=self.config.get('timeout', 30),
-            )
-            res = ''
-            for choice in response.choices: # type: ignore
-                res += choice.message.content.split('</think>')[-1].strip()
-            res = res.strip()
-            # 去掉头尾引号（如果有）
-            if res.startswith('"') and res.endswith('"'):
-                res = res[1:-1]
-            if res.startswith("'") and res.endswith("'"):
-                res = res[1:-1]
-            # if self.config['model'].startswith('gpt-3.5-turbo'):
-            # else:
-            #     response = openai.Completion.create(
-            #         model="text-davinci-003",
-            #         prompt=prompt,
-            #         temperature=0.6,
-            #         max_tokens=self.config.get('max_summary_tokens', 512),
-            #         top_p=1,
-            #         frequency_penalty=0,
-            #         presence_penalty=0
-            #     )
-            #     res = response['choices'][0]['text'].strip() # type: ignore
-            return res, True
-        except Exception as e:
-            return f"请求 OpenAi Api 时发生错误: {e}", False
+        return "".join(content_parts), [v for _, v in sorted(tool_call_chunks.items()) if v["function"]["name"]]
 
-    def get_impression_response(self, key:str, prompt:str, custom:dict = {})->Tuple[str, bool]:
-        """印象文本生成"""
-        self.client.api_key = key
-        try:
-            if 'qwen' in self.config['model_mini']:
-                prompt += '/no_think'
-            response = self.client.chat.completions.create(
-                model= self.config['model_mini'],
-                messages=[
-                    {'role': 'user', 'content': prompt},
-                ],
-                temperature=0.6,
-                max_tokens=self.config.get('max_summary_tokens', 512),
-                # top_p=0.8,
-                # top_k=20,
-                # min_p=0,
-                frequency_penalty=0.2,
-                presence_penalty=0.2,
-                extra_body={
-                    "thinking": {
-                        "type": "disabled",  # 不使用深度思考能力
-                        # "type": "enabled", # 使用深度思考能力
-                        # "type": "auto", # 模型自行判断是否使用深度思考能力
-                    }
-                },
-                timeout=self.config.get('timeout', 30),
-            )
-            res = ''
-            for choice in response.choices: # type: ignore
-                res += choice.message.content.split('</think>')[-1].strip()
-            res = res.strip()
-            # 去掉头尾引号（如果有）
-            if res.startswith('"') and res.endswith('"'):
-                res = res[1:-1]
-            if res.startswith("'") and res.endswith("'"):
-                res = res[1:-1]
-            # if self.config['model'].startswith('gpt-3.5-turbo'):
-            # else:
-            #     response = openai.Completion.create(
-            #         model="text-davinci-003",
-            #         prompt=prompt,
-            #         temperature=0.6,
-            #         max_tokens=self.config.get('max_summary_tokens', 512),
-            #         top_p=1,
-            #         frequency_penalty=0,
-            #         presence_penalty=0
-            #     )
-            #     res = response['choices'][0]['text'].strip() # type: ignore
-            return res, True
-        except Exception as e:
-            return f"请求 OpenAi Api 时发生错误: {e}", False
+    async def _complete_once(self, messages: List[Dict[str, Any]], type: str, tools: Optional[List[Dict[str, Any]]]) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+        kwargs = self._completion_kwargs(messages, type, False, tools)
+        response = await self._acompletion(**kwargs)
+        message = _get(_get(response, "choices", [])[0], "message", {})
+        message_dict = _message_to_dict(message)
+        content = str(message_dict.get("content") or "")
+        tool_calls = message_dict.get("tool_calls") or []
+        return content, tool_calls, message_dict
+
+    async def _execute_tool_calls(self, messages: List[Dict[str, Any]], tool_calls: List[Dict[str, Any]], plugin_config) -> None:
+        for idx, tool_call in enumerate(tool_calls):
+            function = _get(tool_call, "function", {}) or {}
+            name = _get(function, "name", "")
+            raw_args = _get(function, "arguments", "{}") or "{}"
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except Exception:
+                args = {"raw": raw_args}
+
+            logger.info(f"[工具调用] {name}({json.dumps(args, ensure_ascii=False)})")
+            tool_call_id = _get(tool_call, "id", "") or f"call_{idx}"
+            tool_content, attachments = await execute_tool(name, args, plugin_config)
+            logger.info(f"[工具返回] {name} → {tool_content[:200]}{'...' if len(tool_content) > 200 else ''}")
+            self.last_tool_outputs.extend(attachments)
+            messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": name, "content": tool_content})
+
+    async def stream_response(
+        self,
+        prompt,
+        type: str = "chat",
+        custom: dict = {},
+        plugin_config=None,
+        on_text: Optional[ChunkCallback] = None,
+        on_reasoning: Optional[ChunkCallback] = None,
+    ) -> Tuple[str, bool]:
+        messages = self._normalize_prompt(prompt, custom)
+        self.last_tool_outputs = []
+        tool_schemas = get_tool_schemas(plugin_config) if plugin_config and type == "chat" else []
+        max_rounds = getattr(plugin_config, "LLM_MAX_TOOL_ROUNDS", 0) if plugin_config else 0
+
+        for _ in range(max_rounds + 1):
+            try:
+                if self.config.get("enable_stream", True):
+                    content, tool_calls = await self._stream_once(messages, type, tool_schemas, on_text, on_reasoning)
+                    if not tool_calls:
+                        return content.strip(), True
+                    messages.append({"role": "assistant", "content": content or None, "tool_calls": tool_calls})
+                else:
+                    content, tool_calls, message_dict = await self._complete_once(messages, type, tool_schemas)
+                    if not tool_calls:
+                        if on_text and content:
+                            await on_text(content)
+                        return content.strip(), True
+                    messages.append(message_dict)
+
+                await self._execute_tool_calls(messages, tool_calls, plugin_config)
+            except Exception as e:
+                logger.warning(f"LLM 请求失败: {e!r}")
+                self._rotate_key()
+                if len(self.api_keys) <= 1:
+                    return f"请求大模型时发生错误: {e!r}", False
+        return "工具调用轮数过多，已停止本次回复。", False
+
+    async def get_response(self, prompt, type: str = "chat", custom: dict = {}) -> Tuple[str, bool]:
+        chunks: List[str] = []
+
+        async def collect(chunk: str):
+            chunks.append(chunk)
+
+        return await self.stream_response(prompt, type=type, custom=custom, plugin_config=None, on_text=collect)
+
+    def consume_tool_outputs(self) -> List[Dict[str, Any]]:
+        outputs = self.last_tool_outputs
+        self.last_tool_outputs = []
+        return outputs
 
     @staticmethod
-    def generate_msg_template(sender:str, msg: str, time_str: str='') -> str:
-        """生成对话模板"""
+    def generate_msg_template(sender: str, msg: str, time_str: str = "") -> str:
         return f"{time_str}{sender}: {msg}"
-
-    # @staticmethod
-    # def cal_token_count(msg: str) -> int:
-    #     """计算字符串的token数量"""
-    #     try:
-    #         return len(tokenizer.encode(msg))
-    #     except:
-    #         return 2048
 
     @staticmethod
     def cal_token_count(text: str, model: str = "gpt-3.5-turbo"):
-        """计算字节对编码后的token数量
-
-        Args:
-            text (str): 文本
-            model (str, optional): 模型. Defaults to "gpt-3.5-turbo".
-
-        Returns:
-            int: token 数量
-        """
-
-        if model in enc_cache:
-            enc = enc_cache[model]
-        else:
-            enc = encoding_for_model(model)
-            enc_cache[model] = enc
-
-        return len(enc.encode(text))
-
+        try:
+            if model in enc_cache:
+                enc = enc_cache[model]
+            else:
+                enc = encoding_for_model(model)
+                enc_cache[model] = enc
+            return len(enc.encode(text))
+        except Exception:
+            return max(1, len(text) // 2)

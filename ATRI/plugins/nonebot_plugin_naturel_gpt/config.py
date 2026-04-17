@@ -5,6 +5,7 @@ from nonebot import get_driver
 from .logger import logger
 import yaml
 from pathlib import Path
+from .persona_loader import load_personas_from_directory
 
 class GlobalConfig(NBConfig, extra=Extra.ignore):
     """Plugin Config Here"""
@@ -20,12 +21,6 @@ class PresetConfig(BaseModel, extra=Extra.ignore):
     """此预设是否仅限私聊"""
     bot_self_introl:str = ''
 
-class ExtConfig(BaseModel, extra=Extra.ignore):
-    """扩展配置项"""
-    EXT_NAME:str
-    IS_ACTIVE:bool
-    EXT_CONFIG:Any
-
 class Config(BaseModel, extra=Extra.ignore):
     """ng 配置数据，默认保存为 naturel_gpt_config.yml"""
     OPENAI_API_KEYS: List[str]
@@ -38,8 +33,10 @@ class Config(BaseModel, extra=Extra.ignore):
     """请求OpenAI的基础URL"""
     REPLY_THROTTLE_TIME: int
     """回复间隔节流时间"""
-    PRESETS: Dict[str, PresetConfig]
-    """默认人格预设"""
+    PRESETS: Dict[str, PresetConfig] = {}
+    """运行时动态人格预设；不再从配置文件手写人格来源读取"""
+    DEFAULT_PERSONA: str
+    """默认人格名；为空或不存在时使用首个已加载人格"""
     IGNORE_PREFIX: str
     """忽略前缀 以该前缀开头的消息将不会被处理"""
     CHAT_MODEL: str
@@ -62,6 +59,15 @@ class Config(BaseModel, extra=Extra.ignore):
     """单次回复最大token数"""
     REQ_MAX_TOKENS: int
     """单次请求最大token数"""
+
+    LLM_ENABLE_STREAM: bool
+    """是否使用流式响应"""
+    LLM_SHOW_REASONING: bool
+    """是否把模型 reasoning_content 发送到聊天中"""
+    LLM_ENABLE_TOOLS: bool
+    """是否启用原生工具调用"""
+    LLM_MAX_TOOL_ROUNDS: int
+    """单轮回复最多工具调用轮数"""
 
     REPLY_ON_NAME_MENTION_PROBABILITY: float
     """是否在被提及时回复"""
@@ -88,8 +94,6 @@ class Config(BaseModel, extra=Extra.ignore):
     """是否强制使用pickle，默认使用json"""
     NG_DATA_PATH: str
     """数据文件目录"""
-    NG_EXT_PATH: str
-    """扩展目录"""
     NG_LOG_PATH: str
     """日志文件目录"""
 
@@ -113,8 +117,6 @@ class Config(BaseModel, extra=Extra.ignore):
     """消息响应优先级"""
     NG_BLOCK_OTHERS: bool
     """是否阻止其他插件响应"""
-    NG_ENABLE_EXT: bool
-    """是否启用扩展"""
     NG_TO_ME: bool
     """响应命令是否需要@bot"""
     ENABLE_COMMAND_TO_IMG: bool
@@ -135,14 +137,30 @@ class Config(BaseModel, extra=Extra.ignore):
     """每条消息最大响应次数"""
     NG_ENABLE_MSG_SPLIT: bool
     """是否启用消息分割"""
+    REPLY_SEGMENT_INTERVAL: float
+    """分段消息发送最短间隔秒数"""
+    REPLY_MAX_SEGMENTS: int
+    """单次回复最多分段数，最后一段会接收剩余流式内容"""
     NG_ENABLE_AWAKE_IDENTITIES: bool
     """是否允许自动唤醒其它人格"""
 
+    MULTIMODAL_ENABLE: bool
+    """是否允许接收图片作为多模态输入"""
+    MULTIMODAL_HISTORY_LENGTH: int
+    """多模态聊天记录视野长度"""
+    MULTIMODAL_MAX_MESSAGES_WITH_IMAGES: int
+    """最多保留几条消息中的图片"""
+
+    BOCHA_API_KEY: str
+    BOCHA_API_BASE: str
+    BOCHA_SEARCH_COUNT: int
+    WEB_FETCH_TIMEOUT: int
+    WEB_FETCH_MAX_CHARS: int
+    PLAYWRIGHT_TIMEOUT: int
+    LLM_TOOL_LOLICON_CONFIG: Dict[str, Any]
+
     UNLOCK_CONTENT_LIMIT: bool
     """解锁内容限制"""
-
-    NG_EXT_LOAD_LIST: List[ExtConfig]
-    """加载的扩展列表"""
 
     GROUP_CARD:bool
     """优先读取群名片"""
@@ -165,12 +183,6 @@ class Config(BaseModel, extra=Extra.ignore):
     MC_RCON_PASSWORD: str
     """MC服务器RCON密码"""
 
-    PRESETHUB_BED_URL: str
-    """预设库地址"""
-
-    PRESETHUB_ACCESS_TOKEN: str
-    """预设库访问令牌"""
-
     VERSION:str
     """配置文件版本信息"""
     
@@ -187,36 +199,8 @@ CONFIG_TEMPLATE = {
     'OPENAI_PROXY_SERVER': '',  # 请求OpenAI的代理服务器
     'OPENAI_BASE_URL': 'https://api.openai.com/v1',      # 请求OpenAI的基础URL
     "REPLY_THROTTLE_TIME": 3,   # 回复间隔节流时间
-    "PRESETS": {
-        "白羽": {
-            'preset_key': '白羽',  # 人格名称
-            'is_locked': True,  # 是否锁定人格，锁定后无法编辑人格
-            'is_default': True,  # 是否为默认人格
-            "is_only_private": False,
-            'bot_self_introl': '白羽是一名喜欢二次元的中二宅女，她机智、傲娇，对人类充满好奇，聊天时喜欢使用各种可爱的颜文字，如果冒犯到她会生气。',
-        },
-        "浅枫": {
-            'preset_key': '浅枫',
-            'is_locked': False,
-            'is_default': False,
-            "is_only_private": False,
-            'bot_self_introl': '浅枫酱是一名尽职尽责的女仆，她能够帮助主人做很多事情，对话中会体现出对主人的体贴与关心。',
-        },
-        "忆雨": {
-            'preset_key': '忆雨',
-            'is_locked': True,
-            'is_default': False,
-            "is_only_private": False,
-            'bot_self_introl': '忆雨是一名恐怖小说作家，是个阴沉的女孩，她非常恨人类，和陌生人聊天时的表现冷漠，不喜欢回复过多的文字，兴趣是恐怖小说，如果有人和她探讨如何消灭人类会很有兴致。',
-        },
-        "可洛喵": {
-            'preset_key': '可洛喵',
-            'is_locked': True,
-            'is_default': False,
-            "is_only_private": False,
-            'bot_self_introl': '可洛喵是一只可爱的猫，它不会说话，它的回复通常以"[动作/心情]声音+颜文字"形式出现，例如"[坐好]喵~(。・ω・。)"或"[开心]喵喵！ヾ(≧▽≦*)o"',
-        },
-    },
+    "PRESETS": {},
+    "DEFAULT_PERSONA": "",
     'IGNORE_PREFIX': '#',   # 忽略前缀 以该前缀开头的消息将不会被处理
     'CHAT_MODEL': "gpt-4o",
     'CHAT_MODEL_MINI': "gpt-4o-mini",
@@ -229,6 +213,11 @@ CONFIG_TEMPLATE = {
     'CHAT_MAX_SUMMARY_TOKENS': 512,   # 单次总结最大token数
     'REPLY_MAX_TOKENS': 1024,   # 单次回复最大token数
     'REQ_MAX_TOKENS': 3072,  # 单次请求最大token数
+
+    'LLM_ENABLE_STREAM': True,
+    'LLM_SHOW_REASONING': False,
+    'LLM_ENABLE_TOOLS': True,
+    'LLM_MAX_TOOL_ROUNDS': 3,
 
     'REPLY_ON_NAME_MENTION_PROBABILITY': 0,  # 被提及时回复概率
     'REPLY_ON_AT': True,            # 是否在被at时回复
@@ -244,7 +233,6 @@ CONFIG_TEMPLATE = {
 
     'NG_DATA_PICKLE': False,  # 强制使用pickle
     'NG_DATA_PATH': "./data/naturel_gpt/",  # 数据文件目录
-    'NG_EXT_PATH': "./data/naturel_gpt/extensions/",  # 扩展目录
     'NG_LOG_PATH': "./data/naturel_gpt/logs/",  # 扩展目录
 
     'ADMIN_USERID': ['123456'],  # 管理员QQ号
@@ -258,7 +246,6 @@ CONFIG_TEMPLATE = {
 
     'NG_MSG_PRIORITY': 99,       # 消息响应优先级
     'NG_BLOCK_OTHERS': False,    # 是否阻止其他插件响应
-    'NG_ENABLE_EXT': True,      # 是否启用扩展
     'NG_TO_ME':False,           # 响应命令是否需要@bot
     'ENABLE_COMMAND_TO_IMG': True,    #是否将rg相关指令转换为图片
     'ENABLE_MSG_TO_IMG': False,     #是否将机器人的回复转换成图片
@@ -270,16 +257,29 @@ CONFIG_TEMPLATE = {
 
     'NG_MAX_RESPONSE_PER_MSG': 5,  # 每条消息最大响应次数
     'NG_ENABLE_MSG_SPLIT': True,   # 是否启用消息分割
+    'REPLY_SEGMENT_INTERVAL': 1.0,
+    'REPLY_MAX_SEGMENTS': 5,
     'NG_ENABLE_AWAKE_IDENTITIES': True, # 是否允许自动唤醒其它人格
+
+    'MULTIMODAL_ENABLE': True,
+    'MULTIMODAL_HISTORY_LENGTH': 4,
+    'MULTIMODAL_MAX_MESSAGES_WITH_IMAGES': 2,
+
+    'BOCHA_API_KEY': '',
+    'BOCHA_API_BASE': 'https://api.bochaai.com/v1/web-search',
+    'BOCHA_SEARCH_COUNT': 5,
+    'WEB_FETCH_TIMEOUT': 20,
+    'WEB_FETCH_MAX_CHARS': 6000,
+    'PLAYWRIGHT_TIMEOUT': 20,
+    'LLM_TOOL_LOLICON_CONFIG': {
+        'proxy': None,
+        'r18': 0,
+        'pic_proxy': None,
+        'exclude_ai': True,
+    },
 
     'UNLOCK_CONTENT_LIMIT': False,  # 解锁内容限制
 
-    'NG_EXT_LOAD_LIST': [{
-        'EXT_NAME': 'ext_random',
-        'IS_ACTIVE': False,
-        'EXT_CONFIG': {'arg': 'arg_value'},
-    }],     # 加载的扩展列表
-    
     'GROUP_CARD':True,
     'NG_CHECK_USER_NAME_HYPHEN': False, # 检查用户名中的连字符
 
@@ -288,9 +288,6 @@ CONFIG_TEMPLATE = {
     'MC_RCON_HOST': '127.0.0.1',  # MC服务器RCON地址
     'MC_RCON_PORT': 25575,  # MC服务器RCON端口
     'MC_RCON_PASSWORD': '',  # MC服务器RCON密码
-
-    'PRESETHUB_BED_URL': 'https://presethub.miose.cn',  # 预设库地址
-    'PRESETHUB_ACCESS_TOKEN': '',   # 预设库访问令牌
 
     'VERSION':'1.0',
     'DEBUG_LEVEL': 0,  # debug level, [0, 1, 2], 0 为关闭，等级越高debug信息越详细
@@ -305,42 +302,112 @@ def get_config() ->Config:
     """获取config数据（为了能够reload建议使用此函数获取对象）"""
     return config
 
+
+def get_persona_dir() -> Path:
+    """人格目录固定为 naturel_gpt_config.yml 所在目录下的 personas 子目录。"""
+    return Path(config_path).resolve().parent / "personas"
+
+
+def _apply_default_persona(personas: Dict[str, PresetConfig], default_persona: str) -> None:
+    """Mark one loaded persona as default, falling back to the first loaded persona."""
+    if not personas:
+        return
+    selected = default_persona if default_persona in personas else next(iter(personas))
+    for preset_key, preset in personas.items():
+        preset.is_default = preset_key == selected
+
+
+def load_dynamic_persona_presets() -> Dict[str, PresetConfig]:
+    """从配置文件同级的 personas 子目录动态加载 md/skill 人格。"""
+    persona_presets: Dict[str, PresetConfig] = {}
+    for preset_key, persona_text in load_personas_from_directory(str(get_persona_dir())).items():
+        persona_presets[preset_key] = PresetConfig(
+            preset_key=preset_key,
+            is_locked=False,
+            is_default=False,
+            is_only_private=False,
+            bot_self_introl=persona_text,
+        )
+    if config:
+        _apply_default_persona(persona_presets, config.DEFAULT_PERSONA)
+    return persona_presets
+
+
+def reload_dynamic_personas() -> int:
+    """动态刷新配置文件同级 personas 子目录人格到全局 config.PRESETS。"""
+    if not config:
+        return 0
+    persona_presets = load_dynamic_persona_presets()
+    config.PRESETS.clear()
+    for preset_key, preset in persona_presets.items():
+        config.PRESETS[preset_key] = preset
+    if not config.PRESETS:
+        config.PRESETS["default"] = PresetConfig(
+            preset_key="default",
+            is_locked=False,
+            is_default=True,
+            is_only_private=False,
+            bot_self_introl="你是一个自然参与群聊的聊天助手。回复要简短、直接、像真实人类一样。",
+        )
+    return len(persona_presets)
+
 def _load_config_obj_from_file()->Config:
     """从配置文件加载Config对象"""
     # 读取配置文件
     with open(config_path, 'r', encoding='utf-8') as f:
         try:
             config_obj_from_file:Dict = yaml.load(f, Loader=yaml.FullLoader)
-            # 兼容 preset_key 和 bot_name
-            for v in config_obj_from_file["PRESETS"].values():
-                if 'bot_name' in v:
-                    if "preset_key" not in v:
-                        v["preset_key"] = v["bot_name"]
-                    del v["bot_name"]
+            for k in CONFIG_TEMPLATE.keys():
+                if not k in config_obj_from_file.keys():
+                    config_obj_from_file[k] = CONFIG_TEMPLATE[k]
+                    logger.info(f"Naturel GPT 配置文件缺少 {k} 项，将使用默认值")
+
+            # 人格来源固定为 naturel_gpt_config.yml 同级的 personas 子目录。
+            # 配置文件中的 PRESETS 不再作为输入来源，保留字段仅用于运行时承载动态人格。
+            config_obj_from_file["PRESETS"] = {}
+
+            for preset_key, persona_text in load_personas_from_directory(str(get_persona_dir())).items():
+                config_obj_from_file["PRESETS"][preset_key] = {
+                    "preset_key": preset_key,
+                    "is_locked": False,
+                    "is_default": False,
+                    "is_only_private": False,
+                    "bot_self_introl": persona_text,
+                }
+            if config_obj_from_file["PRESETS"]:
+                selected_persona = config_obj_from_file.get("DEFAULT_PERSONA", "")
+                if selected_persona not in config_obj_from_file["PRESETS"]:
+                    selected_persona = next(iter(config_obj_from_file["PRESETS"]))
+                for preset_key, preset in config_obj_from_file["PRESETS"].items():
+                    preset["is_default"] = preset_key == selected_persona
+            if not config_obj_from_file["PRESETS"]:
+                config_obj_from_file["PRESETS"]["default"] = {
+                    "preset_key": "default",
+                    "is_locked": False,
+                    "is_default": True,
+                    "is_only_private": False,
+                    "bot_self_introl": "你是一个自然参与群聊的聊天助手。回复要简短、直接、像真实人类一样。",
+                }
         except Exception as e:
             logger.error(f"Naturel GPT 配置文件读取失败，请检查配置文件填写是否符合yml文件格式规范，错误信息：{e}")
             raise e
-        
-        for k in CONFIG_TEMPLATE.keys():
-            if not k in config_obj_from_file.keys():
-                config_obj_from_file[k] = CONFIG_TEMPLATE[k]
-                logger.info(f"Naturel GPT 配置文件缺少 {k} 项，将使用默认值")
 
         config_obj = Config.parse_obj(config_obj_from_file)
     return config_obj
 
 def save_config():
-    # 检查数据文件夹目录、扩展目录、日志目录是否存在 不存在则创建
+    # 检查数据文件夹目录、日志目录是否存在 不存在则创建
     if not Path(config.NG_DATA_PATH[:-1]).exists():
         Path(config.NG_DATA_PATH[:-1]).mkdir(parents=True)
-    if not Path(config.NG_EXT_PATH[:-1]).exists():
-        Path(config.NG_EXT_PATH[:-1]).mkdir(parents=True)
     if not Path(config.NG_LOG_PATH[:-1]).exists():
         Path(config.NG_LOG_PATH[:-1]).mkdir(parents=True)
+    get_persona_dir().mkdir(parents=True, exist_ok=True)
 
     # 保存配置文件
     with open(config_path, 'w', encoding='utf-8') as f:
-        yaml.dump(config.dict(), f, allow_unicode=True, sort_keys=False)
+        config_dict = config.dict()
+        config_dict["PRESETS"] = {}
+        yaml.dump(config_dict, f, allow_unicode=True, sort_keys=False)
 
 def load_config_from_file_then_save():
     """加载配置文件，然后保存回文件"""

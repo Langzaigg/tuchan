@@ -1,17 +1,11 @@
-import difflib
-import os
+﻿import difflib
 from typing import Optional, Dict
-
-import requests
 
 from .chat import Chat
 from .chat_manager import ChatManager
 from .config import *
-from .Extension import global_extensions, load_extensions
 from .logger import logger
 from .persistent_data_manager import PersistentDataManager
-
-from .preset_hub_funcs import upload_preset, get_preset, search_preset, delete_preset
 
 # 选项类型  bool只要有就是True，str则需要跟上参数值
 option_type = {
@@ -22,12 +16,6 @@ option_type = {
     'to_default': bool,
     'default': str,
     'show': bool,
-    'by': str,
-    'desc': str,
-    'n': str,
-    'use': str,
-    'p': str,
-    'ps': str,
 }
 
 class CommandManager:
@@ -116,54 +104,79 @@ class CommandManager:
 
 cmd:CommandManager = CommandManager()
 
+
+def _refresh_dynamic_personas() -> int:
+    try:
+        return reload_dynamic_personas()
+    except Exception as e:
+        logger.warning(f"动态加载人格失败: {e!r}")
+        return 0
+
+
+def _available_presets(chat_presets_dict: dict) -> Dict:
+    _refresh_dynamic_personas()
+    presets = dict(config.PRESETS)
+    presets.update(chat_presets_dict)
+    return presets
+
+
+def _render_preset_list(chat: Chat, chat_presets_dict: dict, admin: bool = False) -> str:
+    presets = _available_presets(chat_presets_dict)
+    presets_show_text = '\n'.join([
+        f'  -> {k + " (当前)" if k == chat.preset_key else k}'
+        for k in presets.keys()
+    ])
+    if admin:
+        return (
+            f"当前可用人格预设列表:\n"
+            f"{presets_show_text}\n"
+            f"=======================\n"
+            f"+ 切换人格: rg set <预设名>\n"
+            f"+ 查看人格: rg query <预设名>\n"
+            f"+ 刷新/展示人格列表: rg 或 rg list\n"
+            f"+ 编辑预设: rg edit <预设名> <人格信息> <-global?>\n"
+            f"+ 添加预设: rg new <预设名> <人格信息> <-global?>\n"
+            f"+ 删除预设: rg del <预设名> <-global?>\n"
+            f"+ 重命名预设: rg rename <原预设名> <新预设名> <-global?>\n"
+            f"+ 开关会话: rg <on/off> <-global?>\n"
+            f"+ 重置会话: rg reset <-global?>\n"
+            f"+ 查询会话(超管): rg chats\n"
+            f"* -global 参数表示全局设置，仅超管可用\n"
+        )
+    return (
+        f"会话: {chat.chat_key} [{'启用' if chat.is_enable else '禁用'}]\n"
+        f"当前可用人格预设列表:\n"
+        f"{presets_show_text}\n"
+        f"提示: 使用 `rg set <预设名>` 切换人格。"
+    )
+
 """ 注册指令 """
 @cmd.register(route='rg')
 def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
-    presets_show_text = '\n'.join([f'  -> {k + " (当前)" if k == chat.preset_key else k}' for k in chat_presets_dict.keys()])
-    if option_dict.get('admin'):
-        return {
-            'msg': (
-                f"当前可用人格预设有:\n"
-                f"{presets_show_text}\n"
-                f"=======================\n"
-                f"+ 使用预设: rg set <预设名> <-global?>\n"
-                f"+ 查询预设: rg query <预设名>\n"
-                f"+ 编辑预设: rg edit <预设名> <人格信息> <-global?>\n"
-                f"+ 添加预设: rg new <预设名> <人格信息> <-global?>\n"
-                f"+ 删除预设: rg del <预设名> <-global?>\n"
-                f"+ 改名预设: rg rename <原预设名> <新预设名> <-global?>\n"
-                f"+ 开关会话: rg <on/off> <-global?>\n"
-                f"+ 重置会话: rg reset <-global?>\n"
-                f"+ 查询会话(超管): rg chats\n"
-                f"+ 扩展信息(超管): rg ext\n"
-                f"* -global 参数表示是否全局设置(仅超管可用)\n"
-                f"* 改名/重命名预设将丢失所有会话历史！\n"
-                f"* 更多帮助请访问: NG指令文档\n"
-                f"Tip: <人格信息> 是一段第三人称的人设说明(建议不超过200字)\n"
-            )
-        }
-    else:
-        return {
-            'msg': (
-                f"会话: {chat.chat_key} [{'启用' if chat.is_enable else '禁用'}]\n"
-                f"当前可用人格预设有:\n"
-                f"{presets_show_text}\n"
-                # f"=======================\n"
-                # f"+ 使用预设: rg set <预设名>\n"
-                # f"+ 查询预设: rg query <预设名>\n"
-                # f"+ 编辑预设: rg edit <预设名> <人格信息>\n"
-                # f"+ 添加预设: rg new <预设名> <人格信息>\n"
-                # f"+ 删除预设: rg del <预设名>\n"
-                # f"+ 改名预设: rg rename <原预设名> <新预设名>\n"
-                # f"+ 重置会话: rg reset\n"
-                # f"* 改名/重命名预设将丢失所有会话历史！\n"
-                # f"Tip: <人格信息> 是一段第三人称的人设说明(建议不超过200字)\n"
-            )
-        }
+    return {'msg': _render_preset_list(chat, chat_presets_dict, bool(option_dict.get('admin')))}
+
+@cmd.register(route='rg/list')
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+    return {'msg': _render_preset_list(chat, chat_presets_dict, bool(option_dict.get('admin')))}
+
 
 @cmd.register(route='rg/set', params=['preset_key', 'preset_intro'])
 def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+    _refresh_dynamic_personas()
     target_preset_key = param_dict['preset_key']
+    if target_preset_key in config.PRESETS and target_preset_key not in chat_presets_dict:
+        chat.add_preset_from_config(target_preset_key, config.PRESETS[target_preset_key])
+        chat_presets_dict = chat.chat_data.preset_datas
+    if target_preset_key not in chat_presets_dict:
+        matched_preset_keys = difflib.get_close_matches(target_preset_key, _available_presets(chat_presets_dict).keys(), n=1, cutoff=0.3)
+        if not matched_preset_keys:
+            return {'msg': "找不到匹配的人格预设"}
+        target_preset_key = matched_preset_keys[0]
+        if target_preset_key in config.PRESETS and target_preset_key not in chat_presets_dict:
+            chat.add_preset_from_config(target_preset_key, config.PRESETS[target_preset_key])
+            chat_presets_dict = chat.chat_data.preset_datas
+        if target_preset_key not in chat_presets_dict:
+            return {'msg': "找不到匹配的人格预设"}
     if target_preset_key not in chat_presets_dict:  # 如果预设不存在，匹配最相似的预设
         target_preset_key = difflib.get_close_matches(target_preset_key, chat_presets_dict.keys(), n=1, cutoff=0.3)
         if len(target_preset_key) == 0:
@@ -188,7 +201,16 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
 
 @cmd.register(route='rg/query', params=['preset_key'])
 def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+    _refresh_dynamic_personas()
     target_preset_key = param_dict['preset_key']
+    if target_preset_key in config.PRESETS and target_preset_key not in chat_presets_dict:
+        return {'msg': f"预设: {target_preset_key} |\n  {config.PRESETS[target_preset_key].bot_self_introl}"}
+    if target_preset_key not in chat_presets_dict:
+        available_presets = _available_presets(chat_presets_dict)
+        matched_preset_keys = difflib.get_close_matches(target_preset_key, available_presets.keys(), n=1, cutoff=0.3)
+        if matched_preset_keys:
+            matched_key = matched_preset_keys[0]
+            return {'msg': f"预设: {matched_key} |\n  {available_presets[matched_key].bot_self_introl}"}
     if target_preset_key not in chat_presets_dict:
         # 如果预设不存在，进行逐一进行字符匹配，选择最相似的预设
         target_preset_key = difflib.get_close_matches(target_preset_key, chat_presets_dict.keys(), n=1, cutoff=0.3)
@@ -386,119 +408,6 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
         chat.toggle_auto_switch(enabled=True)
         return {'msg': f"解锁当前会话 (￣▽￣)-ok!"}
 
-@cmd.register(route='rg/ext')
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
-    ext_info:str = ''
-    for ext in global_extensions.values():
-        ext_info += f"  {ext.generate_short_description()}"
-    return {'msg': (
-            f"已加载的扩展:\n{ext_info}"
-            f"=======================\n"
-            f"+ 下载扩展: rg ext add <扩展名>\n"
-            f"+ 删除扩展: rg ext del <扩展名>\n"
-        )}
-
-@cmd.register(route='rg/ext/add', params=['ext_name'])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
-    ext_base_url = "https://raw.githubusercontent.com/KroMiose/nonebot_plugin_naturel_gpt/main/extensions"
-    ext_name:str = param_dict.get('ext_name')
-    if not ext_name:
-        return {'msg': f"未指定扩展名!"}
-    if not ext_name.startswith('ext_'): # 扩展名不以 ext_ 开头则自动补全
-        ext_name = f"ext_{ext_name}"
-    if not ext_name.endswith('.py'):    # 扩展名不以 .py 结尾则自动补全
-        ext_name = f"{ext_name}.py"
-
-    ext_file_path = f"{config.NG_EXT_PATH}{ext_name}"   # 扩展文件存储路径
-    # 从 github 下载扩展
-    try:
-        with open(ext_file_path, 'w', encoding='utf-8') as f:
-            code = requests.get(f"{ext_base_url}/{ext_name}", timeout=10)
-            if code.text.startswith('404: Not Found'):
-                return {'msg': f"下载扩展失败: 未找到扩展 {ext_name}"}
-            f.write(code.text)
-    except Exception as e:
-        return {'msg': f"下载扩展失败: {e}"}
-    return {'msg': f"下载扩展 {ext_name} 成功!"}
-
-@cmd.register(route='rg/ext/del', params=['ext_name'])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
-    ext_name = param_dict.get('ext_name')
-    if not ext_name:
-        return {'msg': f"未指定扩展名!"}
-    if not ext_name.startswith('ext_'): # 扩展名不以 ext_ 开头则自动补全
-        ext_name = f"ext_{ext_name}"
-    if not ext_name.endswith('.py'):    # 扩展名不以 .py 结尾则自动补全
-        ext_name = f"{ext_name}.py"
-
-    ext_file_path = f"{config.NG_EXT_PATH}{ext_name}"   # 扩展文件存储路径
-    # 从本地文件删除扩展
-    try:
-        os.remove(ext_file_path)
-    except Exception as e:
-        return {'msg': f"删除扩展失败: {e}"}
-    return {'msg': f"删除扩展 {ext_name} 成功!"}
-
-@cmd.register(route='rg/ext/reload', params=['ext_name'])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
-    load_extensions(config.dict())
-    return {'msg': f"重载扩展成功!"}
-
-def find_ext(ext_name: str) -> Optional[ExtConfig]:
-    ext_name = ext_name.lower()
-    for ext in config.NG_EXT_LOAD_LIST:
-        will_find = ext.EXT_NAME.lower()
-        if will_find == ext_name or will_find == f"ext_{ext_name}":
-            return ext
-    return None
-
-@cmd.register(route='rg/ext/on', params=['ext_name'])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
-    ext_name: str = param_dict.get('ext_name')
-    if not ext_name:
-        return {'msg': "未指定扩展名!"}
-
-    ext_name = ext_name.lower()
-    ext = find_ext(ext_name)
-    if not ext:
-        ext_paths = [
-            x for x in Path(config.NG_EXT_PATH).glob('ext_*.py')
-            if (
-                (will_find := x.stem.lower()) == ext_name
-                or will_find == f"ext_{ext_name}"
-            )
-        ]
-        if not ext_paths:
-            return {'msg': "找不到此扩展或此扩展未加载"}
-
-        ext_file_path = ext_paths[0]
-        ext = ExtConfig(EXT_NAME=ext_file_path.stem, IS_ACTIVE=False, EXT_CONFIG={})
-        config.NG_EXT_LOAD_LIST.append(ext)
-
-    if ext.IS_ACTIVE:
-        return {'msg': "该扩展已经被启用过了"}
-
-    ext.IS_ACTIVE = True
-    save_config()
-    return {'msg': "已启用该扩展，请使用 `rg ext reload` 指令重载所有扩展"}
-
-@cmd.register(route='rg/ext/off', params=['ext_name'])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
-    ext_name: str = param_dict.get('ext_name')
-    if not ext_name:
-        return {'msg': "未指定扩展名!"}
-
-    ext = find_ext(ext_name)
-    if not ext:
-        return {'msg': "找不到此扩展或此扩展未加载"}
-
-    if ext.IS_ACTIVE:
-        ext.IS_ACTIVE = False
-        save_config()
-        return {'msg': "已禁用该扩展，请使用 `rg ext reload` 指令重载所有扩展"}
-
-    return {'msg': "该扩展已经被禁用过了"}
-
 @cmd.register(route='rg/chats')
 def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
     chat_info:str = ''
@@ -512,93 +421,6 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
     PersistentDataManager.instance.load_from_file()
     return {'msg': f"配置文件重载成功! ver:{config.VERSION}"}
 
-""" PresetHub 相关命令 """
-
-@cmd.register(route='rg/search', params=["keyword"])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
-    keyword = param_dict.get('keyword')
-    page = int(option_dict.get('p', '1'))
-    page_size = int(option_dict.get('ps', '10'))
-
-    def gen_preset_info(record: Dict):
-        return (
-            f"+ {record['preset_key']} - id: {record['id']}\n"
-            f"    预设名: {record['name']} by: {record['uploader']}\n"
-        )
-
-    success, data = search_preset(keyword, page=page, page_size=page_size)
-    if success:
-        return {'msg': f"从 PresetHub 中搜索 \"{keyword}\" 结果:\n{''.join([gen_preset_info(r) for r in data['list']])}\n页码:{page}/{data['total']//page_size + 1} - 共 {data['total']} 条\n\ntips: 使用 `rg get <预设id> -u ~` 可应用预设"}
-    else:
-        return {'msg': f"检索预设库数据时出现错误: {data}"}
-
-
-@cmd.register(route='rg/get', params=["preset_id"])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
-    preset_id = param_dict.get('preset_id')
-    with_use = option_dict.get('use')
-
-    if not preset_id:
-        return {"msg": "未指定预设ID!"}
-
-    success, data = get_preset(preset_id, bool(with_use))
-    if success:
-        if with_use:
-            target_preset_key = data['preset_key'] if with_use == "~" else with_use
-
-            if option_dict.get('global'):   # 全局应用
-                success_cnt, fail_cnt = ChatManager.instance.add_preset_for_all(preset_key=target_preset_key, bot_self_introl=data['self_intro'])
-                return {'msg': f"添加预设: {target_preset_key} (￣▽￣)-ok! (所有会话) 成功:{success_cnt}，失败:{fail_cnt}", 'is_progress': True}
-            elif option_dict.get('target'): # 指定会话应用
-                target_chat_key = option_dict.get('target')
-                target_chat = ChatManager.instance.get_chat(chat_key=target_chat_key)
-                if not target_chat:
-                    return {'msg': f"会话: {target_chat_key} 不存在! (；′⌒`)"}
-                success, err_msg = target_chat.add_preset(preset_key=target_preset_key, bot_self_introl=data['self_intro'])
-                if success:
-                    return {'msg': f"添加预设: {target_preset_key} (￣▽￣)-ok! (会话: {target_chat_key})", 'is_progress': True}
-                else:
-                    return {'msg': f"添加预设: {target_preset_key} 失败! (会话: {target_chat_key}) (；′⌒`)\n{err_msg}", 'is_progress': True}
-            else:   # 当前会话应用
-                success, err_msg = chat.add_preset(preset_key=target_preset_key, bot_self_introl=data['self_intro'])
-                if success:
-                    return {'msg': f"添加预设: {target_preset_key} (￣▽￣)-ok!", 'is_progress': True}
-                else:
-                    return {'msg': f"添加预设: {target_preset_key} 失败! (；′⌒`)\n{err_msg}", 'is_progress': True}
-
-        else:
-            return {"msg": f"查询到预设信息: {data['name']}\n  预设键: {data['preset_key']}\n  预设值: {data['self_intro']}{('  描述:' + data.get('description')) if data.get('description') else ''}\n  (id: {data['id']})"}
-    else:
-        return {"msg": f"获取预设时出现错误: {data}"}
-
-@cmd.register(route='rg/upload', params=["preset_key", "preset_intro"])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
-    preset_key = param_dict['preset_key']
-    self_intro = param_dict.get('preset_intro', '')
-    name = option_dict.get('n', preset_key)
-    uploader = option_dict.get('by', 'Unknown')
-    description = option_dict.get('desc', '')
-
-    if not (preset_key or self_intro):
-        return {"msg": "未指定预设名或预设介绍!"}
-
-    success, data = upload_preset(name, preset_key, self_intro, uploader, description)
-    if success:
-        return {"msg": f"上传预设成功! 预设名: {preset_key}\nid: {data['id']}"}
-    else:
-        return {"msg": f"上传预设时出现错误: {data}"}
-
-@cmd.register(route='rg/ph/del', params=["preset_id"])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
-    preset_id = param_dict.get('preset_id')
-
-    success, data = delete_preset(preset_id)
-    if success:
-        return {"msg": "从 PresetHub 中删除预设成功!"}
-    else:
-        return {"msg": f"删除预设时出现错误: {data}"}
-
-
 # 提交指令注册
 cmd.submit_commands()
 
@@ -608,3 +430,4 @@ cmd.submit_commands()
 #         chat=None,
 #         chat_presets_dict={},
 #     ))
+

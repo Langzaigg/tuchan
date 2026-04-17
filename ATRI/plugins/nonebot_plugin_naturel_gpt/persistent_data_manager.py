@@ -99,12 +99,15 @@ class ChatData(StoreSerializable):
     # 以下为对话产生的数据
     chat_history: List[str] = field(default_factory=lambda: [])
     """当前会话的全局对话历史"""
+    chat_image_history: List[Dict[str, Any]] = field(default_factory=lambda: [])
+    """最近包含图片的消息，用于多模态上下文"""
     chat_summarized: str = field(default="")
     """总结"""
 
     def reset(self):
         """重置当前会话历史数据"""
         self.chat_history.clear()
+        self.chat_image_history.clear()
         self.chat_summarized = ''
 
         for k, v in self.preset_datas.items():
@@ -119,6 +122,8 @@ class ChatData(StoreSerializable):
             k: PresetData._load_from_dict(v)
             for k, v in self.preset_datas.items()
         }
+        if not hasattr(self, "chat_image_history"):
+            self.chat_image_history = []
         return self
 
 
