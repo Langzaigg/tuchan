@@ -132,7 +132,3 @@ class ChatManager(Singleton["ChatManager"]):
                 fail_cnt += 1
         return (success_cnt, fail_cnt)
     
-    def clear_all_chat_summary(self):
-        """清除所有的聊天摘要"""
-        for chat in self._chat_dict.values():
-            chat.chat_data.chat_summarized = ''

@@ -6,6 +6,8 @@ from .chat_manager import ChatManager
 from .config import *
 from .logger import logger
 from .persistent_data_manager import PersistentDataManager
+from .llm_tool_plugins import enable_anima_tool, disable_anima_tool
+from .llm_tool_plugins import anima_generate
 
 # 选项类型  bool只要有就是True，str则需要跟上参数值
 option_type = {
@@ -420,6 +422,37 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
     reload_config()
     PersistentDataManager.instance.load_from_file()
     return {'msg': f"配置文件重载成功! ver:{config.VERSION}"}
+
+@cmd.register(route='rg/draw', params=['state'])
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+    state = param_dict.get('state', '').strip().lower()
+    if state not in ('on', 'off'):
+        return {'msg': "用法: rg draw <on/off>"}
+
+    if state == 'on':
+        # 1) health check
+        ok, err = anima_generate.health_check_sync()
+        if not ok:
+            return {'msg': f"Anima 画图服务离线，无法开启: {err}"}
+
+        # 2) 加载 schema + knowledge
+        ok, err = anima_generate.fetch_schema_and_knowledge_sync()
+        if not ok:
+            return {'msg': f"加载 Anima 规范失败: {err}"}
+
+        # 3) 注册工具（全局注册一次即可，多个会话共用同一套 schema）
+        if enable_anima_tool():
+            logger.info(f"[会话: {chat.chat_key}] Anima 画图工具已注册")
+
+        # 4) 设置当前会话内存状态
+        anima_generate.set_chat_enabled(chat.chat_key, True)
+        return {'msg': "Anima 画图已开启 (￣▽￣)-ok!"}
+    else:
+        anima_generate.set_chat_enabled(chat.chat_key, False)
+        # 若没有任何会话开启，则卸载工具
+        if not anima_generate.any_chat_enabled():
+            disable_anima_tool()
+        return {'msg': "Anima 画图已关闭 (￣▽￣)-ok!"}
 
 # 提交指令注册
 cmd.submit_commands()

@@ -76,9 +76,19 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
         .replace(".jpg", "_master1200.jpg")
         .replace(".png", "_master1200.jpg")
     )
+    pid = pic.get("pid")
+    author = pic.get("author")
+    tags = ", ".join(pic.get("tags") or [])
     content = (
-        f"已找到图片。标题: {pic.get('title')}; 作者: {pic.get('author')}; "
-        f"PID: {pic.get('pid')}; 标签: {', '.join(pic.get('tags') or [])}。"
-        f"图片会作为图片消息自动发送给用户，你只需要自然地提到找到了图片即可。图片地址: {display_url}"
+        f"已找到图片。标题: {pic.get('title')}; 作者: {author}; "
+        f"标签: {tags}。"
+        f"图片会自动发送给用户，只需要描述图片信息即可。图片地址: {display_url}"
     )
-    return content, [{"type": "image", "url": display_url}]
+    attachment = {
+        "type": "image",
+        "url": display_url,
+        "pid": pid,
+        "author": author,
+        "gallery_url": f"https://www.pixiv.net/artworks/{pid}" if pid else None,
+    }
+    return content, [attachment]

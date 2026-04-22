@@ -13,7 +13,6 @@ from nonebot.adapters.onebot.v11.permission import GROUP_ADMIN, GROUP_OWNER
 from nonebot.adapters.onebot.v11 import Message, MessageEvent, PrivateMessageEvent, GroupMessageEvent, MessageSegment, GroupIncreaseNoticeEvent
 
 from .config import config
-
 try:
     import ujson as json
 except ImportError:
@@ -84,6 +83,33 @@ async def gen_chat_text(event: MessageEvent, bot:Bot) -> Tuple[str, bool]:
         return msg, wake_up
 
 
+def _is_supported_image_url(url: str) -> bool:
+    return bool(url) and str(url).strip().startswith(("http://", "https://", "data:image/"))
+
+
+async def _extract_message_text_and_images(message: Message, event: MessageEvent, bot: Bot) -> Tuple[str, List[str]]:
+    text = ""
+    image_urls: List[str] = []
+    for seg in message:
+        if seg.is_text():
+            text += seg.data.get("text", "")
+        elif seg.type == "at":
+            qq = seg.data.get("qq", None)
+            if qq == "all":
+                text += "@全体成员"
+            elif qq:
+                try:
+                    user_name = await get_user_name(event=event, bot=bot, user_id=int(qq))
+                    text += f"@{user_name or qq}"
+                except Exception:
+                    text += f"@{qq}"
+        elif seg.type == "image":
+            url = seg.data.get("url") or seg.data.get("file")
+            if _is_supported_image_url(url):
+                image_urls.append(str(url))
+    return text.strip(), image_urls
+
+
 async def gen_chat_payload(event: MessageEvent, bot: Bot) -> Tuple[str, bool, List[str]]:
     """生成会话文本和图片 URL。保留 gen_chat_text 兼容旧调用。"""
     chat_text, wake_up = await gen_chat_text(event, bot)
@@ -95,7 +121,7 @@ async def gen_chat_payload(event: MessageEvent, bot: Bot) -> Tuple[str, bool, Li
         if seg.type != "image":
             continue
         url = seg.data.get("url") or seg.data.get("file")
-        if url:
+        if _is_supported_image_url(url):
             image_urls.append(str(url))
     return chat_text, wake_up, image_urls
     

@@ -15,6 +15,7 @@ from .persistent_data_manager import PersistentDataManager
 from .chat_manager import ChatManager
 from . import matcher
 from . import matcher_MCRcon # noqa: F401
+from .llm_tool_plugins import init_tools
 
 
 def set_permission_check_func(callback:Callable[[Matcher, Event, Bot, str, str], Awaitable[Tuple[bool,Optional[str]]]]):
@@ -28,14 +29,12 @@ set_permission_check_func(utils.default_permission_check_func)
 PersistentDataManager.instance.load_from_file()
 ChatManager.instance.create_all_chat_object() # 启动时创建所有的已有Chat对象，以便被 -all 相关指令控制
 
+# 条件加载工具（如博查搜索需配置 key 才注册）
+init_tools(config)
+
 # 读取ApiKeys
 api_keys = config.OPENAI_API_KEYS
 logger.info(f"共读取到 {len(api_keys)} 个API Key")
-
-# 检查聊天摘要功能是否开启 未开启则清空所有聊天摘要
-if not config.CHAT_ENABLE_SUMMARY_CHAT:
-    logger.warning("聊天摘要功能已关闭，将自动清理历史聊天摘要数据")
-    ChatManager.instance.clear_all_chat_summary()
 
 """ ======== 初始化对话文本生成器 ======== """
 TextGenerator.instance.init(api_keys=api_keys, config={

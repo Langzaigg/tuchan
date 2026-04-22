@@ -6,7 +6,7 @@ schema = {
     "type": "function",
     "function": {
         "name": "browse_url",
-        "description": "Open a page with Playwright, wait for browser rendering, and return visible text.",
+        "description": "ONLY use when fetch_url fails or the page requires JavaScript rendering. Open a page with Playwright, wait for browser rendering, and return visible text.",
         "parameters": {
             "type": "object",
             "properties": {
