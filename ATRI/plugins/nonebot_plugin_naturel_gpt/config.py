@@ -51,8 +51,6 @@ class Config(BaseModel, extra=Extra.ignore):
     CHAT_FREQUENCY_PENALTY: float
     """复读惩罚"""
 
-    CHAT_HISTORY_MAX_TOKENS: int
-    """上下文聊天记录最大token数"""
     CHAT_MAX_SUMMARY_TOKENS: int
     """单次总结最大token数"""
     REPLY_MAX_TOKENS: int
@@ -87,8 +85,6 @@ class Config(BaseModel, extra=Extra.ignore):
     """短期对话记忆长度"""
     CHAT_MEMORY_MAX_LENGTH: int
     """长期对话记忆长度"""
-    CHAT_SUMMARY_INTERVAL: int
-    """长期对话记忆间隔"""
 
     NG_DATA_PICKLE: bool
     """是否强制使用pickle，默认使用json"""
@@ -130,11 +126,6 @@ class Config(BaseModel, extra=Extra.ignore):
     """是否启用记忆功能"""
     MEMORY_MAX_LENGTH: int
     """记忆最大条数"""
-    MEMORY_ENHANCE_THRESHOLD: float
-    """记忆强化阈值"""
-
-    NG_MAX_RESPONSE_PER_MSG: int
-    """每条消息最大响应次数"""
     NG_ENABLE_MSG_SPLIT: bool
     """是否启用消息分割"""
     REPLY_SEGMENT_INTERVAL: float
@@ -158,6 +149,9 @@ class Config(BaseModel, extra=Extra.ignore):
     WEB_FETCH_MAX_CHARS: int
     PLAYWRIGHT_TIMEOUT: int
     LLM_TOOL_LOLICON_CONFIG: Dict[str, Any]
+
+    COMFYUI_BASE_URL: str
+    """ComfyUI Anima 画图服务地址"""
 
     UNLOCK_CONTENT_LIMIT: bool
     """解锁内容限制"""
@@ -209,7 +203,6 @@ CONFIG_TEMPLATE = {
     'CHAT_PRESENCE_PENALTY': 0.4,   # 主题重复惩罚
     'CHAT_FREQUENCY_PENALTY': 0.4,  # 复读惩罚
 
-    'CHAT_HISTORY_MAX_TOKENS': 2048,    # 上下文聊天记录最大token数
     'CHAT_MAX_SUMMARY_TOKENS': 512,   # 单次总结最大token数
     'REPLY_MAX_TOKENS': 1024,   # 单次回复最大token数
     'REQ_MAX_TOKENS': 3072,  # 单次请求最大token数
@@ -229,7 +222,6 @@ CONFIG_TEMPLATE = {
     'CHAT_ENABLE_SUMMARY_CHAT': False,   # 是否启用总结对话
     'CHAT_MEMORY_SHORT_LENGTH': 8,  # 短期对话记忆长度
     'CHAT_MEMORY_MAX_LENGTH': 16,   # 长期对话记忆长度
-    'CHAT_SUMMARY_INTERVAL': 10,  # 长期对话记忆间隔
 
     'NG_DATA_PICKLE': False,  # 强制使用pickle
     'NG_DATA_PATH': "./data/naturel_gpt/",  # 数据文件目录
@@ -253,9 +245,6 @@ CONFIG_TEMPLATE = {
 
     'MEMORY_ACTIVE': True,  # 是否启用记忆功能
     'MEMORY_MAX_LENGTH': 16,  # 记忆最大条数
-    'MEMORY_ENHANCE_THRESHOLD': 0.6,  # 记忆强化阈值
-
-    'NG_MAX_RESPONSE_PER_MSG': 5,  # 每条消息最大响应次数
     'NG_ENABLE_MSG_SPLIT': True,   # 是否启用消息分割
     'REPLY_SEGMENT_INTERVAL': 1.0,
     'REPLY_MAX_SEGMENTS': 5,
@@ -277,6 +266,8 @@ CONFIG_TEMPLATE = {
         'pic_proxy': None,
         'exclude_ai': True,
     },
+
+    'COMFYUI_BASE_URL': 'http://127.0.0.1:8188',
 
     'UNLOCK_CONTENT_LIMIT': False,  # 解锁内容限制
 

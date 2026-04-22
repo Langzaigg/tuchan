@@ -23,16 +23,21 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
 
 def _message_to_dict(message: Any) -> Dict[str, Any]:
     if isinstance(message, dict):
-        return dict(message)
-    if hasattr(message, "model_dump"):
-        return message.model_dump(exclude_none=True)
-    if hasattr(message, "dict"):
-        return message.dict(exclude_none=True)
-    return {
-        "role": _get(message, "role", "assistant"),
-        "content": _get(message, "content", ""),
-        "tool_calls": _get(message, "tool_calls", None),
-    }
+        d = dict(message)
+    elif hasattr(message, "model_dump"):
+        d = message.model_dump(exclude_none=True)
+    elif hasattr(message, "dict"):
+        d = message.dict(exclude_none=True)
+    else:
+        d = {
+            "role": _get(message, "role", "assistant"),
+            "content": _get(message, "content", ""),
+            "tool_calls": _get(message, "tool_calls", None),
+        }
+    # 确保 content 不是 None；OpenAI API 要求 assistant 消息必须有 content
+    if d.get("content") is None:
+        d["content"] = ""
+    return d
 
 
 class TextGenerator(Singleton["TextGenerator"]):
@@ -43,6 +48,7 @@ class TextGenerator(Singleton["TextGenerator"]):
         self.proxy = proxy
         self.base_url = base_url
         self.last_tool_outputs: List[Dict[str, Any]] = []
+        self._tool_calling: bool = False  # 标记是否正在执行工具调用（受保护阶段）
 
     def _current_key(self) -> str:
         return self.api_keys[self.key_index % len(self.api_keys)]
@@ -60,6 +66,10 @@ class TextGenerator(Singleton["TextGenerator"]):
             "timeout": self.config.get("timeout", 30),
             "stream": stream,
         }
+        for optional_key in ("top_p", "frequency_penalty", "presence_penalty"):
+            value = self.config.get(optional_key)
+            if value is not None:
+                kwargs[optional_key] = value
         if self.base_url:
             kwargs["base_url"] = self.base_url
         if self.proxy:
@@ -111,6 +121,9 @@ class TextGenerator(Singleton["TextGenerator"]):
             body["temperature"] = kwargs["temperature"]
         if "max_tokens" in kwargs:
             body["max_tokens"] = kwargs["max_tokens"]
+        for optional_key in ("top_p", "frequency_penalty", "presence_penalty"):
+            if optional_key in kwargs:
+                body[optional_key] = kwargs[optional_key]
         if tools:
             body["tools"] = tools
             if tool_choice:
@@ -125,7 +138,9 @@ class TextGenerator(Singleton["TextGenerator"]):
 
         async with httpx.AsyncClient(**client_kwargs) as client:
             response = await client.post(url, headers=headers, json=body)
-            response.raise_for_status()
+            if response.status_code >= 400:
+                body_text = response.text[:1000]
+                raise RuntimeError(f"HTTP {response.status_code}: {body_text}")
             return response.json()
 
     async def _stream_iter_openai(self, kwargs: Dict[str, Any]):
@@ -156,6 +171,9 @@ class TextGenerator(Singleton["TextGenerator"]):
             body["temperature"] = kwargs["temperature"]
         if "max_tokens" in kwargs:
             body["max_tokens"] = kwargs["max_tokens"]
+        for optional_key in ("top_p", "frequency_penalty", "presence_penalty"):
+            if optional_key in kwargs:
+                body[optional_key] = kwargs[optional_key]
         if tools:
             body["tools"] = tools
             if tool_choice:
@@ -169,7 +187,9 @@ class TextGenerator(Singleton["TextGenerator"]):
 
         async with httpx.AsyncClient(**client_kwargs) as client:
             async with client.stream("POST", url, headers=headers, json=body) as response:
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    body_text = (await response.aread()).decode("utf-8", errors="replace")[:1000]
+                    raise RuntimeError(f"HTTP {response.status_code}: {body_text}")
                 async for line in response.aiter_lines():
                     line = line.strip()
                     if not line:
@@ -193,9 +213,10 @@ class TextGenerator(Singleton["TextGenerator"]):
         tools: Optional[List[Dict[str, Any]]],
         on_text: Optional[ChunkCallback],
         on_reasoning: Optional[ChunkCallback],
-    ) -> Tuple[str, List[Dict[str, Any]]]:
+    ) -> Tuple[str, List[Dict[str, Any]], str]:
         kwargs = self._completion_kwargs(messages, type, True, tools)
         content_parts: List[str] = []
+        reasoning_parts: List[str] = []
         tool_call_chunks: Dict[int, Dict[str, Any]] = {}
 
         async for chunk in self._stream_iter_openai(kwargs):
@@ -205,8 +226,10 @@ class TextGenerator(Singleton["TextGenerator"]):
             delta = _get(choices[0], "delta", {})
 
             reasoning = _get(delta, "reasoning_content") or _get(delta, "reasoning") or ""
-            if reasoning and on_reasoning:
-                await on_reasoning(str(reasoning))
+            if reasoning:
+                reasoning_parts.append(str(reasoning))
+                if on_reasoning:
+                    await on_reasoning(str(reasoning))
 
             content = _get(delta, "content") or ""
             if content:
@@ -229,7 +252,11 @@ class TextGenerator(Singleton["TextGenerator"]):
                 if _get(function, "arguments"):
                     state["function"]["arguments"] += str(_get(function, "arguments"))
 
-        return "".join(content_parts), [v for _, v in sorted(tool_call_chunks.items()) if v["function"]["name"]]
+        return (
+            "".join(content_parts),
+            [v for _, v in sorted(tool_call_chunks.items()) if v["function"]["name"]],
+            "".join(reasoning_parts),
+        )
 
     async def _complete_once(self, messages: List[Dict[str, Any]], type: str, tools: Optional[List[Dict[str, Any]]]) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
         kwargs = self._completion_kwargs(messages, type, False, tools)
@@ -274,10 +301,13 @@ class TextGenerator(Singleton["TextGenerator"]):
         for _ in range(max_rounds + 1):
             try:
                 if self.config.get("enable_stream", True):
-                    content, tool_calls = await self._stream_once(messages, type, tool_schemas, on_text, on_reasoning)
+                    content, tool_calls, reasoning_content = await self._stream_once(messages, type, tool_schemas, on_text, on_reasoning)
                     if not tool_calls:
                         return content.strip(), True
-                    messages.append({"role": "assistant", "content": content or None, "tool_calls": tool_calls})
+                    assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content or "", "tool_calls": tool_calls}
+                    if reasoning_content:
+                        assistant_msg["reasoning_content"] = reasoning_content
+                    messages.append(assistant_msg)
                 else:
                     content, tool_calls, message_dict = await self._complete_once(messages, type, tool_schemas)
                     if not tool_calls:
@@ -286,8 +316,14 @@ class TextGenerator(Singleton["TextGenerator"]):
                         return content.strip(), True
                     messages.append(message_dict)
 
-                await self._execute_tool_calls(messages, tool_calls, plugin_config)
+                # 通知外部：工具调用阶段开始（受保护，不打断）
+                self._tool_calling = True
+                try:
+                    await self._execute_tool_calls(messages, tool_calls, plugin_config)
+                finally:
+                    self._tool_calling = False
             except Exception as e:
+                self._tool_calling = False
                 logger.warning(f"LLM 请求失败: {e!r}")
                 self._rotate_key()
                 if len(self.api_keys) <= 1:
