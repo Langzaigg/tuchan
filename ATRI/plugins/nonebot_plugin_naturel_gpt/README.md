@@ -205,6 +205,16 @@ BOCHA_SEARCH_COUNT: 5
 
 如果 `BOCHA_API_KEY` 为空，工具会返回未配置提示。
 
+### bangumi_search
+
+用途：调用 Bangumi API 搜索动画、书籍、游戏等条目，以及角色和人物信息。
+
+```yaml
+BANGUMI_ACCESS_TOKEN: ''
+```
+
+如果 `BANGUMI_ACCESS_TOKEN` 为空，工具不会加载。
+
 ## 人格加载
 
 人格不再从配置文件 `PRESETS` 手写加载。`PRESETS` 在配置文件中会保持为空，仅作为运行时动态人格承载字段。

@@ -1,4 +1,4 @@
-﻿import difflib
+import difflib
 from typing import Optional, Dict
 
 from .chat import Chat
@@ -38,13 +38,13 @@ class CommandManager:
             return func
         return wrapper
 
-    def execute(self, chat:Chat, command:str, chat_presets_dict:dict) -> Optional[dict]:
+    def execute(self, chat:Chat, command:str, chat_presets_dict:dict, user_id:str='') -> Optional[dict]:
         """执行指令"""
         option_dict, param_dict, target_route = self.resolve_command(command)
         logger.info(f'执行命令: "{command}";  指令匹配路由: {target_route}')
         if target_route:
             try:
-                return self.command_router[target_route]['func'](option_dict, param_dict, chat, chat_presets_dict)
+                return self.command_router[target_route]['func'](option_dict, param_dict, chat, chat_presets_dict, user_id)
             except Exception as e:
                 return {'error': e}
         return None
@@ -142,6 +142,8 @@ def _render_preset_list(chat: Chat, chat_presets_dict: dict, admin: bool = False
             f"+ 重命名预设: rg rename <原预设名> <新预设名> <-global?>\n"
             f"+ 开关会话: rg <on/off> <-global?>\n"
             f"+ 重置会话: rg reset <-global?>\n"
+            f"+ 清除记忆: rg mem clear <group|user|all>\n"
+            f"+ 查询记忆: rg mem\n"
             f"+ 查询会话(超管): rg chats\n"
             f"* -global 参数表示全局设置，仅超管可用\n"
         )
@@ -154,16 +156,16 @@ def _render_preset_list(chat: Chat, chat_presets_dict: dict, admin: bool = False
 
 """ 注册指令 """
 @cmd.register(route='rg')
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     return {'msg': _render_preset_list(chat, chat_presets_dict, bool(option_dict.get('admin')))}
 
 @cmd.register(route='rg/list')
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     return {'msg': _render_preset_list(chat, chat_presets_dict, bool(option_dict.get('admin')))}
 
 
 @cmd.register(route='rg/set', params=['preset_key', 'preset_intro'])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     _refresh_dynamic_personas()
     target_preset_key = param_dict['preset_key']
     if target_preset_key in config.PRESETS and target_preset_key not in chat_presets_dict:
@@ -202,7 +204,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
         return {'msg': f"应用预设: {target_preset_key} (￣▽￣)-ok!", 'is_progress': True}
 
 @cmd.register(route='rg/query', params=['preset_key'])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     _refresh_dynamic_personas()
     target_preset_key = param_dict['preset_key']
     if target_preset_key in config.PRESETS and target_preset_key not in chat_presets_dict:
@@ -224,7 +226,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
     return {'msg': f"预设: {target_preset_key} |\n  {chat_presets_dict[target_preset_key].bot_self_introl}"}
 
 @cmd.register(route='rg/new', params=['preset_key', 'preset_intro'])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     target_preset_key = param_dict['preset_key']
     bot_self_introl = param_dict.get('preset_intro', '')
     
@@ -249,7 +251,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
             return {'msg': f"添加预设: {target_preset_key} 失败! (；′⌒`)\n{err_msg}", 'is_progress': True}
 
 @cmd.register(route='rg/edit', params=['preset_key', 'preset_intro'])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     target_preset_key = param_dict['preset_key']
     bot_self_introl = param_dict.get('preset_intro', '')
     
@@ -274,7 +276,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
             return {'msg': f"编辑预设: {target_preset_key} 错误 ＞﹏＜!\n{err_msg}", 'is_progress': True}
 
 @cmd.register(route='rg/del', params=['preset_key'])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     target_preset_key = param_dict['preset_key']
 
     if option_dict.get('global'):   # 全局应用
@@ -298,7 +300,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
             return {'msg': f"删除预设: {target_preset_key} 错误 ＞﹏＜!\n{err_msg}", 'is_progress': True}
         
 @cmd.register(route='rg/rename', params=['old_preset_key', 'new_preset_key'])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     target_old_preset_key = param_dict['old_preset_key']
     target_new_preset_key = param_dict['new_preset_key']
 
@@ -323,7 +325,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
             return {'msg': f"重命名预设: {target_old_preset_key} 错误 ＞﹏＜!\n{err_msg}", 'is_progress': True}
 
 @cmd.register(route='rg/reset')
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     if option_dict.get('global'):   # 全局应用
         success_cnt, fail_cnt = ChatManager.instance.reset_chat_for_all()
         return {'msg': f"重置会话(￣▽￣)-ok! (所有会话) 成功:{success_cnt}，失败:{fail_cnt}", 'is_progress': True}
@@ -342,8 +344,121 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
         else:
             return {'msg': f"重置 错误 ＞﹏＜!", 'is_progress': True}
 
+@cmd.register(route='rg/mem')
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
+    preset = chat.chat_preset
+    pdm = PersistentDataManager.instance
+    is_global = chat.chat_data.global_memory_enabled
+    parts = []
+
+    # global 状态提示
+    if is_global:
+        parts.append("[global 记忆模式: 已开启]")
+
+    # 群记忆
+    if is_global:
+        mem = chat.chat_data.global_chat_memory
+    else:
+        mem = preset.chat_memory
+    if mem:
+        lines = [f"  {i+1}. {k}: {v}" for i, (k, v) in enumerate(mem.items())]
+        parts.append(f"[群记忆] ({len(mem)}/{config.MEMORY_MAX_LENGTH})\n" + "\n".join(lines))
+    else:
+        parts.append(f"[群记忆] (0/{config.MEMORY_MAX_LENGTH}) 无")
+
+    # 当前用户记忆
+    if is_global:
+        user_mem = pdm.get_global_user_memories(user_id) if user_id else {}
+    else:
+        user_mem = preset.user_memories.get(user_id, {}) if user_id else {}
+    if user_mem:
+        lines = [f"  {i+1}. {k}: {v}" for i, (k, v) in enumerate(user_mem.items())]
+        parts.append(f"[你的记忆] ({len(user_mem)}/{config.MEMORY_MAX_LENGTH})\n" + "\n".join(lines))
+    else:
+        parts.append(f"[你的记忆] (0/{config.MEMORY_MAX_LENGTH}) 无")
+
+    # 当前用户印象
+    if user_id and user_id in preset.chat_impressions:
+        imp = preset.chat_impressions[user_id].chat_impression.strip()
+        if imp:
+            parts.append(f"[对你的印象]\n  {imp}")
+        else:
+            parts.append("[对你的印象] 暂无")
+    else:
+        parts.append("[对你的印象] 暂无")
+
+    return {'msg': f"人格: {preset.preset_key}\n\n" + "\n\n".join(parts)}
+
+@cmd.register(route='rg/mem/clear', params=['scope'])
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
+    scope = param_dict.get('scope', '').strip().lower()
+    preset = chat.chat_preset
+    pdm = PersistentDataManager.instance
+    is_global = chat.chat_data.global_memory_enabled
+
+    if scope == 'group':
+        if is_global:
+            chat.chat_data.global_chat_memory.clear()
+        else:
+            preset.chat_memory.clear()
+        return {'msg': f"已清除 {preset.preset_key} 的群记忆 (￣▽￣)-ok!", 'is_progress': True}
+    elif scope == 'user':
+        if not user_id:
+            return {'msg': "无法获取当前用户信息 (；′⌒`)"}
+        if is_global:
+            pdm.set_global_user_memories(user_id, {})
+            return {'msg': f"已清除 {preset.preset_key} 的用户记忆 (global) (￣▽￣)-ok!", 'is_progress': True}
+        if user_id in preset.user_memories:
+            del preset.user_memories[user_id]
+            return {'msg': f"已清除 {preset.preset_key} 的用户记忆 (￣▽￣)-ok!", 'is_progress': True}
+        return {'msg': f"{preset.preset_key} 没有关于你的记忆 (；′⌒`)"}
+    elif scope == 'all':
+        if is_global:
+            chat.chat_data.global_chat_memory.clear()
+            pdm.set_global_user_memories(user_id, {}) if user_id else None
+        else:
+            preset.chat_memory.clear()
+            preset.user_memories.clear()
+        return {'msg': f"已清除 {preset.preset_key} 的全部记忆 (￣▽￣)-ok!", 'is_progress': True}
+    else:
+        return {'msg': "用法: rg mem clear <group|user|all>\n  group=群记忆  user=你的记忆  all=全部"}
+
+@cmd.register(route='rg/mem/global', params=['action'])
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
+    action = param_dict.get('action', '').strip().lower()
+    pdm = PersistentDataManager.instance
+    chat_data = chat.chat_data
+    is_global = chat_data.global_memory_enabled
+
+    # rg mem global (无参数) → 显示状态并切换
+    if not action:
+        new_state = not is_global
+        chat_data.global_memory_enabled = new_state
+        if new_state:
+            report = pdm.init_global_memory(chat_data.chat_key)
+            return {'msg': f"global 记忆已开启\n{report}", 'is_progress': True}
+        else:
+            return {'msg': "global 记忆已关闭，恢复使用按人格隔离的记忆。", 'is_progress': True}
+
+    # rg mem global on
+    if action == 'on':
+        if is_global:
+            return {'msg': "global 记忆已经是开启状态。"}
+        chat_data.global_memory_enabled = True
+        report = pdm.init_global_memory(chat_data.chat_key)
+        return {'msg': f"global 记忆已开启\n{report}", 'is_progress': True}
+
+    # rg mem global off
+    if action == 'off':
+        if not is_global:
+            return {'msg': "global 记忆已经是关闭状态。"}
+        chat_data.global_memory_enabled = False
+        return {'msg': "global 记忆已关闭，恢复使用按人格隔离的记忆。", 'is_progress': True}
+
+    return {'msg': "用法: rg mem global [on|off]\n  无参数=切换  on=开启  off=关闭"}
+
 @cmd.register(route='rg/on')
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     if option_dict.get('global'):
         ChatManager.instance.toggle_chat_for_all(enabled=True)
         return {'msg': f"启用所有会话 (￣▽￣)-ok!"}
@@ -360,7 +475,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
         return {'msg': f"启用当前会话 (￣▽￣)-ok!"}
 
 @cmd.register(route='rg/off')
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     if option_dict.get('global'):
         ChatManager.instance.toggle_chat_for_all(enabled=False)
         return {'msg': f"禁用所有会话 (￣▽￣)-ok!"}
@@ -377,7 +492,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
         return {'msg': f"禁用当前会话 (￣▽￣)-ok!"}
 
 @cmd.register(route='rg/lock')
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     if option_dict.get('global'):
         ChatManager.instance.toggle_auto_switch_for_all(enabled=False)
         return {'msg': f"锁定所有会话人格 (￣▽￣)-ok!"}
@@ -394,7 +509,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
         return {'msg': f"锁定当前会话人格 (￣▽￣)-ok!"}
 
 @cmd.register(route='rg/unlock')
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     if option_dict.get('global'):
         ChatManager.instance.toggle_auto_switch_for_all(enabled=True)
         return {'msg': f"解锁所有会话 (￣▽￣)-ok!"}
@@ -411,48 +526,98 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
         return {'msg': f"解锁当前会话 (￣▽￣)-ok!"}
 
 @cmd.register(route='rg/chats')
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     chat_info:str = ''
     for chat in ChatManager.instance.get_all_chats():
         chat_info += f"+ {chat.generate_description(not option_dict.get('show'))}"
     return {'msg': f"当前已加载的会话:\n{chat_info}"}
 
 @cmd.register(route='rg/reload_config')
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     reload_config()
     PersistentDataManager.instance.load_from_file()
     return {'msg': f"配置文件重载成功! ver:{config.VERSION}"}
 
-@cmd.register(route='rg/draw', params=['state'])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict):
-    state = param_dict.get('state', '').strip().lower()
-    if state not in ('on', 'off'):
-        return {'msg': "用法: rg draw <on/off>"}
+@cmd.register(route='rg/draw', params=['mode'])
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
+    mode = param_dict.get('mode', '').strip().lower()
+    valid_modes = ('force', 'on', 'auto', 'off')
 
-    if state == 'on':
-        # 1) health check
-        ok, err = anima_generate.health_check_sync()
-        if not ok:
-            return {'msg': f"Anima 画图服务离线，无法开启: {err}"}
+    # 无参数：显示当前模式
+    if not mode:
+        current = anima_generate.get_chat_mode(chat.chat_key)
+        return {'msg': f"当前画图模式: {current}\n用法: rg draw <force|on|auto|off>\n  force: 常驻工具+拦截虚假回复\n  on:    常驻工具\n  auto:  仅画图关键词时注入工具（默认）\n  off:   关闭"}
 
-        # 2) 加载 schema + knowledge
-        ok, err = anima_generate.fetch_schema_and_knowledge_sync()
-        if not ok:
-            return {'msg': f"加载 Anima 规范失败: {err}"}
+    if mode not in valid_modes:
+        return {'msg': f"无效模式: {mode}\n用法: rg draw <force|on|auto|off>"}
 
-        # 3) 注册工具（全局注册一次即可，多个会话共用同一套 schema）
-        if enable_anima_tool():
-            logger.info(f"[会话: {chat.chat_key}] Anima 画图工具已注册")
-
-        # 4) 设置当前会话内存状态
-        anima_generate.set_chat_enabled(chat.chat_key, True)
-        return {'msg': "Anima 画图已开启 (￣▽￣)-ok!"}
-    else:
-        anima_generate.set_chat_enabled(chat.chat_key, False)
-        # 若没有任何会话开启，则卸载工具
+    if mode == 'off':
+        anima_generate.set_chat_mode(chat.chat_key, 'off')
+        # 若没有任何会话需要工具，则卸载
         if not anima_generate.any_chat_enabled():
             disable_anima_tool()
+            if config.COMFYUI_ENABLED:
+                config.COMFYUI_ENABLED = False
+                save_config()
         return {'msg': "Anima 画图已关闭 (￣▽￣)-ok!"}
+
+    # force/on/auto 都需要工具可用
+    # 1) health check
+    ok, err = anima_generate.health_check_sync()
+    if not ok:
+        return {'msg': f"Anima 画图服务离线，无法开启: {err}"}
+
+    # 2) 加载 schema + knowledge
+    ok, err = anima_generate.fetch_schema_and_knowledge_sync()
+    if not ok:
+        return {'msg': f"加载 Anima 规范失败: {err}"}
+
+    # 3) 注册工具（全局注册一次即可）
+    if enable_anima_tool():
+        logger.info(f"[会话: {chat.chat_key}] Anima 画图工具已注册")
+
+    # 4) 设置当前会话模式
+    anima_generate.set_chat_mode(chat.chat_key, mode)
+
+    # 5) 持久化开启状态
+    if not config.COMFYUI_ENABLED:
+        config.COMFYUI_ENABLED = True
+        save_config()
+
+    mode_desc = {'force': '常驻+拦截', 'on': '常驻', 'auto': '按需注入'}
+    return {'msg': f"Anima 画图已设为 {mode} 模式（{mode_desc[mode]}）(￣▽￣)-ok!"}
+
+@cmd.register(route='rg/model', params=['profile_name'])
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
+    from .openai_func import TextGenerator
+    profile_name = param_dict.get('profile_name', '').strip()
+    profiles = config.OPENAI_PROFILES
+
+    if not profiles:
+        return {'msg': "未配置 OPENAI_PROFILES，无法切换"}
+
+    # 无参数：列出所有 profile 及当前会话的配置
+    if not profile_name:
+        chat_profile = chat.get_active_profile()
+        lines = ["可用配置:"]
+        for name, p in profiles.items():
+            marker = " ← 当前" if name == chat_profile else ""
+            lines.append(f"  {name}: {p.get('model', '?')} / {p.get('model_mini', '?')}{marker}")
+        lines.append(f"\n用法: rg model <配置名>")
+        return {'msg': '\n'.join(lines)}
+
+    # 切换 profile（按群）
+    if profile_name not in profiles:
+        return {'msg': f"配置 '{profile_name}' 不存在，可用: {', '.join(profiles.keys())}"}
+
+    profile = profiles[profile_name]
+    chat.set_active_profile(profile_name)
+    # 立即应用到 TextGenerator
+    tg = TextGenerator.instance
+    tg.switch_profile(profile_name, profile)
+    config.OPENAI_ACTIVE_PROFILE = profile_name
+    PersistentDataManager.instance.save_to_file()
+    return {'msg': f"已切换到 {profile_name}: {profile.get('model', '?')}"}
 
 # 提交指令注册
 cmd.submit_commands()

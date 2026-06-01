@@ -45,7 +45,7 @@ __plugin_meta__ = PluginMetadata(
 )
 
 general_divine = on_command("今日运势", aliases={"抽签", "运势"}, permission=GROUP, priority=8)
-specific_divine = on_regex(r"^[^/]\S+抽签$", permission=GROUP, priority=8)
+specific_divine = on_regex(r"^[^/]\S+抽签$", permission=GROUP, priority=8, block=False)
 limit_setting = on_regex(r"^指定(.*?)签$", permission=GROUP, priority=8)
 change_theme = on_regex(
     r"^设置(.*?)签$",
@@ -107,12 +107,12 @@ async def _(
 ):
     user_theme: str = user_themes[:-2]
     if len(user_theme) < 1:
-        await matcher.finish("输入参数错误")
+        return
 
     for theme in FortuneThemesDict:
         if user_theme in FortuneThemesDict[theme]:
             if not FortuneManager.theme_enable_check(theme):
-                await specific_divine.finish("该抽签主题未启用~")
+                return
             else:
                 gid: str = str(event.group_id)
                 uid: str = str(event.user_id)
@@ -133,7 +133,7 @@ async def _(
 
             await specific_divine.finish(msg, at_sender=True)
 
-    await specific_divine.finish("还没有这种抽签主题哦~")
+    return
 
 
 async def get_user_arg(matcher: Matcher, args: Annotated[str, RegexStr()]) -> str:

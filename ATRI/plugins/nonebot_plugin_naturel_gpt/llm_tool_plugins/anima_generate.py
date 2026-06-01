@@ -1,4 +1,7 @@
 import asyncio
+import random
+import re
+import string
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -10,8 +13,11 @@ _comfyui_base_url: str = "http://127.0.0.1:8188"
 _anima_schema_cache: Optional[Dict[str, Any]] = None
 _anima_knowledge_cache: Optional[str] = None
 
-# 内存级会话开关：只记录哪些 chat_key 启用了 Anima 画图
-_chat_enabled: set = set()
+# 画图模式说明：
+# force: 常驻工具 + 画图关键词时拦截虚假回复
+# on:    常驻工具，不拦截
+# auto:  仅在用户消息含画图关键词时注入工具（默认）
+# off:   关闭
 
 # 发送上下文：asyncio.Task → {chat_key, bot_id, group_id, user_id}
 # 由 matcher 在发起 LLM 请求前注册，后台任务完成后用于直接发送图片
@@ -25,24 +31,43 @@ def _get_url(path: str) -> str:
     return f"{_comfyui_base_url.rstrip('/')}{path}"
 
 
+def _generate_task_id() -> str:
+    """生成随机的6位字母数字任务编号"""
+    return 'draw-' + ''.join(random.choices(string.ascii_letters + string.digits, k=6))
+
+
 def set_base_url(url: str) -> None:
     global _comfyui_base_url
     _comfyui_base_url = url
 
 
-def set_chat_enabled(chat_key: str, enabled: bool) -> None:
-    if enabled:
-        _chat_enabled.add(chat_key)
-    else:
-        _chat_enabled.discard(chat_key)
+def set_chat_mode(chat_key: str, mode: str) -> None:
+    """设置指定会话的画图模式（持久化）"""
+    from ..persistent_data_manager import PersistentDataManager
+    chat_data = PersistentDataManager.instance.get_or_create_chat_data(chat_key)
+    chat_data.draw_mode = mode if mode in ("force", "on", "auto", "off") else "auto"
+    PersistentDataManager.instance.save_to_file(must_save=True)
+
+
+def get_chat_mode(chat_key: str) -> str:
+    """获取指定会话的画图模式，默认 auto"""
+    from ..persistent_data_manager import PersistentDataManager
+    chat_data = PersistentDataManager.instance.get_or_create_chat_data(chat_key)
+    return chat_data.draw_mode
 
 
 def is_chat_enabled(chat_key: str) -> bool:
-    return chat_key in _chat_enabled
+    """画图是否启用（force/on/auto 都算启用，仅 off 为关闭）"""
+    return get_chat_mode(chat_key) != "off"
 
 
 def any_chat_enabled() -> bool:
-    return bool(_chat_enabled)
+    """是否有任何会话启用了画图"""
+    from ..persistent_data_manager import PersistentDataManager
+    for cd in PersistentDataManager.instance.get_all_chat_datas():
+        if cd.draw_mode != "off":
+            return True
+    return False
 
 
 def register_send_context(chat_key: str, bot_id: str, group_id: Optional[str] = None, user_id: Optional[str] = None) -> None:
@@ -83,6 +108,81 @@ def health_check_sync() -> Tuple[bool, str]:
         return False, str(e)
 
 
+def _compress_anima_expert(content: str) -> str:
+    """精简专家知识：保留硬性规则、字段说明、提示词技巧、多角色规范，去除冗余解释。"""
+    lines = content.split('\n')
+    result = []
+    skip = False
+    for line in lines:
+        stripped = line.strip()
+        # 跳过默认参数和长宽比段落（工具自动处理）
+        if stripped.startswith('## 推荐默认参数') or stripped.startswith('## 长宽比'):
+            skip = True
+            continue
+        if skip and stripped.startswith('## '):
+            skip = False
+        if skip:
+            continue
+        # 压缩冗余解释行
+        if stripped.startswith('> **说明**') or stripped.startswith('> 说明'):
+            continue
+        result.append(line)
+    return '\n'.join(result).strip()
+
+
+def _compress_artist_list(content: str) -> str:
+    """精简画师列表：只保留 @artist 名称，去除说明文字。"""
+    artists = []
+    for line in content.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith('- `@') and '`' in stripped:
+            # 提取 `@name` 中的名称
+            name = stripped.split('`')[1] if '`' in stripped else ''
+            if name.startswith('@'):
+                artists.append(name)
+    return ', '.join(artists)
+
+
+def _compress_examples(content: str) -> str:
+    """精简示例：保留 3 个代表性场景（单角色竖构图、双角色+外观、纯自然语言原创）。"""
+    import json as _json
+    # 按 ## 分割示例块
+    blocks = re.split(r'^## \d+\)', content, flags=re.MULTILINE)
+    examples = []
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        # 提取 JSON 块
+        match = re.search(r'```json\s*\n(.*?)\n```', block, re.DOTALL)
+        if match:
+            try:
+                obj = _json.loads(match.group(1))
+                examples.append(obj)
+            except Exception:
+                pass
+    if len(examples) <= 3:
+        return content
+    # 选择 3 个代表性场景：第1个（单角色竖构图）、第4个（双角色+外观描述）、第6个（纯自然语言原创）
+    selected = [examples[0]]  # 单角色竖构图
+    # 找双角色+有外观描述的
+    for ex in examples[1:]:
+        if ex.get('appearance') and '2' in ex.get('count', ''):
+            selected.append(ex)
+            break
+    # 找纯自然语言原创（appearance 为空）
+    for ex in examples:
+        if not ex.get('appearance') and ex.get('nltags'):
+            selected.append(ex)
+            break
+    if len(selected) < 3:
+        selected = examples[:3]
+    result_parts = []
+    for i, ex in enumerate(selected, 1):
+        result_parts.append(f"## {i})\n```json\n{_json.dumps(ex, ensure_ascii=False, indent=2)}\n```")
+    return '\n\n'.join(result_parts)
+
+
 def fetch_schema_and_knowledge_sync() -> Tuple[bool, str]:
     """同步获取 schema 与 knowledge，用于指令处理（同步上下文）。"""
     global _anima_schema_cache, _anima_knowledge_cache
@@ -101,13 +201,34 @@ def fetch_schema_and_knowledge_sync() -> Tuple[bool, str]:
             "function": _enhance_schema(schema_data),
         }
 
+        # 按文件类型分别压缩
         parts = []
         for k, v in knowledge_data.items():
-            parts.append(f"## {k}\n{v}\n")
+            kl = k.lower()
+            if 'expert' in kl:
+                compressed = _compress_anima_expert(v)
+                if compressed:
+                    parts.append(f"## 提示词规范\n{compressed}\n")
+            elif 'artist' in kl:
+                artist_str = _compress_artist_list(v)
+                if artist_str:
+                    parts.append(f"## 常用画师\n{artist_str}\n")
+            elif 'example' in kl:
+                compressed = _compress_examples(v)
+                if compressed:
+                    parts.append(f"## 示例\n{compressed}\n")
+            else:
+                parts.append(f"## {k}\n{v}\n")
+
+        # 精简的核心规则
         parts.append(
-            "## 角色扮演引导\n"
-            "上述是你自己的绘画技巧。用户请你画画时，自然地用第一人称说你正在画什么，"
-            "避免提及工具、系统、调用等词。"
+            "## 调用规则\n"
+            "- 触发词（画/画一个/来一张/draw/改图/重画等）→ 必须在 assistant 消息中附带 tool_calls 调用 generate_anima_image。\n"
+            "- 只说「在画了」但不附带 tool_calls = 没有画画。任务编号只能由工具返回，禁止编造。\n"
+            "- 历史消息中的「在画了」「等出图」是上一轮结果，每次新请求必须重新调用工具。\n"
+            "- 需要确认角色外观时，用 bocha_search 搜索「角色名 wiki」或「角色名 萌娘百科」，再用 fetch_url 获取外观描述。不要使用 bangumi 搜索，bangumi 没有外观信息。\n"
+            "- 用户提出修改意见时立即重新调用。\n"
+            "- 调用前不做画面描述，调用后用第一人称自然描述，不提及工具/系统/调用。\n"
         )
         _anima_knowledge_cache = "\n".join(parts)
 
@@ -130,9 +251,9 @@ def clear_cache() -> None:
     _anima_knowledge_cache = None
 
 
-async def _request(path: str, method: str = "GET", json: Optional[Dict] = None) -> Any:
+async def _request(path: str, method: str = "GET", json: Optional[Dict] = None, timeout: int = 300) -> Any:
     url = _get_url(path)
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         if method.upper() == "GET":
             resp = await client.get(url)
         else:
@@ -141,73 +262,129 @@ async def _request(path: str, method: str = "GET", json: Optional[Dict] = None) 
         return resp.json()
 
 
+
 def _build_positive(args: Dict[str, Any]) -> str:
-    """根据参数拼出人类可读的作画思路/提示词描述。"""
+    """按固定顺序拼接作画描述，角色相关字段合并到 [角色]。"""
     parts = []
     if args.get("quality_meta_year_safe"):
-        parts.append(f"质量与安全: {args['quality_meta_year_safe']}")
+        parts.append(f"[质量与安全] {args['quality_meta_year_safe']}")
     if args.get("count"):
-        parts.append(f"人数: {args['count']}")
-    if args.get("character"):
-        parts.append(f"角色: {args['character']}")
+        parts.append(f"[人数] {args['count']}")
+    # 角色相关合并
+    role_parts = []
+    for key in ("character", "appearance", "style", "environment", "nltags"):
+        val = args.get(key)
+        if val:
+            role_parts.append(str(val))
+    if role_parts:
+        parts.append(f"[角色] {'；'.join(role_parts)}")
     if args.get("series"):
-        parts.append(f"作品: {args['series']}")
+        parts.append(f"[作品系列] {args['series']}")
     if args.get("artist"):
-        parts.append(f"画师: {args['artist']}")
-    if args.get("style"):
-        parts.append(f"风格: {args['style']}")
-    if args.get("appearance"):
-        parts.append(f"外观: {args['appearance']}")
+        parts.append(f"[艺术家] {args['artist']}")
     if args.get("tags"):
-        parts.append(f"标签: {args['tags']}")
-    if args.get("environment"):
-        parts.append(f"环境: {args['environment']}")
-    if args.get("nltags"):
-        parts.append(f"自然语言: {args['nltags']}")
-    if args.get("aspect_ratio"):
-        parts.append(f"比例: {args['aspect_ratio']}")
-    return "；".join(parts)
+        parts.append(f"[通用标签] {args['tags']}")
+    return " ".join(parts)
 
 
 def _enhance_schema(schema_data: Dict[str, Any]) -> Dict[str, Any]:
-    """增强 schema，提升模型调用积极性，并引导其认为是自身在画画。"""
+    """增强 schema description，引导模型积极调用。"""
     data = dict(schema_data)
     original_desc = data.get("description", "")
     data["description"] = (
-        "使用你自己的绘画能力创作插画。这是你自己的画师技能，不是外部工具。"
-        + (f" 技术说明: {original_desc}" if original_desc else "")
+        "画图工具。触发词（画/画一个/draw/改图/重画等）出现时必须通过 tool_calls 调用此工具，"
+        "禁止只发文字不调用。任务编号只能由工具返回，禁止编造。"
+        + (f" {original_desc}" if original_desc else "")
     )
     return data
 
 
 async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
-    """工具调用入口：立即返回作画思路，后台提交生成任务。"""
+    """工具调用入口：先查队列，再决定是否提交。"""
     base_url = getattr(config, "COMFYUI_BASE_URL", "http://127.0.0.1:8188")
     set_base_url(base_url)
 
-    # 通过当前 asyncio Task 精确取出属于本请求的发送上下文快照
-    # 传给后台任务，这样即使 matcher 的 finally 提前注销了上下文，
-    # 后台任务仍可使用快照发送。即使不同群的请求并行也不会串扰。
     current_task = asyncio.current_task()
-    send_ctx = dict(_send_context.get(current_task, {}))  # 浅拷贝
+    send_ctx = dict(_send_context.get(current_task, {}))
 
     positive_desc = _build_positive(args)
-    # 返回给 LLM，引导其以第一人称描述自己在画画
+    steps = args.get("steps") or 35
+
+    # 尝试查询队列状态
+    queue_info = await _check_queue(steps)
+    if queue_info is not None:
+        if queue_info.get("queue_too_long"):
+            mins = queue_info.get("estimated_remaining_minutes", "?")
+            active = queue_info.get("active_tasks", 0)
+            qlen = queue_info.get("queue_length", 0)
+            logger.info(f"Anima 队列过长，拒绝提交: active={active} queued={qlen} est={mins}min")
+            content = (
+                f"当前画图队列繁忙（{qlen} 个任务，预计等待 {mins} 分钟），请稍后再试。"
+            )
+            return content, []
+        # 队列正常，后端返回的时长已包含当前任务耗时
+        est_seconds = queue_info.get("estimated_remaining_seconds", 60)
+        # 计算预计生成时间：当前图片预计生成时间 + n*一分半 - 30秒
+        queue_length = queue_info.get("queue_length", 0)
+        est_seconds = est_seconds + queue_length * 90 - 30
+        est_minutes = max(1, round(est_seconds / 60))
+        logger.info(
+            f"Anima 队列检查通过: active={queue_info.get('active_tasks', 0)} "
+            f"queued={queue_info.get('queue_length', 0)} "
+            f"est_remaining={est_seconds}s ({est_minutes}min)"
+        )
+    else:
+        # 接口异常，回退到本地估算：60 + (steps - 35) * 1.5
+        est_seconds = int(60 + (int(steps) - 35) * 1.5)
+        est_minutes = max(1, round(est_seconds / 60))
+
+    # 生成随机的6位字母数字任务编号
+    task_id = _generate_task_id()
+    
     content = (
-        f"你正在画一幅插画：{positive_desc}。"
-        f"用第一人称向用户描述你的创作，不要提到工具或系统，只说你自己在画画。"
+        f"你正在画一幅插画：{positive_desc}。任务编号：{task_id}，预计{est_seconds}秒完成。"
+        f"你必须将任务编号和预计时间告知用户，这是确认任务已成功提交的唯一凭证。"
+        f"用第一人称自然地告诉用户你正在作画，不要提到工具或系统。"
+        f"注意：调用工具前不要对画面做出描述，调用完成后再描述画面内容。"
     )
 
-    # 启动后台任务，传入上下文快照以便完成后发送
-    _schedule_bg(_do_generate(args, config, send_ctx))
-
+    _schedule_bg(_do_generate(args, config, send_ctx, task_id, timeout=600))
     return content, []
 
 
-async def _do_generate(args: Dict[str, Any], config, send_ctx: Optional[Dict[str, Any]] = None) -> None:
+async def _check_queue(steps: int) -> Optional[Dict[str, Any]]:
+    """直接查 ComfyUI 队列，估算等待时间。异常时返回 None。"""
+    try:
+        data = await _request("/queue", method="GET", timeout=10)
+        running = len(data.get("queue_running", []))
+        pending = len(data.get("queue_pending", []))
+        real_count = running + pending
+
+        # running 按已完成一半估算，pending 按满时估算
+        task_time = int(60 + (int(steps) - 35) * 1.5)
+        real_remaining = running * task_time * 0.5 + pending * task_time
+        total = real_remaining + task_time  # 加上当前任务自身
+        est_minutes = max(1, round(total / 60))
+
+        # 队列长度大于5时拒绝
+        queue_too_long = real_count > 5
+        
+        return {
+            "active_tasks": running,
+            "queue_length": real_count + 1,
+            "estimated_remaining_seconds": round(total),
+            "estimated_remaining_minutes": est_minutes,
+            "queue_too_long": queue_too_long,
+        }
+    except Exception as e:
+        logger.warning(f"Anima 队列查询失败，回退直接提交: {e}")
+        return None
+
+
+async def _do_generate(args: Dict[str, Any], config, send_ctx: Optional[Dict[str, Any]] = None, task_id: str = "", timeout: int = 600) -> None:
     """后台执行生成，完成后通过 OneBot 直接发送图片。"""
     try:
-        data = await _request("/anima/generate", method="POST", json=args)
+        data = await _request("/anima/generate", method="POST", json=args, timeout=timeout)
         if not data.get("success"):
             logger.warning(f"Anima 后台生成失败: {data}")
             return
@@ -217,32 +394,42 @@ async def _do_generate(args: Dict[str, Any], config, send_ctx: Optional[Dict[str
             logger.warning("Anima 后台生成成功但未返回图片")
             return
 
-        img = images[0]
-        image_url = img.get("view_url") or img.get("url")
         prompt_text = data.get("positive", "")
         seed = data.get("seed")
-        logger.info(f"Anima 图片生成完成: {img.get('filename')} seed={seed}")
+        queue = data.get("queue", {})
+        q_active = queue.get("active_tasks", 0)
+        q_len = queue.get("queue_length", 0)
+        q_mins = queue.get("estimated_remaining_minutes", 0)
+        logger.info(
+            f"Anima 图片生成完成: {len(images)} 张 seed={seed} | "
+            f"队列: active={q_active} queued={q_len} est={q_mins}min"
+        )
 
-        # 尝试直接通过 OneBot 发送图片
-        sent = await _send_image_with_ctx(send_ctx, image_url, prompt_text)
-        if not sent:
-            # 如果直接发送失败，仍然存入 pending 队列作为兜底
-            _pending_results.append({
-                "type": "image",
-                "url": image_url,
-                "filename": img.get("filename"),
-                "prompt": prompt_text,
-                "seed": seed,
-                "width": data.get("width"),
-                "height": data.get("height"),
-                "chat_key": send_ctx.get("chat_key") if send_ctx else None,
-            })
-            logger.warning(f"Anima 图片直接发送失败，已存入 pending 队列等待兜底消费")
+        for i, img in enumerate(images):
+            image_url = img.get("view_url") or img.get("url")
+            if not image_url:
+                continue
+            # 拼接任务序号和图片一起发送
+            task_info = f"任务编号：{task_id}" if task_id else ""
+            sent = await _send_image_with_ctx(send_ctx, image_url, prompt_text, task_info)
+            if not sent:
+                _pending_results.append({
+                    "type": "image",
+                    "url": image_url,
+                    "filename": img.get("filename"),
+                    "prompt": prompt_text,
+                    "seed": seed,
+                    "width": data.get("width"),
+                    "height": data.get("height"),
+                    "chat_key": send_ctx.get("chat_key") if send_ctx else None,
+                    "task_id": task_id,
+                })
+                logger.warning(f"Anima 图片 {i+1} 直接发送失败，已存入 pending 队列等待兜底消费")
     except Exception as e:
         logger.exception("Anima 后台生成任务失败")
 
 
-async def _send_image_with_ctx(send_ctx: Optional[Dict[str, Any]], image_url: Optional[str], prompt_text: str = "") -> bool:
+async def _send_image_with_ctx(send_ctx: Optional[Dict[str, Any]], image_url: Optional[str], prompt_text: str = "", task_info: str = "") -> bool:
     """通过 OneBot 直接发送图片到对应会话。成功返回 True。"""
     if not send_ctx or not image_url:
         return False
@@ -261,7 +448,10 @@ async def _send_image_with_ctx(send_ctx: Optional[Dict[str, Any]], image_url: Op
     user_id = send_ctx.get("user_id")
 
     try:
+        # 拼接任务信息和图片
         msg = MessageSegment.image(file=image_url)
+        if task_info:
+            msg = MessageSegment.text(task_info + "\n") + msg
         if group_id:
             await bot.send_group_msg(group_id=int(group_id), message=msg)
         elif user_id:

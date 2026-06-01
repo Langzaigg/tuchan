@@ -1,24 +1,35 @@
 import json
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 from nonebot import get_driver
 from nonebot.log import logger
-from pydantic import BaseModel, Extra, root_validator
-
-from .download import ResourceError, download_resource
+from pydantic import BaseModel, Extra, Field, root_validator
 
 """
 	抽签主题对应表，第一键值为“抽签设置”或“主题列表”展示的主题名称
 	Key-Value: 主题资源文件夹名-主题别名
 """
+
+
+class ResourceError(Exception):
+    def __init__(self, msg):
+        self.msg = msg
+
+    def __str__(self):
+        return self.msg
+
+    __repr__ = __str__
+
+
 FortuneThemesDict: Dict[str, List[str]] = {
     "random": ["随机"],
     "amazing_grace": ["奇异恩典"],
     "arknights": ["明日方舟", "方舟", "arknights", "鹰角", "Arknights", "舟游"],
     "asoul": ["Asoul", "asoul", "a手", "A手", "as", "As"],
     "azure": ["碧蓝航线", "碧蓝", "azure", "Azure"],
+    "ba": ["蔚蓝档案", "碧蓝档案", "Blue Archive", "blue archive", "BA", "ba", "档案"],
     "dc4": ["dc4", "DC4", "Dc4"],
     "einstein": ["爱因斯坦携爱敬上", "爱因斯坦", "einstein", "Einstein"],
     "genshin": ["原神", "Genshin Impact", "genshin", "Genshin", "op", "原批"],
@@ -40,8 +51,23 @@ FortuneThemesDict: Dict[str, List[str]] = {
 }
 
 
+def sync_local_theme_dirs(resource_path: Path) -> None:
+    """Register every local image directory as a selectable theme."""
+    img_path = resource_path / "img"
+    if not img_path.exists():
+        return
+
+    for theme_dir in sorted(img_path.iterdir()):
+        if not theme_dir.is_dir():
+            continue
+
+        theme = theme_dir.name
+        FortuneThemesDict.setdefault(theme, [theme.replace("_", " ")])
+
+
 class PluginConfig(BaseModel, extra=Extra.ignore):
     fortune_path: Path = Path(__file__).parent / "resource"
+    fortune_data_path: Path = Path("data") / "fortune"
 
 
 class ThemesFlagConfig(BaseModel, extra=Extra.ignore):
@@ -54,6 +80,7 @@ class ThemesFlagConfig(BaseModel, extra=Extra.ignore):
     arknights_flag: bool = True
     asoul_flag: bool = True
     azure_flag: bool = True
+    ba_flag: bool = True
     dc4_flag: bool = True
     einstein_flag: bool = True
     genshin_flag: bool = True
@@ -72,15 +99,33 @@ class ThemesFlagConfig(BaseModel, extra=Extra.ignore):
     touhou_lostword_flag: bool = True
     touhou_old_flag: bool = True
     warship_girls_r_flag: bool = True
+    fortune_theme_flags: Dict[str, bool] = Field(default_factory=dict)
+
+    def as_theme_flags(self) -> Dict[str, bool]:
+        flags: Dict[str, bool] = {}
+        for theme in FortuneThemesDict:
+            if theme == "random":
+                continue
+
+            flags[theme] = bool(getattr(self, f"{theme}_flag", True))
+
+        flags.update(
+            {theme: bool(enabled) for theme, enabled in self.fortune_theme_flags.items()}
+        )
+        return flags
 
     @root_validator
     def check_all_disabled(cls, values) -> None:
         """Check whether all themes are DISABLED"""
         flag: bool = False
-        for theme in values:
-            if values.get(theme, False):
+        for theme, enabled in values.items():
+            if theme.endswith("_flag") and enabled:
                 flag = True
                 break
+
+        custom_flags: Dict[str, bool] = values.get("fortune_theme_flags", {})
+        if custom_flags and any(custom_flags.values()):
+            flag = True
 
         if not flag:
             raise ValueError("Fortune themes ALL disabled! Please check!")
@@ -104,13 +149,78 @@ class DateTimeEncoder(json.JSONEncoder):
 
 driver = get_driver()
 fortune_config: PluginConfig = PluginConfig.parse_obj(driver.config.dict())
+sync_local_theme_dirs(fortune_config.fortune_path)
 themes_flag_config: ThemesFlagConfig = ThemesFlagConfig.parse_obj(driver.config.dict())
+fortune_theme_flags: Dict[str, bool] = themes_flag_config.as_theme_flags()
+
+
+def _write_json(path: Path, data: Any) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4, cls=DateTimeEncoder)
+
+
+def _load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _init_json_file(
+    path: Path, default: Any, legacy_path: Optional[Path] = None
+) -> None:
+    if path.exists():
+        return
+
+    if legacy_path and legacy_path.exists():
+        data = _load_json(legacy_path, default)
+    else:
+        data = default
+
+    _write_json(path, data)
+
+
+def _sync_theme_flags_file(path: Path) -> None:
+    global fortune_theme_flags
+
+    configured_flags = themes_flag_config.as_theme_flags()
+    disk_flags: Dict[str, bool] = _load_json(path, {})
+    changed = not path.exists()
+
+    for theme in sorted(FortuneThemesDict):
+        if theme == "random":
+            continue
+
+        if theme not in disk_flags:
+            disk_flags[theme] = configured_flags.get(theme, True)
+            changed = True
+        else:
+            disk_flags[theme] = bool(disk_flags[theme])
+
+    if changed:
+        _write_json(path, disk_flags)
+
+    fortune_theme_flags = {
+        theme: bool(disk_flags.get(theme, True))
+        for theme in FortuneThemesDict
+        if theme != "random"
+    }
+
+
+def theme_enabled(theme: str) -> bool:
+    return fortune_theme_flags.get(theme, True)
 
 
 @driver.on_startup
 async def fortune_check() -> None:
+    sync_local_theme_dirs(fortune_config.fortune_path)
+
     if not fortune_config.fortune_path.exists():
         fortune_config.fortune_path.mkdir(parents=True, exist_ok=True)
+
+    if not fortune_config.fortune_data_path.exists():
+        fortune_config.fortune_data_path.mkdir(parents=True, exist_ok=True)
 
     """Check fonts"""
     fonts_path: Path = fortune_config.fortune_path / "font"
@@ -123,36 +233,31 @@ async def fortune_check() -> None:
     if not (fonts_path / "sakura.ttf").exists():
         raise ResourceError("Resource sakura.ttf is missing! Please check!")
 
-    """
-		Try to get the latest copywriting from the repository.
-	"""
     copywriting_path: Path = (
         fortune_config.fortune_path / "fortune" / "copywriting.json"
     )
-    if not copywriting_path.parent.exists():
-        copywriting_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Skip download if local copywriting.json already exists
-    if copywriting_path.exists():
-        logger.info("Local copywriting.json found, skip downloading")
-    else:
-        ret = await download_resource(copywriting_path, "copywriting.json", "fortune")
-        if not ret and not copywriting_path.exists():
-            raise ResourceError("Resource copywriting.json is missing! Please check!")
+    if not copywriting_path.exists():
+        raise ResourceError("Resource copywriting.json is missing! Please check!")
 
     """
 		Check rules and data files
 	"""
-    fortune_data_path: Path = fortune_config.fortune_path / "fortune_data.json"
-    fortune_setting_path: Path = fortune_config.fortune_path / "fortune_setting.json"
-    group_rules_path: Path = fortune_config.fortune_path / "group_rules.json"
-    specific_rules_path: Path = fortune_config.fortune_path / "specific_rules.json"
+    fortune_data_path: Path = fortune_config.fortune_data_path / "fortune_data.json"
+    fortune_setting_path: Path = fortune_config.fortune_data_path / "fortune_setting.json"
+    group_rules_path: Path = fortune_config.fortune_data_path / "group_rules.json"
+    specific_rules_path: Path = fortune_config.fortune_data_path / "specific_rules.json"
+    theme_flags_path: Path = fortune_config.fortune_data_path / "theme_flags.json"
+
+    legacy_fortune_data_path: Path = fortune_config.fortune_path / "fortune_data.json"
+    legacy_group_rules_path: Path = fortune_config.fortune_path / "group_rules.json"
+    legacy_specific_rules_path: Path = fortune_config.fortune_path / "specific_rules.json"
+
+    _sync_theme_flags_file(theme_flags_path)
 
     if not fortune_data_path.exists():
         logger.warning("Resource fortune_data.json is missing, initialized one...")
 
-        with fortune_data_path.open("w", encoding="utf-8") as f:
-            json.dump(dict(), f, ensure_ascii=False, indent=4)
+        _init_json_file(fortune_data_path, dict(), legacy_fortune_data_path)
     else:
         """
         In version 0.4.10, the format of fortune_data.json is changed from v0.4.9 and older.
@@ -197,8 +302,7 @@ async def fortune_check() -> None:
                     except KeyError:
                         pass
 
-        with open(fortune_data_path, "w", encoding="utf-8") as f:
-            json.dump(_data, f, ensure_ascii=False, indent=4, cls=DateTimeEncoder)
+        _write_json(fortune_data_path, _data)
 
     _flag: bool = False
     if not group_rules_path.exists():
@@ -211,9 +315,7 @@ async def fortune_check() -> None:
                 _flag = True
 
         if not _flag:
-            # If failed or fortune_setting_path doesn't exist, initialize group_rules.json instead
-            with group_rules_path.open("w", encoding="utf-8") as f:
-                json.dump(dict(), f, ensure_ascii=False, indent=4)
+            _init_json_file(group_rules_path, dict(), legacy_group_rules_path)
 
             logger.info("旧版 fortune_setting.json 文件中群聊抽签主题设置不存在，初始化 group_rules.json")
 
@@ -232,19 +334,11 @@ async def fortune_check() -> None:
                 _flag = True
 
         if not _flag:
-            # Try to download it from repo
-            ret = await download_resource(specific_rules_path, "specific_rules.json")
-            if ret:
-                logger.info(f"Downloaded specific_rules.json from repo")
-            else:
-                # If failed, initialize specific_rules.json instead
-                with specific_rules_path.open("w", encoding="utf-8") as f:
-                    json.dump(dict(), f, ensure_ascii=False, indent=4)
-
-                logger.info(
-                    "旧版 fortune_setting.json 文件中签底指定规则不存在，初始化 specific_rules.json"
-                )
-                logger.warning("指定签底抽签功能将在 v0.5.0 弃用")
+            _init_json_file(specific_rules_path, dict(), legacy_specific_rules_path)
+            logger.info(
+                "旧版 fortune_setting.json 文件中签底指定规则不存在，初始化 specific_rules.json"
+            )
+            logger.warning("指定签底抽签功能将在 v0.5.0 弃用")
 
 
 def group_rules_transfer(fortune_setting_dir: Path, group_rules_dir: Path) -> bool:

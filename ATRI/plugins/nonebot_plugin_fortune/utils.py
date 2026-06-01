@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
-from .config import fortune_config, themes_flag_config
+from .config import fortune_config, theme_enabled
 
 
 def get_copywriting() -> Tuple[str, str]:
@@ -59,25 +59,52 @@ def drawing(gid: str, uid: str, theme: str, spec_path: Optional[str] = None) -> 
     # 2. Random choice a luck text with title
     title, text = get_copywriting()
 
-    # 3. Draw
-    font_size = 45
-    color = "#F5F5F5"
-    image_font_center = [140, 99]
     fontPath = {
         "title": f"{fortune_config.fortune_path}/font/Mamelon.otf",
         "text": f"{fortune_config.fortune_path}/font/sakura.ttf",
     }
+
+    draw_default_text(draw, title, text, fontPath)
+
+    # Save
+    outDir: Path = fortune_config.fortune_data_path / "out"
+    if not outDir.exists():
+        outDir.mkdir(exist_ok=True, parents=True)
+
+    outPath = outDir / f"{gid}_{uid}.png"
+
+    img.save(outPath)
+    return outPath
+
+
+def text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> Tuple[int, int]:
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+def draw_centered_text(
+    draw: ImageDraw.ImageDraw,
+    center: Tuple[int, int],
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    fill: str,
+) -> None:
+    width, height = text_size(draw, text, font)
+    draw.text((center[0] - width / 2, center[1] - height / 2), text, fill=fill, font=font)
+
+
+def draw_default_text(
+    draw: ImageDraw.ImageDraw,
+    title: str,
+    text: str,
+    fontPath: dict,
+) -> None:
+    # 3. Draw
+    font_size = 45
+    color = "#F5F5F5"
+    image_font_center = [140, 99]
     ttfront = ImageFont.truetype(fontPath["title"], font_size)
-    font_length = ttfront.getsize(title)
-    draw.text(
-        (
-            image_font_center[0] - font_length[0] / 2,
-            image_font_center[1] - font_length[1] / 2,
-        ),
-        title,
-        fill=color,
-        font=ttfront,
-    )
+    draw_centered_text(draw, tuple(image_font_center), title, ttfront, color)
 
     # Text rendering
     font_size = 25
@@ -97,16 +124,6 @@ def drawing(gid: str, uid: str, theme: str, spec_path: Optional[str] = None) -> 
         )
         y: int = int(image_font_center[1] - font_height / 2)
         draw.text((x, y), textVertical, fill=color, font=ttfront)
-
-    # Save
-    outDir: Path = fortune_config.fortune_path / "out"
-    if not outDir.exists():
-        outDir.mkdir(exist_ok=True, parents=True)
-
-    outPath = outDir / f"{gid}_{uid}.png"
-
-    img.save(outPath)
-    return outPath
 
 
 def decrement(text: str) -> Tuple[int, List[str]]:
@@ -158,4 +175,4 @@ def theme_flag_check(theme: str) -> bool:
     """
     check wether a theme is enabled in themes_flag_config
     """
-    return themes_flag_config.dict().get(theme + "_flag", False)
+    return theme_enabled(theme)

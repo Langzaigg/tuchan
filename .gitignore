@@ -160,3 +160,10 @@ data/database/manege/*.json
 
 AGENT.md
 old
+ATRI/plugins/gptalk_config.json
+data/exports/
+data/fortune/
+data/source/
+_temp_*.py
+export_group_chat.py
+test_llm_request.py

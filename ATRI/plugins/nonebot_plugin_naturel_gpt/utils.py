@@ -84,12 +84,13 @@ async def gen_chat_text(event: MessageEvent, bot:Bot) -> Tuple[str, bool]:
 
 
 def _is_supported_image_url(url: str) -> bool:
-    return bool(url) and str(url).strip().startswith(("http://", "https://", "data:image/"))
+    return bool(url) and str(url).strip().startswith(("http://", "https://", "data:image/", "file:///"))
 
 
 async def _extract_message_text_and_images(message: Message, event: MessageEvent, bot: Bot) -> Tuple[str, List[str]]:
     text = ""
     image_urls: List[str] = []
+    image_index = 0
     for seg in message:
         if seg.is_text():
             text += seg.data.get("text", "")
@@ -106,23 +107,29 @@ async def _extract_message_text_and_images(message: Message, event: MessageEvent
         elif seg.type == "image":
             url = seg.data.get("url") or seg.data.get("file")
             if _is_supported_image_url(url):
+                image_index += 1
                 image_urls.append(str(url))
+                text += f"[图片{image_index}]"
     return text.strip(), image_urls
 
 
 async def gen_chat_payload(event: MessageEvent, bot: Bot) -> Tuple[str, bool, List[str]]:
     """生成会话文本和图片 URL。保留 gen_chat_text 兼容旧调用。"""
-    chat_text, wake_up = await gen_chat_text(event, bot)
-    image_urls: List[str] = []
     if not config.MULTIMODAL_ENABLE:
-        return chat_text, wake_up, image_urls
-
-    for seg in event.message:
-        if seg.type != "image":
-            continue
-        url = seg.data.get("url") or seg.data.get("file")
-        if _is_supported_image_url(url):
-            image_urls.append(str(url))
+        chat_text, wake_up = await gen_chat_text(event, bot)
+        return chat_text, wake_up, []
+    
+    # 使用 _extract_message_text_and_images 获取带有图片标记的文本
+    chat_text, image_urls = await _extract_message_text_and_images(event.message, event, bot)
+    
+    # 检查是否需要唤醒
+    wake_up = False
+    if isinstance(event, GroupMessageEvent):
+        for seg in event.message:
+            if seg.type == 'at' and seg.data.get('qq') == 'all':
+                wake_up = True
+                break
+    
     return chat_text, wake_up, image_urls
     
 

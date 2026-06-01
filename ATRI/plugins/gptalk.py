@@ -1,23 +1,18 @@
 from nonebot import on_command, on_regex, on_message
 from nonebot.adapters.onebot.v11 import Message, MessageEvent, PrivateMessageEvent, GroupMessageEvent, MessageSegment
-import time
+import time, json, os
 from nonebot.adapters import Message
 from nonebot.params import CommandArg
 import requests, re, asyncio
 
-default_api = 'REDACTED_DIFY_KEY'
-api_dic = {'研究':'REDACTED_DIFY_KEY',
-           '简洁':'REDACTED_DIFY_KEY',
-           '旮旯':'REDACTED_DIFY_KEY',
-           '深入':'REDACTED_DIFY_KEY',
-           '自动':'REDACTED_DIFY_KEY',
-           '画画': 'REDACTED_DIFY_KEY'}
-# default_api = 'REDACTED_DIFY_KEY'
-# api_dic = {'dnd':'REDACTED_FASTGPT_KEY',
-#            '旮旯':'REDACTED_FASTGPT_KEY',
-#            '5e':'REDACTED_FASTGPT_KEY',
-#            '测试':'REDACTED_FASTGPT_KEY',
-#            'metaso': 'REDACTED_DIFY_KEY'}
+_config_path = os.path.join(os.path.dirname(__file__), 'gptalk_config.json')
+try:
+    with open(_config_path, 'r', encoding='utf-8') as _f:
+        _cfg = json.load(_f)
+except (FileNotFoundError, json.JSONDecodeError):
+    _cfg = {}
+default_api = _cfg.get('default_api', '')
+api_dic = _cfg.get('api_dic', {})
 group_api = {}
 cid_dic = {}
 

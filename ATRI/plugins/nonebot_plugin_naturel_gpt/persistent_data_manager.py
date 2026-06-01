@@ -43,22 +43,34 @@ class ChatMessageData(StoreSerializable):
     text: str = field(default="")
     images: List[str] = field(default_factory=list)
     content_is_labeled: bool = field(default=False)
+    context_only: bool = field(default=False)
     timestamp: float = field(default=0.0)
     triggered: bool = field(default=False)
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    tool_call_id: str = field(default="")
+    tool_name: str = field(default="")
+    reasoning_content: str = field(default="")
+    tool_call_summary: str = field(default="")
 
     @override
     def _init_from_dict(self, self_dict: Dict[str, Any]) -> Self:
         super()._init_from_dict(self_dict)
-        self.role = self.role if self.role in {"user", "assistant"} else "user"
+        self.role = self.role if self.role in {"user", "assistant", "tool"} else "user"
         self.sender = str(getattr(self, "sender", "") or "")
         self.text = str(getattr(self, "text", "") or "")
         self.images = list(getattr(self, "images", []) or [])
         self.content_is_labeled = bool(getattr(self, "content_is_labeled", False))
+        self.context_only = bool(getattr(self, "context_only", False))
         try:
             self.timestamp = float(getattr(self, "timestamp", 0.0) or 0.0)
         except (TypeError, ValueError):
             self.timestamp = 0.0
         self.triggered = bool(getattr(self, "triggered", False))
+        self.tool_calls = list(getattr(self, "tool_calls", []) or [])
+        self.tool_call_id = str(getattr(self, "tool_call_id", "") or "")
+        self.tool_name = str(getattr(self, "tool_name", "") or "")
+        self.reasoning_content = str(getattr(self, "reasoning_content", "") or "")
+        self.tool_call_summary = str(getattr(self, "tool_call_summary", "") or "")
         return self
 
 
@@ -73,8 +85,10 @@ class PresetData(StoreSerializable):
     is_only_private: bool = field(default=False)
 
     chat_impressions: Dict[str, ImpressionData] = field(default_factory=dict)
-    chat_memory: Dict[str, str] = field(default_factory=dict)
+    chat_memory: Dict[str, str] = field(default_factory=dict)  # 群记忆
+    user_memories: Dict[str, Dict[str, str]] = field(default_factory=dict)  # 用户个人记忆: {user_id: {key: value}}
     context_summary: str = field(default="")
+    tool_call_summary: str = field(default="")  # 模式3: 最近一次工具调用的摘要
     prompt_messages: List[ChatMessageData] = field(default_factory=list)
 
     @classmethod
@@ -97,8 +111,8 @@ class PresetData(StoreSerializable):
             self.is_only_private = False
 
         self.chat_impressions.clear()
-        self.chat_memory.clear()
         self.context_summary = ""
+        self.tool_call_summary = ""
         self.prompt_messages.clear()
 
     @override
@@ -110,7 +124,16 @@ class PresetData(StoreSerializable):
         self.is_default = bool(getattr(self, "is_default", False))
         self.is_only_private = bool(getattr(self, "is_only_private", False))
         self.chat_memory = dict(getattr(self, "chat_memory", {}) or {})
+        
+        # 加载用户个人记忆
+        raw_user_memories = getattr(self, "user_memories", {}) or {}
+        self.user_memories = {}
+        for uid, memories in raw_user_memories.items():
+            if isinstance(memories, dict):
+                self.user_memories[str(uid)] = {str(k): str(v) for k, v in memories.items() if v}
+        
         self.context_summary = str(getattr(self, "context_summary", "") or "")
+        self.tool_call_summary = str(getattr(self, "tool_call_summary", "") or "")
 
         raw_impressions = getattr(self, "chat_impressions", {}) or {}
         self.chat_impressions = {
@@ -127,6 +150,19 @@ class PresetData(StoreSerializable):
         ]
         return self
 
+    @override
+    def _serializable(self) -> Dict[str, Any]:
+        """序列化时过滤掉工具消息和思考内容"""
+        rtn = super()._serializable()
+        # 过滤prompt_messages中的工具消息和思考内容
+        if "prompt_messages" in rtn:
+            rtn["prompt_messages"] = [
+                msg._serializable() if isinstance(msg, ChatMessageData) else msg
+                for msg in rtn["prompt_messages"]
+                if isinstance(msg, ChatMessageData) and msg.role in {"user", "assistant"} and not msg.tool_calls
+            ]
+        return rtn
+
 
 @dataclass
 class ChatData(StoreSerializable):
@@ -136,9 +172,13 @@ class ChatData(StoreSerializable):
     is_enable: bool = field(default=True)
     enable_auto_switch_identity: bool = field(default=config.NG_ENABLE_AWAKE_IDENTITIES)
     active_preset: str = field(default="")
+    active_profile: str = field(default="")  # 当前会话使用的 OpenAI profile
+    draw_mode: str = field(default="auto")  # 画图模式: force/on/auto/off
     preset_datas: Dict[str, PresetData] = field(default_factory=dict)
     next_message_index: int = field(default=0)
     chat_image_history: List[Dict[str, Any]] = field(default_factory=list)
+    global_memory_enabled: bool = field(default=False)  # 群级 global 记忆开关
+    global_chat_memory: Dict[str, str] = field(default_factory=dict)  # global 群记忆（所有人格共享）
 
     def reset(self):
         self.chat_image_history.clear()
@@ -155,6 +195,9 @@ class ChatData(StoreSerializable):
             getattr(self, "enable_auto_switch_identity", config.NG_ENABLE_AWAKE_IDENTITIES)
         )
         self.active_preset = str(getattr(self, "active_preset", "") or "")
+        self.active_profile = str(getattr(self, "active_profile", "") or "")
+        raw_draw_mode = str(getattr(self, "draw_mode", "auto") or "auto")
+        self.draw_mode = raw_draw_mode if raw_draw_mode in ("force", "on", "auto", "off") else "auto"
 
         raw_presets = getattr(self, "preset_datas", {}) or {}
         self.preset_datas = {
@@ -186,6 +229,10 @@ class ChatData(StoreSerializable):
                 item.pop("history_index", None)
                 max_seen_index = max(max_seen_index, index + 1)
         self.next_message_index = max_seen_index
+
+        self.global_memory_enabled = bool(getattr(self, "global_memory_enabled", False))
+        raw_global_chat_mem = getattr(self, "global_chat_memory", {}) or {}
+        self.global_chat_memory = {str(k): str(v) for k, v in raw_global_chat_mem.items() if v}
         return self
 
 
@@ -193,6 +240,7 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
     """Persistent chat data manager."""
 
     _datas: Dict[str, ChatData] = {}
+    _global_user_memories: Dict[str, Dict[str, str]] = {}  # global 用户记忆: {user_id: {key: value}}
     _last_save_data_time: float = 0
     _file_path: str
     _inited: bool
@@ -245,14 +293,22 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             logger.info("找不到历史数据，初始化成功 (pickle)")
             return
-
         with open(file_path, "rb") as f:
             raw_datas = pickle.load(f)
-        self._datas = {
-            k: ChatData._load_from_dict(v.__dict__ if isinstance(v, ChatData) else v)
-            for k, v in raw_datas.items()
-            if isinstance(v, (dict, ChatData))
-        }
+        if isinstance(raw_datas, dict):
+            raw_global = raw_datas.pop("__global_user_memories", None)
+            if isinstance(raw_global, dict):
+                self._global_user_memories = raw_global
+            else:
+                self._global_user_memories = {}
+            self._datas = {
+                k: ChatData._load_from_dict(v.__dict__ if isinstance(v, ChatData) else v)
+                for k, v in raw_datas.items()
+                if isinstance(v, (dict, ChatData))
+            }
+        else:
+            self._global_user_memories = {}
+            self._datas = {}
         logger.info("读取历史数据成功 (pickle)")
 
     def _load_from_file_json(self):
@@ -261,12 +317,19 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
         if not os.path.exists(file_path):
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             return
-
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
             raise Exception(f"File `{self._file_path}` load error! Data not dict!")
-
+        raw_global = data.pop("__global_user_memories", None)
+        if isinstance(raw_global, dict):
+            self._global_user_memories = {
+                str(uid): {str(k): str(v) for k, v in mems.items() if v}
+                for uid, mems in raw_global.items()
+                if isinstance(mems, dict)
+            }
+        else:
+            self._global_user_memories = {}
         self._datas = {
             k: ChatData._load_from_dict(v)
             for k, v in data.items()
@@ -290,12 +353,18 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
         return self._inited
 
     def _save_to_file_pickle(self):
+        save_data = dict(self._datas)
+        if self._global_user_memories:
+            save_data["__global_user_memories"] = self._global_user_memories
         with open(self._file_path, "wb") as f:
-            pickle.dump(self._datas, f)
+            pickle.dump(save_data, f)
 
     def _save_to_file_json(self):
+        save_data = dict(self._datas)
+        if self._global_user_memories:
+            save_data["__global_user_memories"] = self._global_user_memories
         with open(self._file_path, mode="w", encoding="utf-8") as fw:
-            json.dump(self._datas, fw, ensure_ascii=False, sort_keys=True, indent=2, cls=StoreEncoder)
+            json.dump(save_data, fw, ensure_ascii=False, sort_keys=True, indent=2, cls=StoreEncoder)
 
     def save_to_file(self, must_save: bool = False):
         if not must_save and time.time() - self._last_save_data_time < 60:
@@ -328,6 +397,66 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
             chat_data.preset_datas[preset_data.preset_key] = preset_data
         self._datas[chat_key] = chat_data
         return chat_data
+
+    def get_global_user_memories(self, user_id: str) -> Dict[str, str]:
+        """获取指定用户的 global 记忆。不存在时自动创建。"""
+        uid = str(user_id)
+        if uid not in self._global_user_memories:
+            self._global_user_memories[uid] = {}
+        return self._global_user_memories[uid]
+
+    def set_global_user_memories(self, user_id: str, memories: Dict[str, str]) -> None:
+        """设置指定用户的 global 记忆。"""
+        self._global_user_memories[str(user_id)] = memories
+
+    def init_global_memory(self, chat_key: str) -> str:
+        """为指定会话开启 global 记忆，合并所有人格的记忆到 global 空间。返回合并报告。"""
+        chat_data = self._datas.get(chat_key)
+        if not chat_data:
+            return "会话不存在。"
+
+        chat_data.global_memory_enabled = True
+
+        # 合并所有人格的群记忆
+        merged_group: Dict[str, str] = dict(chat_data.global_chat_memory)
+        group_parts = []
+        for preset_key, preset in chat_data.preset_datas.items():
+            if preset.chat_memory:
+                group_parts.append(f"{preset_key}: {len(preset.chat_memory)}条")
+                for k, v in preset.chat_memory.items():
+                    if k not in merged_group:
+                        merged_group[k] = v
+                preset.chat_memory.clear()
+        chat_data.global_chat_memory = merged_group
+
+        # 合并所有人格的用户记忆（跨群）
+        user_parts = []
+        for chat_d in self._datas.values():
+            for preset_key, preset in chat_d.preset_datas.items():
+                for uid, mems in preset.user_memories.items():
+                    if not mems:
+                        continue
+                    target = self._global_user_memories.setdefault(uid, {})
+                    added = 0
+                    for k, v in mems.items():
+                        if k not in target:
+                            target[k] = v
+                            added += 1
+                    if added:
+                        user_parts.append(f"{uid}@{preset_key}: +{added}")
+                    preset.user_memories[uid].clear()
+
+        report_parts = []
+        if group_parts:
+            report_parts.append(f"群记忆 <- {', '.join(group_parts)}")
+        else:
+            report_parts.append("群记忆: 无合并")
+        if user_parts:
+            report_parts.append(f"用户记忆 <- {', '.join(user_parts)}")
+        else:
+            report_parts.append("用户记忆: 无合并")
+
+        return "\n".join(report_parts)
 
 
 @driver.on_shutdown

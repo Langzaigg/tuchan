@@ -4,10 +4,20 @@ from .llm_tool_plugins import TOOL_REGISTRY
 from .logger import logger
 
 
-def get_tool_schemas(config) -> List[Dict[str, Any]]:
+def get_tool_schemas(config, chat_key: str = "") -> List[Dict[str, Any]]:
     if not config.LLM_ENABLE_TOOLS:
         return []
-    return [schema for schema, _ in TOOL_REGISTRY.values()]
+    
+    schemas = []
+    for name, (schema, _) in TOOL_REGISTRY.items():
+        # NAS游戏工具：仅在白名单群中暴露
+        if name == "nas_game_list" and chat_key:
+            from .llm_tool_plugins.nas_game_list import _check_whitelist
+            allowed, _, _ = _check_whitelist(config, chat_key)
+            if not allowed:
+                continue
+        schemas.append(schema)
+    return schemas
 
 
 async def execute_tool(name: str, args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:

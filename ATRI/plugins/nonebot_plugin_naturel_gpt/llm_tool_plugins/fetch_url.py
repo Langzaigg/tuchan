@@ -24,7 +24,22 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
     url = str(args.get("url") or "").strip()
     if not validate_http_url(url):
         return "URL 必须以 http:// 或 https:// 开头。", []
-    async with httpx.AsyncClient(timeout=config.WEB_FETCH_TIMEOUT, follow_redirects=True) as client:
+    
+    proxy = getattr(config, "TOOL_PROXY", "") or None
+    timeout = config.WEB_FETCH_TIMEOUT
+    
+    # 先尝试使用代理
+    if proxy:
+        try:
+            async with httpx.AsyncClient(proxy=proxy, timeout=timeout, follow_redirects=True) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                return clean_text(resp.text, config.WEB_FETCH_MAX_CHARS), []
+        except Exception:
+            pass  # 代理失败，回退到直连
+    
+    # 直连
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         resp = await client.get(url)
         resp.raise_for_status()
         return clean_text(resp.text, config.WEB_FETCH_MAX_CHARS), []
