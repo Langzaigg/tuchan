@@ -1,17 +1,37 @@
 """对话历史管理模块 - 负责对话历史的添加、截断和清理"""
 
+import copy
 import time
 from typing import Any, Dict, List, Optional
 
 from .logger import logger
 from .config import config
-from .openai_func import TextGenerator
+from .openai_func import TextGenerator, is_model_request_error_text
 from .persistent_data_manager import ChatMessageData, ImpressionData, PresetData
 from .llm_tool_plugins import TOOL_REGISTRY
 
 
 class ChatHistoryMixin:
     """对话历史管理 Mixin，提供对话历史的添加、截断和清理功能"""
+
+    @staticmethod
+    def _target_context_round_limit() -> int:
+        """摘要完成后的目标上下文轮数。"""
+        return max(1, int(getattr(config, "CONTEXT_WINDOW_SIZE", 1) or 1))
+
+    @staticmethod
+    def _context_overflow_round_limit() -> int:
+        """摘要触发前允许额外保留的溢出轮数。"""
+        try:
+            ratio = float(getattr(config, "CONTEXT_COMPRESS_THRESHOLD_RATIO", 0.5) or 0)
+        except (TypeError, ValueError):
+            ratio = 0.5
+        return int(ChatHistoryMixin._target_context_round_limit() * max(0.0, ratio))
+
+    @staticmethod
+    def _history_buffer_round_limit() -> int:
+        """请求构造和未摘要硬裁剪使用的独立对话缓冲窗口。"""
+        return ChatHistoryMixin._target_context_round_limit() + ChatHistoryMixin._context_overflow_round_limit()
 
     async def update_chat_history_row(
         self,
@@ -24,6 +44,7 @@ class ChatHistoryMixin:
         record_for_prompt: bool = False,
         content_is_labeled: bool = False,
         context_only: bool = False,
+        user_id: str = "",
     ) -> None:
         """更新当前预设的结构化对话历史。"""
         tg = TextGenerator.instance
@@ -63,8 +84,9 @@ class ChatHistoryMixin:
                 role = "assistant"
             else:
                 role = "user"
-            preset.prompt_messages.append(ChatMessageData(
+            history_item = ChatMessageData(
                 role=role,
+                user_id=str(user_id or ""),
                 sender=sender,
                 text=msg,
                 images=valid_images,
@@ -72,27 +94,39 @@ class ChatHistoryMixin:
                 context_only=context_only,
                 timestamp=time.time(),
                 triggered=record_for_prompt,
-            ))
+            )
+            if context_only:
+                insert_at = len(preset.prompt_messages)
+                for idx in range(len(preset.prompt_messages) - 1, -1, -1):
+                    item = preset.prompt_messages[idx]
+                    if isinstance(item, ChatMessageData) and item.role == "user" and not item.context_only:
+                        insert_at = idx
+                        break
+                preset.prompt_messages.insert(insert_at, history_item)
+            else:
+                preset.prompt_messages.append(history_item)
         
         if record_time:
             self._last_msg_time = time.time()   # 更新上次对话时间
         
         if require_summary:
             await self._compress_prompt_messages_if_needed(preset)
-        else:
+        elif not config.CONTEXT_SUMMARY_ENABLED:
             self._trim_prompt_messages_without_summary(preset)
 
-    async def save_tool_messages(self, tool_messages: List[Dict[str, Any]]) -> None:
+    async def save_tool_messages(self, tool_messages: List[Dict[str, Any]]) -> Optional[ChatMessageData]:
         """保存工具调用消息到内存中的prompt_messages（不持久化）"""
         if not tool_messages:
-            return
+            return None
         
         preset = self.chat_preset_dicts.get(self._preset_key)
         if not preset:
             logger.error(f"[会话: {self.chat_key}] 无法获取当前预设 '{self._preset_key}' 的数据")
-            return
+            return None
         
         valid_tool_names = set(TOOL_REGISTRY.keys())
+        last_assistant_msg: Optional[ChatMessageData] = None
+        valid_tool_call_names: Dict[str, str] = {}
 
         for msg in tool_messages:
             role = msg.get("role", "")
@@ -100,6 +134,7 @@ class ChatHistoryMixin:
                 # 校验工具调用：修复双拼函数名，剔除无效调用
                 fixed_calls = []
                 for tc in msg["tool_calls"]:
+                    tc = copy.deepcopy(tc)
                     func = tc.get("function", {})
                     name = func.get("name", "")
                     if not name:
@@ -117,35 +152,52 @@ class ChatHistoryMixin:
                         fixed_calls.append(tc)
                 if not fixed_calls:
                     continue
+                for i, tc in enumerate(fixed_calls):
+                    call_id = str(tc.get("id") or f"call_{i}")
+                    tc["id"] = call_id
+                    func = tc.get("function", {})
+                    valid_tool_call_names[call_id] = str(func.get("name", "") or "")
+                # 创建新字典而非修改原始 msg
+                msg = {k: v for k, v in msg.items() if k != "tool_calls"}
                 msg["tool_calls"] = fixed_calls
-                preset.prompt_messages.append(ChatMessageData(
+                assistant_history_item = ChatMessageData(
                     role="assistant",
                     sender=self._preset_key,
                     text=msg.get("content", ""),
                     tool_calls=fixed_calls,
                     reasoning_content=msg.get("reasoning_content", ""),
                     timestamp=time.time(),
-                ))
+                )
+                preset.prompt_messages.append(assistant_history_item)
+                last_assistant_msg = assistant_history_item
             elif role == "tool":
+                tool_call_id = str(msg.get("tool_call_id", "") or "")
+                if tool_call_id not in valid_tool_call_names:
+                    if config.DEBUG_LEVEL > 0:
+                        logger.warning(f"[会话: {self.chat_key}] 剔除无对应 tool_call 的工具结果: {tool_call_id}")
+                    continue
                 preset.prompt_messages.append(ChatMessageData(
                     role="tool",
                     sender=self._preset_key,
                     text=msg.get("content", ""),
-                    tool_call_id=msg.get("tool_call_id", ""),
-                    tool_name=msg.get("name", ""),
+                    tool_call_id=tool_call_id,
+                    tool_name=valid_tool_call_names.get(tool_call_id, str(msg.get("name", "") or "")),
                     timestamp=time.time(),
                 ))
         
         if config.DEBUG_LEVEL > 0:
             logger.info(f"[会话: {self.chat_key}] 已保存 {len(tool_messages)} 条工具消息到内存")
+        return last_assistant_msg
 
     async def update_chat_history_row_for_user(self, sender: str, msg: str, userid: str, username: str, require_summary: bool = False) -> None:
         """更新对特定用户的对话历史行（仅累积，印象由摘要任务统一生成）"""
         if userid not in self.chat_preset.chat_impressions:
-            impression_data = ImpressionData(user_id=userid)
+            impression_data = ImpressionData(user_id=userid, nickname=username or "")
             self.chat_preset.chat_impressions[userid] = impression_data
         else:
             impression_data = self.chat_preset.chat_impressions[userid]
+            if username:
+                impression_data.nickname = username
         tg = TextGenerator.instance
         messageunit = tg.generate_msg_template(sender=sender, msg=msg)
         impression_data.chat_history.append(messageunit)
@@ -172,9 +224,16 @@ class ChatHistoryMixin:
         preset = self.chat_preset_dicts.get(self._preset_key)
         if preset:
             preset.prompt_messages = preset.prompt_messages[-keep_history:]
+            # 只清理超过有效期的图片，保留新鲜图片
+            now = time.time()
+            fresh_seconds = max(1, config.MULTIMODAL_IMAGE_FRESH_MINUTES) * 60
             for item in preset.prompt_messages:
-                if isinstance(item, ChatMessageData):
-                    item.images = []
+                if isinstance(item, ChatMessageData) and item.images:
+                    item.images = [
+                        url for url in item.images
+                        if not item.timestamp or (now - item.timestamp <= fresh_seconds)
+                    ]
+            preset.prompt_messages = self._cleanup_orphan_history_messages(preset.prompt_messages)
         if config.DEBUG_LEVEL > 0:
             logger.warning(
                 f"[会话: {self.chat_key}] 已清理 400 后上下文: "
@@ -182,11 +241,11 @@ class ChatHistoryMixin:
             )
 
     def _trim_prompt_messages_without_summary(self, preset: PresetData) -> None:
-        """滑动窗口截断：保留最近 CONTEXT_WINDOW_SIZE 轮对话，保护工具调用链完整性。
-        截断时保存溢出消息到 _pending_overflow_text，供后续摘要任务使用。"""
-        max_rounds = max(1, config.CONTEXT_WINDOW_SIZE)
-        # 先清理孤立的tool消息
-        preset.prompt_messages = self._cleanup_orphan_tool_messages(preset.prompt_messages)
+        """滑动窗口截断：保留最近独立缓冲窗口内的对话，保护工具调用链完整性。
+        保留 context_only 消息（非触发上下文），只删除溢出的 user/assistant 轮次。"""
+        max_rounds = self._history_buffer_round_limit()
+        # 先清理没有真实 user 承接的 assistant/tool 消息
+        preset.prompt_messages = self._cleanup_orphan_history_messages(preset.prompt_messages)
         # 从末尾向前数 max_rounds 轮，找到截断点（排除 context_only）
         rounds = 0
         cut_index = 0
@@ -194,32 +253,63 @@ class ChatHistoryMixin:
             if preset.prompt_messages[i].role == "user" and not preset.prompt_messages[i].context_only:
                 rounds += 1
                 if rounds > max_rounds:
-                    cut_index = i + 1  # +1 确保包含最旧的溢出轮本身
+                    cut_index = i + 1
                     break
         else:
             # 不足 max_rounds 轮，不截断
             return
         if cut_index > 0:
-            # 保存溢出消息用于后续摘要（排除工具消息，避免干扰摘要质量）
-            overflow_messages = [
-                m for m in preset.prompt_messages[:cut_index]
-                if not (isinstance(m, ChatMessageData) and m.role in {"tool", "assistant"} and m.tool_calls)
-            ]
-            if overflow_messages:
-                overflow_text = "\n".join(self._format_prompt_message_for_summary(item) for item in overflow_messages)
-                if overflow_text:
-                    if self._pending_overflow_text:
-                        self._pending_overflow_text += "\n" + overflow_text
-                    else:
-                        self._pending_overflow_text = overflow_text
-                    if config.DEBUG_LEVEL > 0:
-                        logger.info(f"[会话: {self.chat_key}] 截断时保存 {len(overflow_messages)} 条溢出消息到 pending")
-            del preset.prompt_messages[:cut_index]
-            # 截断后，如果开头是孤立的 assistant（其对应的 user 已被截断），删除它
-            while preset.prompt_messages and preset.prompt_messages[0].role == "assistant":
-                preset.prompt_messages.pop(0)
-            # 截断可能在 assistant+tool_calls 和 tool 结果之间切断，产生新的孤立 tool 消息
-            preset.prompt_messages = self._cleanup_orphan_tool_messages(preset.prompt_messages)
+            # 保留 context_only 消息，只删除溢出的 user/assistant/tool 轮次
+            del_indices = [i for i in range(cut_index) if not preset.prompt_messages[i].context_only]
+            for i in sorted(del_indices, reverse=True):
+                del preset.prompt_messages[i]
+            if config.DEBUG_LEVEL > 0:
+                preserved_ctx = sum(1 for i in range(min(cut_index, len(preset.prompt_messages))) if preset.prompt_messages[i].context_only)
+                if preserved_ctx:
+                    logger.info(f"[会话: {self.chat_key}] 截断时保留了 {preserved_ctx} 条 context_only 消息")
+            # 截断可能切断 user -> assistant/tool 链，产生新的孤立消息
+            preset.prompt_messages = self._cleanup_orphan_history_messages(preset.prompt_messages)
+
+    @staticmethod
+    def _cleanup_orphan_history_messages(messages: List[ChatMessageData]) -> List[ChatMessageData]:
+        """清理没有真实 user 轮次承接的 assistant/tool 历史，保留 context_only。"""
+        cleaned = ChatHistoryMixin._cleanup_orphan_tool_messages(messages)
+        result: List[ChatMessageData] = []
+        round_open = False
+        active_tool_call_ids = set()
+        for item in cleaned:
+            if item.context_only:
+                result.append(item)
+                continue
+            if item.role == "user":
+                round_open = True
+                active_tool_call_ids = set()
+                result.append(item)
+                continue
+            if item.role == "assistant":
+                if not round_open:
+                    continue
+                if is_model_request_error_text(item.text):
+                    round_open = False
+                    active_tool_call_ids = set()
+                    continue
+                result.append(item)
+                if item.tool_calls:
+                    active_tool_call_ids = {
+                        tc.get("id")
+                        for tc in item.tool_calls
+                        if isinstance(tc, dict) and tc.get("id")
+                    }
+                else:
+                    round_open = False
+                    active_tool_call_ids = set()
+                continue
+            if item.role == "tool":
+                if round_open and item.tool_call_id and item.tool_call_id in active_tool_call_ids:
+                    result.append(item)
+                    active_tool_call_ids.discard(item.tool_call_id)
+                continue
+        return ChatHistoryMixin._cleanup_orphan_tool_messages(result)
 
     @staticmethod
     def _cleanup_orphan_tool_messages(messages: List[ChatMessageData]) -> List[ChatMessageData]:

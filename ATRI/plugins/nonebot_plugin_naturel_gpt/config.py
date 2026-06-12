@@ -82,6 +82,8 @@ class Config(BaseModel, extra=Extra.ignore):
     """禁用的工具列表，填写工具模块名（如 browse_url、pixiv_search）"""
     LLM_MAX_TOOL_ROUNDS: int
     """单轮回复最多工具调用轮数"""
+    LLM_MAX_TOTAL_TOOL_CALLS: int
+    """单轮总工具调用次数上限"""
 
     REPLY_ON_NAME_MENTION_PROBABILITY: float
     """是否在被提及时回复"""
@@ -150,8 +152,10 @@ class Config(BaseModel, extra=Extra.ignore):
     """图片有效期（分钟），超过此时间的图片不再作为上下文"""
 
     CONTEXT_BUFFER_SIZE: int
-    """非触发消息缓冲区大小（消息条数），同时控制图片视野窗口"""
+    """旧版非触发消息缓冲区大小（兼容字段；主路径窗口由 CONTEXT_WINDOW_SIZE 和 CONTEXT_COMPRESS_THRESHOLD_RATIO 计算）"""
 
+    TAVILY_API_KEY: List[str]
+    """Tavily 搜索 API Key 列表，启动时自动选用额度剩余最多的 key"""
     BOCHA_API_KEY: str
     BOCHA_API_BASE: str
     BOCHA_SEARCH_COUNT: int
@@ -221,7 +225,7 @@ CONFIG_TEMPLATE = {
     'CONTEXT_WINDOW_SIZE': 16,  # 上下文窗口大小（对话轮数），每轮=1条用户消息+1条回复
     'CONTEXT_SUMMARY_ENABLED': False,  # 是否启用上下文摘要压缩
     'CONTEXT_COMPRESS_THRESHOLD_RATIO': 0.5,  # 压缩触发阈值乘数，溢出超过窗口*此比例才触发摘要生成
-    'TOOL_CONTEXT_TOKEN_BUDGET': 8196,  # 工具消息token预算（含思考），超出时从旧到新逐组去除
+    'TOOL_CONTEXT_TOKEN_BUDGET': 16384,  # 工具消息token预算（含思考），超出时从旧到新逐组去除
     'TOOL_CONTEXT_MODE': 3,  # 工具上下文模式: 1=完整工具+思考, 2=仅思考, 3=仅工具调用摘要
 
     'LLM_ENABLE_STREAM': True,
@@ -229,6 +233,7 @@ CONFIG_TEMPLATE = {
     'LLM_ENABLE_TOOLS': True,
     'LLM_DISABLED_TOOLS': [],  # 禁用的工具列表，填写工具模块名（如 browse_url、pixiv_search）
     'LLM_MAX_TOOL_ROUNDS': 3,
+    'LLM_MAX_TOTAL_TOOL_CALLS': 15,
 
     'REPLY_ON_NAME_MENTION_PROBABILITY': 0,  # 被提及时回复概率
     'REPLY_ON_AT': True,            # 是否在被at时回复
@@ -269,9 +274,10 @@ CONFIG_TEMPLATE = {
 
     'CONTEXT_BUFFER_SIZE': 10,
 
+    'TAVILY_API_KEY': [],
     'BOCHA_API_KEY': '',
     'BOCHA_API_BASE': 'https://api.bochaai.com/v1/web-search',
-    'BOCHA_SEARCH_COUNT': 5,
+    'BOCHA_SEARCH_COUNT': 20,
     'WEB_FETCH_TIMEOUT': 20,
     'WEB_FETCH_MAX_CHARS': 6000,
     'PLAYWRIGHT_TIMEOUT': 20,
@@ -361,7 +367,7 @@ def _load_config_obj_from_file()->Config:
     # 读取配置文件
     with open(config_path, 'r', encoding='utf-8') as f:
         try:
-            config_obj_from_file:Dict = yaml.load(f, Loader=yaml.FullLoader)
+            config_obj_from_file:Dict = yaml.safe_load(f)
             for k in CONFIG_TEMPLATE.keys():
                 if not k in config_obj_from_file.keys():
                     config_obj_from_file[k] = CONFIG_TEMPLATE[k]
@@ -452,10 +458,8 @@ _LEGACY_FIELDS = {
 
 def save_config():
     # 检查数据文件夹目录、日志目录是否存在 不存在则创建
-    if not Path(config.NG_DATA_PATH[:-1]).exists():
-        Path(config.NG_DATA_PATH[:-1]).mkdir(parents=True)
-    if not Path(config.NG_LOG_PATH[:-1]).exists():
-        Path(config.NG_LOG_PATH[:-1]).mkdir(parents=True)
+    Path(config.NG_DATA_PATH).parent.mkdir(parents=True, exist_ok=True)
+    Path(config.NG_LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
     get_persona_dir().mkdir(parents=True, exist_ok=True)
 
     # 保存配置文件（有 OPENAI_PROFILES 时剔除旧格式兼容字段）
@@ -481,8 +485,8 @@ def reload_config():
     assert(config)
 
     config_tmp = _load_config_obj_from_file()
-    for k in config.dict():
-        setattr(config, k, getattr(config_tmp,k))
+    # 直接替换整个 config 对象，避免 setattr 逐字段覆盖丢失新字段
+    config = config_tmp
     logger.info(f'Naturel GPT 配置文件重载成功! ver:{config.VERSION}')
 
 # 检查config文件夹是否存在 不存在则创建

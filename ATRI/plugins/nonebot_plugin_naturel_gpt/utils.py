@@ -152,13 +152,18 @@ async def get_user_name(event: Union[MessageEvent, GroupIncreaseNoticeEvent], bo
     return user_name
 
 async def translate(text:str, from_:str="auto", to_:str="en") -> str:
-    """翻译"""
-    loop = asyncio.get_event_loop()
+    """翻译（注意：依赖外部 API，可能不稳定）"""
     try:
-        r = await loop.run_in_executor(None, requests.post, "https://hf.space/embed/mikeee/gradio-gtr/+/api/predict", {"data": [text, from_, to_]})
-        return r.json()["data"][0]
-    except:
-        raise Exception("翻译 API 请求失败")
+        import httpx
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://hf.space/embed/mikeee/gradio-gtr/+/api/predict",
+                json={"data": [text, from_, to_]}
+            )
+            resp.raise_for_status()
+            return resp.json()["data"][0]
+    except Exception as e:
+        raise Exception(f"翻译 API 请求失败: {e}")
 
 async def async_fetch(
     url,
@@ -178,16 +183,16 @@ async def async_fetch(
     if isinstance(data, dict):
         data = json.dumps(data)
 
-    async with aiohttp.ClientSession(headers=headers) as session:
-        if proxy_server:
-            conn = aiohttp.TCPConnector(limit=10, verify_ssl=False)
-            session = aiohttp.ClientSession(connector=conn)
-            session._default_headers.update(  # noqa: SLF001
-                {"Proxy-Switch-Ip": "yes"},
-            )
-            session._default_headers.update(  # noqa: SLF001
-                {"Proxy-Server": proxy_server},
-            )
+    # 条件创建 session，避免资源泄漏
+    if proxy_server:
+        conn = aiohttp.TCPConnector(limit=10, verify_ssl=False)
+        merged_headers = dict(headers)
+        merged_headers.update({"Proxy-Switch-Ip": "yes", "Proxy-Server": proxy_server})
+        session = aiohttp.ClientSession(connector=conn, headers=merged_headers)
+    else:
+        session = aiohttp.ClientSession(headers=headers)
+
+    async with session:
         async with getattr(session, method)(
             url,
             params=params,

@@ -226,7 +226,7 @@ def fetch_schema_and_knowledge_sync() -> Tuple[bool, str]:
             "- 触发词（画/画一个/来一张/draw/改图/重画等）→ 必须在 assistant 消息中附带 tool_calls 调用 generate_anima_image。\n"
             "- 只说「在画了」但不附带 tool_calls = 没有画画。任务编号只能由工具返回，禁止编造。\n"
             "- 历史消息中的「在画了」「等出图」是上一轮结果，每次新请求必须重新调用工具。\n"
-            "- 需要确认角色外观时，用 bocha_search 搜索「角色名 wiki」或「角色名 萌娘百科」，再用 fetch_url 获取外观描述。不要使用 bangumi 搜索，bangumi 没有外观信息。\n"
+            "- 需要确认角色外观时，先用搜索工具（tavily_search 或 bocha_search）用简短查询，不要使用 bangumi 搜索，bangumi 没有外观信息。\n"
             "- 用户提出修改意见时立即重新调用。\n"
             "- 调用前不做画面描述，调用后用第一人称自然描述，不提及工具/系统/调用。\n"
         )
@@ -304,6 +304,11 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
     base_url = getattr(config, "COMFYUI_BASE_URL", "http://127.0.0.1:8188")
     set_base_url(base_url)
 
+    # 校验参数：至少需要一个有效字段（character / appearance / nltags / artist / series / tags / style / environment）
+    _meaningful_keys = ("character", "appearance", "nltags", "artist", "series", "tags", "style", "environment")
+    if not args or not any(args.get(k) for k in _meaningful_keys):
+        return "参数为空，无法生成图片。请根据用户描述提供作画参数，然后重新调用工具。", []
+
     current_task = asyncio.current_task()
     send_ctx = dict(_send_context.get(current_task, {}))
 
@@ -340,7 +345,11 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
 
     # 生成随机的6位字母数字任务编号
     task_id = _generate_task_id()
-    
+
+    # 保存提示词到数据库
+    from ..draw_db import save_prompt
+    save_prompt(task_id, args)
+
     content = (
         f"你正在画一幅插画：{positive_desc}。任务编号：{task_id}，预计{est_seconds}秒完成。"
         f"你必须将任务编号和预计时间告知用户，这是确认任务已成功提交的唯一凭证。"

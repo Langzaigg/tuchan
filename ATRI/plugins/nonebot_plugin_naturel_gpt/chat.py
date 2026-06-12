@@ -26,17 +26,20 @@ class Chat(ChatMemoryMixin, ChatSummaryMixin, ChatHistoryMixin, ChatPromptMixin)
     is_insilence = False         # 是否处于沉默状态
     chat_attitude = 0            # 对话态度
     silence_time = 0             # 沉默时长
-    _compress_task = None        # 正在运行的消息摘要任务
-    _tool_summary_task = None    # 正在运行的工具摘要任务
-    _pending_overflow_text: str = ""  # 摘要任务运行期间累积的溢出文本
-    _pending_overflow_user_ids: set = None  # 溢出文本中涉及的用户 ID
-    _compress_failure_time: float = 0  # 上次摘要压缩失败的时间戳（用于冷却）
-    _last_interrupted_response: str = ""  # 被打断的流式回复内容
 
     def __init__(self, chat_data: ChatData, preset_key: str = ''):
         if not isinstance(chat_data, ChatData):
             raise Exception(f'chat_data 参数不是ChatData类型,实际类型为:{type(chat_data).__name__}')
         self._chat_data = chat_data  # 当前对话关联的数据
+        # 实例变量初始化（避免类变量共享状态）
+        self._compress_task = None        # 正在运行的消息摘要任务
+        self._tool_summary_task = None    # 正在运行的工具摘要任务
+        self._pending_overflow_text: str = ""  # 摘要任务运行期间累积的溢出文本
+        self._pending_overflow_user_ids: set = None  # 溢出文本中涉及的用户 ID
+        self._pending_overflow_item_ids: set = set()  # 已累积待摘要的消息 id，避免摘要任务运行中重复累积
+        self._compressing_overflow_item_ids: set = set()  # 当前摘要任务正在处理的消息 id
+        self._compress_failure_time: float = 0  # 上次摘要压缩失败的时间戳（用于冷却）
+        self._last_interrupted_response: str = ""  # 被打断的流式回复内容
         preset_key = preset_key or self._chat_data.active_preset  # 参数没有设置时尝试查找上次使用的preset
         if not self.chat_preset_dicts:
             fallback_preset = PresetData(
@@ -57,16 +60,37 @@ class Chat(ChatMemoryMixin, ChatSummaryMixin, ChatHistoryMixin, ChatPromptMixin)
         self._context_buffer: List[Dict[str, Any]] = []  # 非触发消息临时缓冲
 
     def push_context_buffer(self, sender: str, text: str, images: Optional[List[str]] = None) -> None:
-        """将非触发消息推入临时缓冲区，长度限制为 CONTEXT_BUFFER_SIZE"""
+        """兼容旧路径：将非触发消息推入临时缓冲区。主路径在 matcher._recent_context_buffers。"""
+        image_list = list(images or [])
+        normalized_text = str(text or "").strip()
+        if not normalized_text and image_list:
+            normalized_text = " ".join(f"[图片{i + 1}]" for i in range(len(image_list)))
         self._context_buffer.append({
             "sender": sender,
-            "text": text,
-            "images": images or [],
+            "text": normalized_text,
+            "images": image_list,
             "timestamp": time.time(),
         })
-        max_buf = max(1, config.CONTEXT_BUFFER_SIZE)
+        if hasattr(self, "_history_buffer_round_limit"):
+            max_buf = self._history_buffer_round_limit()
+        else:
+            try:
+                target_rounds = int(getattr(config, "CONTEXT_WINDOW_SIZE", 1) or 1)
+            except (TypeError, ValueError):
+                target_rounds = 1
+            try:
+                overflow_ratio = float(getattr(config, "CONTEXT_COMPRESS_THRESHOLD_RATIO", 0.5) or 0)
+            except (TypeError, ValueError):
+                overflow_ratio = 0.5
+            max_buf = max(1, target_rounds) + int(max(1, target_rounds) * max(0.0, overflow_ratio))
         if len(self._context_buffer) > max_buf:
             self._context_buffer = self._context_buffer[-max_buf:]
+        if config.DEBUG_LEVEL > 0:
+            logger.info(
+                f"[上下文缓冲] 已缓存非触发消息 | 会话: {self.chat_key} | "
+                f"sender={sender} | text_len={len(normalized_text)} | images={len(image_list)} | "
+                f"buffer={len(self._context_buffer)}/{max_buf}"
+            )
 
     def flush_context_buffer(self) -> Tuple[str, List[str]]:
         """清空缓冲区，返回 (合并文本, 图片URL列表)。格式: [HH:MM] sender: text"""
@@ -82,7 +106,12 @@ class Chat(ChatMemoryMixin, ChatSummaryMixin, ChatHistoryMixin, ChatPromptMixin)
             if item.get("images"):
                 for i in range(len(item["images"])):
                     img_counter += 1
-                    text = text.replace(f"[图片{i+1}]", f"[图片{img_counter}]", 1)
+                    marker = f"[图片{i + 1}]"
+                    replacement = f"[图片{img_counter}]"
+                    if marker in text:
+                        text = text.replace(marker, replacement, 1)
+                    else:
+                        text = f"{text} {replacement}".strip()
             parts.append(f"[{ts}] {item['sender']}: {text}")
             images.extend(item.get("images", []))
         self._context_buffer = []
@@ -151,13 +180,24 @@ class Chat(ChatMemoryMixin, ChatSummaryMixin, ChatHistoryMixin, ChatPromptMixin)
 
     @property
     def chat_preset(self) -> PresetData:
-        """获取当前正在使用的预设的数据，并热加载 md 文件内容"""
+        """获取当前正在使用的预设的数据，并热加载 md 文件内容（带缓存，TTL 5秒）"""
         preset = self.chat_preset_dicts[self.preset_key]
+        now = time.time()
+        # 缓存命中：5秒内不重复加载
+        if hasattr(self, '_persona_cache_time') and now - self._persona_cache_time < 5.0:
+            if hasattr(self, '_persona_cache') and self.preset_key in self._persona_cache:
+                preset.bot_self_introl = self._persona_cache[self.preset_key]
+                return preset
         # 热加载：从 md 文件实时读取人设内容
         try:
             personas = load_personas_from_directory(str(get_persona_dir()))
             if self.preset_key in personas:
                 preset.bot_self_introl = personas[self.preset_key]
+                # 更新缓存
+                if not hasattr(self, '_persona_cache'):
+                    self._persona_cache = {}
+                self._persona_cache[self.preset_key] = personas[self.preset_key]
+                self._persona_cache_time = now
                 if config.DEBUG_LEVEL > 0:
                     logger.info(f"[热加载] 已更新预设 '{self.preset_key}' 的人格设定")
         except Exception as e:

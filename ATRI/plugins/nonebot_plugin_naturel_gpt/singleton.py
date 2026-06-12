@@ -1,8 +1,11 @@
+import threading
 from typing import Type, TypeVar, Generic
 
 T = TypeVar("T", bound="Singleton")
 
 class Singleton_Meta(type):
+    _lock = threading.Lock()
+    
     @property
     def instance(cls:Type[T]) -> T: # type: ignore
         return cls()
@@ -13,5 +16,8 @@ class Singleton(Generic[T], metaclass=Singleton_Meta):
 
     def __new__(cls, *args, **kwargs):
         if not cls._instance:
-            cls._instance = super().__new__(cls)
+            with Singleton_Meta._lock:
+                # 双重检查锁定
+                if not cls._instance:
+                    cls._instance = super().__new__(cls)
         return cls._instance

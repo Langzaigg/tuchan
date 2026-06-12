@@ -200,10 +200,10 @@ WEB_FETCH_MAX_CHARS: 6000
 ```yaml
 BOCHA_API_KEY: ''
 BOCHA_API_BASE: https://api.bochaai.com/v1/web-search
-BOCHA_SEARCH_COUNT: 5
+BOCHA_SEARCH_COUNT: 20
 ```
 
-如果 `BOCHA_API_KEY` 为空，工具会返回未配置提示。
+如果 `BOCHA_API_KEY` 为空，工具会返回未配置提示。单次搜索结果数强制为 10-20 条。
 
 ### bangumi_search
 

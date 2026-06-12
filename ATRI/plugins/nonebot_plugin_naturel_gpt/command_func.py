@@ -1,5 +1,8 @@
+import asyncio
 import difflib
-from typing import Optional, Dict
+import json
+import re
+from typing import Optional, Dict, Any
 
 from .chat import Chat
 from .chat_manager import ChatManager
@@ -8,6 +11,7 @@ from .logger import logger
 from .persistent_data_manager import PersistentDataManager
 from .llm_tool_plugins import enable_anima_tool, disable_anima_tool
 from .llm_tool_plugins import anima_generate
+from . import draw_db
 
 # 选项类型  bool只要有就是True，str则需要跟上参数值
 option_type = {
@@ -30,24 +34,38 @@ class CommandManager:
         #     'rg': {'arg_list': [], 'func': None},
         # }
 
-    def register(self, route, params:list=[]):
+    def register(self, route, params: Optional[list] = None):
         """注册指令修饰方法"""
         # print('register:', route, params)
         def wrapper(func):
-            self.command_router[route] = {'arg_list': params, 'func': func}
+            self.command_router[route] = {'arg_list': params or [], 'func': func}
             return func
         return wrapper
 
     def execute(self, chat:Chat, command:str, chat_presets_dict:dict, user_id:str='') -> Optional[dict]:
         """执行指令"""
+        # 特殊处理: rg draw-XXXXXX 查询绘图提示词
+        cmd_stripped = command.strip()
+        draw_id_match = re.match(r'^rg\s+draw-([A-Za-z0-9]{6})$', cmd_stripped)
+        if draw_id_match:
+            task_id = f"draw-{draw_id_match.group(1)}"
+            return self._query_draw_prompt(task_id)
+
         option_dict, param_dict, target_route = self.resolve_command(command)
         logger.info(f'执行命令: "{command}";  指令匹配路由: {target_route}')
         if target_route:
             try:
                 return self.command_router[target_route]['func'](option_dict, param_dict, chat, chat_presets_dict, user_id)
             except Exception as e:
-                return {'error': e}
+                return {'error': str(e)}
         return None
+
+    def _query_draw_prompt(self, task_id: str) -> dict:
+        """查询绘图提示词并返回 JSON"""
+        prompt_data = draw_db.get_prompt(task_id)
+        if prompt_data is None:
+            return {'msg': f"未找到任务编号 {task_id} 对应的绘图提示词", 'no_img': True}
+        return {'msg': json.dumps(prompt_data, ensure_ascii=False, indent=2), 'no_img': True}
 
     def submit_commands(self):
         """提交指令注册 *在所有指令注册完成后调用*"""
@@ -72,12 +90,15 @@ class CommandManager:
         for i in range(len(cmd_list)):
             if cmd_list[i].startswith('-'):
                 option = cmd_list[i][1:]
+                if option not in option_type:
+                    continue  # 跳过未定义的选项
                 cmd_list[i] = ''  # 去除已经解析的参数
                 if option_type[option] == bool:
                     option_dict[option] = True
                 elif option_type[option] == str:
-                    option_dict[option] = cmd_list[i + 1]
-                    cmd_list[i + 1] = ''  # 去除已经解析的参数
+                    if i + 1 < len(cmd_list):
+                        option_dict[option] = cmd_list[i + 1]
+                        cmd_list[i + 1] = ''  # 去除已经解析的参数
         cmd_list = [c.strip() for c in cmd_list if c.strip()]  # 去除已经解析的参数
 
         # 按照 一级命令/二级命令... 匹配命令路由 如果有多余的参数则以空格为间隔拼接后存放到最后一个参数中
@@ -144,6 +165,7 @@ def _render_preset_list(chat: Chat, chat_presets_dict: dict, admin: bool = False
             f"+ 重置会话: rg reset <-global?>\n"
             f"+ 清除记忆: rg mem clear <group|user|all>\n"
             f"+ 查询记忆: rg mem\n"
+            f"+ 设置昵称: rg nn <昵称>\n"
             f"+ 查询会话(超管): rg chats\n"
             f"* -global 参数表示全局设置，仅超管可用\n"
         )
@@ -168,26 +190,25 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
 def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     _refresh_dynamic_personas()
     target_preset_key = param_dict['preset_key']
+    
+    # 尝试从全局预设添加到会话预设
     if target_preset_key in config.PRESETS and target_preset_key not in chat_presets_dict:
         chat.add_preset_from_config(target_preset_key, config.PRESETS[target_preset_key])
         chat_presets_dict = chat.chat_data.preset_datas
+    
+    # 如果预设不存在，匹配最相似的预设
     if target_preset_key not in chat_presets_dict:
-        matched_preset_keys = difflib.get_close_matches(target_preset_key, _available_presets(chat_presets_dict).keys(), n=1, cutoff=0.3)
+        available_presets = _available_presets(chat_presets_dict)
+        matched_preset_keys = difflib.get_close_matches(target_preset_key, available_presets.keys(), n=1, cutoff=0.3)
         if not matched_preset_keys:
             return {'msg': "找不到匹配的人格预设"}
         target_preset_key = matched_preset_keys[0]
+        # 匹配到的预设可能在全局预设中但不在会话预设中
         if target_preset_key in config.PRESETS and target_preset_key not in chat_presets_dict:
             chat.add_preset_from_config(target_preset_key, config.PRESETS[target_preset_key])
             chat_presets_dict = chat.chat_data.preset_datas
         if target_preset_key not in chat_presets_dict:
             return {'msg': "找不到匹配的人格预设"}
-    if target_preset_key not in chat_presets_dict:  # 如果预设不存在，匹配最相似的预设
-        target_preset_key = difflib.get_close_matches(target_preset_key, chat_presets_dict.keys(), n=1, cutoff=0.3)
-        if len(target_preset_key) == 0:
-            return {'msg': "找不到匹配的人格预设! 是不是手滑了呢？(；′⌒`)"}
-        else:
-            target_preset_key = target_preset_key[0]
-            # return {'msg': f"预设不存在! 已为您匹配最相似的预设: {target_preset_key} v(￣▽￣)v"}
 
     if option_dict.get('global'):   # 全局应用
         success_cnt, fail_cnt = ChatManager.instance.change_presettings_for_all(preset_key=target_preset_key)
@@ -202,28 +223,6 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
     else:   # 当前会话应用
         chat.change_presettings(target_preset_key)
         return {'msg': f"应用预设: {target_preset_key} (￣▽￣)-ok!", 'is_progress': True}
-
-@cmd.register(route='rg/query', params=['preset_key'])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
-    _refresh_dynamic_personas()
-    target_preset_key = param_dict['preset_key']
-    if target_preset_key in config.PRESETS and target_preset_key not in chat_presets_dict:
-        return {'msg': f"预设: {target_preset_key} |\n  {config.PRESETS[target_preset_key].bot_self_introl}"}
-    if target_preset_key not in chat_presets_dict:
-        available_presets = _available_presets(chat_presets_dict)
-        matched_preset_keys = difflib.get_close_matches(target_preset_key, available_presets.keys(), n=1, cutoff=0.3)
-        if matched_preset_keys:
-            matched_key = matched_preset_keys[0]
-            return {'msg': f"预设: {matched_key} |\n  {available_presets[matched_key].bot_self_introl}"}
-    if target_preset_key not in chat_presets_dict:
-        # 如果预设不存在，进行逐一进行字符匹配，选择最相似的预设
-        target_preset_key = difflib.get_close_matches(target_preset_key, chat_presets_dict.keys(), n=1, cutoff=0.3)
-        if len(target_preset_key) == 0:
-            return {'msg': "找不到匹配的人格预设! 是不是手滑了呢？(；′⌒`)"}
-        else:
-            target_preset_key = target_preset_key[0]
-            # return {'msg': f"预设不存在! 已为您匹配最相似的预设: {target_preset_key} v(￣▽￣)v"}
-    return {'msg': f"预设: {target_preset_key} |\n  {chat_presets_dict[target_preset_key].bot_self_introl}"}
 
 @cmd.register(route='rg/new', params=['preset_key', 'preset_intro'])
 def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
@@ -528,8 +527,8 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
 @cmd.register(route='rg/chats')
 def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     chat_info:str = ''
-    for chat in ChatManager.instance.get_all_chats():
-        chat_info += f"+ {chat.generate_description(not option_dict.get('show'))}"
+    for c in ChatManager.instance.get_all_chats():
+        chat_info += f"+ {c.generate_description(not option_dict.get('show'))}"
     return {'msg': f"当前已加载的会话:\n{chat_info}"}
 
 @cmd.register(route='rg/reload_config')
@@ -540,14 +539,20 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
 
 @cmd.register(route='rg/draw', params=['mode'])
 def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
-    mode = param_dict.get('mode', '').strip().lower()
+    mode = param_dict.get('mode', '').strip()
     valid_modes = ('force', 'on', 'auto', 'off')
 
     # 无参数：显示当前模式
     if not mode:
         current = anima_generate.get_chat_mode(chat.chat_key)
-        return {'msg': f"当前画图模式: {current}\n用法: rg draw <force|on|auto|off>\n  force: 常驻工具+拦截虚假回复\n  on:    常驻工具\n  auto:  仅画图关键词时注入工具（默认）\n  off:   关闭"}
+        return {'msg': f"当前画图模式: {current}\n用法:\n  rg draw <force|on|auto|off>  切换画图模式\n  rg draw <json字符串>  根据 JSON 创建绘图任务\n  rg draw-XXXXXX  查询绘图提示词"}
 
+    # 检查是否是 JSON 字符串（以 { 开头）
+    if mode.startswith('{'):
+        return _create_draw_task_from_json(mode, chat)
+
+    # 模式切换
+    mode = mode.lower()
     if mode not in valid_modes:
         return {'msg': f"无效模式: {mode}\n用法: rg draw <force|on|auto|off>"}
 
@@ -587,6 +592,104 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
     mode_desc = {'force': '常驻+拦截', 'on': '常驻', 'auto': '按需注入'}
     return {'msg': f"Anima 画图已设为 {mode} 模式（{mode_desc[mode]}）(￣▽￣)-ok!"}
 
+
+def _create_draw_task_from_json(json_str: str, chat: Chat) -> dict:
+    """从 JSON 字符串创建绘图任务"""
+    # 解析 JSON
+    try:
+        args = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        return {'msg': f"JSON 解析失败: {e}\n请检查 JSON 格式是否正确"}
+
+    if not isinstance(args, dict):
+        return {'msg': "JSON 必须是一个对象（字典格式）"}
+
+    # 提示词模板字段（允许空值）
+    prompt_fields = [
+        'quality_meta_year_safe', 'aspect_ratio', 'count', 'character', 'series',
+        'artist', 'style', 'appearance', 'tags', 'environment', 'nltags', 'neg',
+        'steps', 'cfg'
+    ]
+
+    # 构建标准化的提示词数据（保留所有字段，包括空值）
+    prompt_data = {}
+    for field in prompt_fields:
+        prompt_data[field] = str(args.get(field, '') or '')
+
+    # 生成任务编号
+    task_id = anima_generate._generate_task_id()
+
+    # 保存到数据库
+    draw_db.save_prompt(task_id, prompt_data)
+
+    # 构建绘图参数（填充默认值）
+    draw_args = dict(prompt_data)
+    if not draw_args.get('steps'):
+        draw_args['steps'] = '35'
+    if not draw_args.get('cfg'):
+        draw_args['cfg'] = '5'
+
+    # 检查画图服务是否可用
+    ok, err = anima_generate.health_check_sync()
+    if not ok:
+        return {'msg': f"Anima 画图服务离线，无法创建任务: {err}"}
+
+    # 检查队列状态
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, anima_generate._check_queue(int(draw_args.get('steps', 35))))
+                queue_info = future.result(timeout=15)
+        else:
+            queue_info = loop.run_until_complete(anima_generate._check_queue(int(draw_args.get('steps', 35))))
+    except Exception as e:
+        logger.warning(f"队列检查失败: {e}")
+        queue_info = None
+
+    if queue_info is not None:
+        if queue_info.get("queue_too_long"):
+            mins = queue_info.get("estimated_remaining_minutes", "?")
+            qlen = queue_info.get("queue_length", 0)
+            return {'msg': f"当前画图队列繁忙（{qlen} 个任务，预计等待 {mins} 分钟），请稍后再试。"}
+        est_seconds = queue_info.get("estimated_remaining_seconds", 60)
+        queue_length = queue_info.get("queue_length", 0)
+        est_seconds = est_seconds + queue_length * 90 - 30
+        est_minutes = max(1, round(est_seconds / 60))
+    else:
+        est_seconds = int(60 + (int(draw_args.get('steps', 35)) - 35) * 1.5)
+        est_minutes = max(1, round(est_seconds / 60))
+
+    # 提交后台生成任务
+    positive_desc = anima_generate._build_positive(draw_args)
+    try:
+        from nonebot import get_bot
+        loop = asyncio.get_event_loop()
+        # 构建 send_ctx 以便图片能发送到正确的会话
+        try:
+            bot = get_bot()
+            bot_id = bot.self_id
+        except Exception:
+            bot_id = None
+        chat_type = "group" if chat.chat_key.startswith("group_") else "private"
+        group_id = chat.chat_key.split("_")[1] if chat_type == "group" else None
+        user_id_val = chat.chat_key.split("_")[1] if chat_type == "private" else None
+        send_ctx = {
+            "chat_key": chat.chat_key,
+            "bot_id": bot_id,
+            "group_id": group_id,
+            "user_id": user_id_val,
+        }
+        loop.create_task(anima_generate._do_generate(draw_args, config, send_ctx=send_ctx, task_id=task_id))
+    except Exception as e:
+        logger.error(f"提交绘图任务失败: {e}")
+        return {'msg': f"提交绘图任务失败: {e}"}
+
+    return {
+        'msg': f"绘图任务已创建！\n任务编号：{task_id}\n预计生成时间：{est_seconds}秒（约{est_minutes}分钟）\n提示词：{positive_desc[:200]}{'...' if len(positive_desc) > 200 else ''}"
+    }
+
 @cmd.register(route='rg/model', params=['profile_name'])
 def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     from .openai_func import TextGenerator
@@ -618,6 +721,77 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
     config.OPENAI_ACTIVE_PROFILE = profile_name
     PersistentDataManager.instance.save_to_file()
     return {'msg': f"已切换到 {profile_name}: {profile.get('model', '?')}"}
+
+@cmd.register(route='rg/nn', params=['nickname'])
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
+    if not user_id:
+        return {'msg': "无法获取当前用户信息 (；′⌒`)"}
+    pdm = PersistentDataManager.instance
+    nickname = param_dict.get('nickname', '').strip()
+
+    if not nickname:
+        # 无参数：显示当前昵称或清除
+        current = pdm.get_custom_nickname(user_id)
+        if current:
+            return {'msg': f"你当前的自定义昵称: {current}\n发送 `rg nn 清除` 可以删除自定义昵称。"}
+        else:
+            return {'msg': "你还没有设置自定义昵称。\n用法: rg nn <昵称> 设置在 bot 中的固定昵称。"}
+
+    if nickname in ('清除', 'clear', 'reset', '删除', 'del'):
+        pdm.set_custom_nickname(user_id, "")
+        PersistentDataManager.instance.save_to_file(must_save=True)
+        return {'msg': "已清除自定义昵称，将使用群名片。", 'is_progress': True}
+
+    if len(nickname) > 30:
+        return {'msg': "昵称最长 30 个字符 (；′⌒`)"}
+
+    pdm.set_custom_nickname(user_id, nickname)
+    PersistentDataManager.instance.save_to_file(must_save=True)
+    return {'msg': f"已将你的昵称设为: {nickname}", 'is_progress': True}
+
+@cmd.register(route='rg/help')
+def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
+    from .llm_tool_plugins import TOOL_REGISTRY
+    from .llm_tool_plugins.anima_generate import is_chat_enabled as is_anima_chat_enabled
+
+    # 构建工具列表
+    tools = list(TOOL_REGISTRY.keys())
+    # 检查 Anima 画图状态
+    anima_status = "已启用" if is_anima_chat_enabled(chat.chat_key) else "未启用"
+    # 构建工具显示文本（一段式）
+    tools_text = "、".join(tools) if tools else "无"
+
+    help_text = f"""兔酱人格指令帮助
+
+【基础指令】
+  rg / rg list        显示人格列表
+  rg set <预设名>      切换人格
+  rg on / rg off       启用/禁用当前会话
+  rg reset             重置会话上下文
+  rg help              显示本帮助
+
+【记忆管理】
+  rg mem               查看当前记忆
+  rg mem clear <scope> 清除记忆 (group/user/all)
+  rg mem global [on|off] 开关全局记忆
+
+【画图相关】
+  rg draw              查看画图模式
+  rg draw <mode>       切换画图模式 (force/on/auto/off)
+  rg draw <json>       根据JSON创建绘图任务
+  rg draw-XXXXXX       查询绘图提示词
+
+【其他】
+  rg model [配置名]    查看/切换LLM配置
+  rg nn <昵称>         设置自定义昵称
+  rg nn 清除           清除自定义昵称
+
+【选项】
+  -global              全局设置 (仅超管)
+  -target <会话>       指定会话操作
+
+【当前会话工具】Anima画图: {anima_status} | 已注册: {tools_text}"""
+    return {'msg': help_text}
 
 # 提交指令注册
 cmd.submit_commands()

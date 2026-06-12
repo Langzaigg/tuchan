@@ -18,6 +18,7 @@ from .chat_manager import ChatManager
 from . import matcher
 from . import matcher_MCRcon # noqa: F401
 from .llm_tool_plugins import init_tools
+from . import draw_db
 
 
 async def _check_proxy_connectivity(proxy_url: str) -> bool:
@@ -60,6 +61,9 @@ set_permission_check_func(utils.default_permission_check_func)
 PersistentDataManager.instance.load_from_file()
 ChatManager.instance.create_all_chat_object() # 启动时创建所有的已有Chat对象，以便被 -all 相关指令控制
 
+# 初始化绘图提示词数据库
+draw_db.init_db()
+
 # 检查代理连通性
 _proxy = getattr(config, "TOOL_PROXY", "")
 if _proxy:
@@ -85,8 +89,19 @@ if _proxy:
 else:
     logger.info("[代理检查] 未配置代理，跳过检查")
 
-# 条件加载工具（如博查搜索需配置 key 才注册）
+# 条件加载工具（搜索工具需配置 key 才注册）
+from .llm_tool_plugins import tavily_search
+tavily_search.init(config)
 init_tools(config)
+
+# 记录当前激活的搜索工具
+from .llm_tool_plugins import TOOL_REGISTRY
+if "tavily_search" in TOOL_REGISTRY:
+    logger.info("[搜索工具] Tavily Search 已激活（Bocha 作为 fallback）")
+elif "bocha_search" in TOOL_REGISTRY:
+    logger.info("[搜索工具] Bocha Search 已激活")
+else:
+    logger.info("[搜索工具] 未配置任何搜索工具（TAVILY_API_KEY / BOCHA_API_KEY 均为空）")
 
 # Anima 画图：启动时自动 health check，成功则默认开启
 from .llm_tool_plugins import anima_generate, enable_anima_tool

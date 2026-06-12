@@ -1,8 +1,9 @@
-﻿from typing import Dict, Optional, Tuple
+﻿from typing import Dict, List, Optional, Tuple
 from .singleton import Singleton
 from .chat import Chat
 from .persistent_data_manager import PersistentDataManager
-from .config import *
+from .config import config
+from .logger import logger
 
 class ChatManager(Singleton["ChatManager"]):
     """全局会话管理器"""
@@ -10,8 +11,9 @@ class ChatManager(Singleton["ChatManager"]):
     # 对Chat的查找和批量操作必须通过调用此类函数实现，不允许直接读写 PersistentDataManager
     # 对单个Chat的操作相关函数定义在Chat类定义内
 
-    _chat_dict:Dict[str, Chat] = {}
-    """进程中存在的所有聊天Session"""
+    def __init__(self):
+        self._chat_dict: Dict[str, Chat] = {}
+        """进程中存在的所有聊天Session"""
 
     def create_all_chat_object(self) -> None:
         """创建所有的已有Chat对象"""
@@ -25,8 +27,8 @@ class ChatManager(Singleton["ChatManager"]):
         """是否存在指定chat_key"""
         return chat_key in self._chat_dict
     
-        """通过chat_key获取一个Chat对象"""
     def get_chat(self, chat_key: str) -> Optional[Chat]:
+        """通过chat_key获取一个Chat对象"""
         return self._chat_dict.get(chat_key, None)
     
     def get_all_chats(self) -> List[Chat]:
