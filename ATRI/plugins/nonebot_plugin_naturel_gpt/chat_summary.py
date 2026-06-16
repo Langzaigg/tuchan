@@ -15,6 +15,43 @@ from .persistent_data_manager import ChatMessageData, PersistentDataManager, Pre
 _COMPRESS_COOLDOWN_SECONDS = 120
 
 
+def _extract_tavily_ai_answer(content: str) -> str:
+    """从 tavily_search 返回的格式化结果中提取 [AI 摘要] 内容"""
+    marker = "[AI 摘要]"
+    idx = content.find(marker)
+    if idx < 0:
+        return ""
+    answer = content[idx + len(marker):].strip()
+    # 截断到第一个换行或结果列表开头（如 "\n1."），避免混入搜索结果
+    for stop in ["\n1.", "\n2.", "\n3."]:
+        stop_idx = answer.find(stop)
+        if stop_idx > 0:
+            answer = answer[:stop_idx].strip()
+            break
+    return answer
+
+
+def _save_error_log(chat_key: str, prompt: str, response: str, cost_tokens: int) -> None:
+    """保存摘要/印象任务的失败请求到 error log，便于排查 API 兼容性问题"""
+    log_dir = Path(config.NG_LOG_PATH)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    safe_key = chat_key.replace("/", "_").replace("\\", "_")
+    log_file = log_dir / f"{safe_key}.error.json"
+    data = {
+        "chat_key": chat_key,
+        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
+        "cost_tokens": cost_tokens,
+        "prompt": prompt,
+        "response": response,
+        "source": "summary_task",
+    }
+    try:
+        with open(log_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"保存摘要 error 日志失败: {e!r}")
+
+
 def _save_summary_log(chat_key: str, summary_type: str,
                       summary_prompt: str, summary_response: str,
                       context_summary: str, tool_call_summary: str,
@@ -98,6 +135,7 @@ class ChatSummaryMixin:
 
         search_entries: List[Dict[str, Any]] = []
         other_entries: List[Dict[str, Any]] = []
+        tavily_ai_answers: List[str] = []  # 收集 tavily_search 返回的 AI 摘要
         for msg in tool_messages:
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
@@ -118,11 +156,16 @@ class ChatSummaryMixin:
                 name = msg.get("name", "")
                 if name in IGNORED_TOOLS:
                     continue
-                entry = {"name": name, "result": msg.get("content", "")[:300]}
+                content = msg.get("content", "")
+                entry = {"name": name, "result": content[:300]}
                 if name in SEARCH_TOOLS:
                     search_entries.append(entry)
                 else:
                     other_entries.append(entry)
+                if name == "tavily_search":
+                    ai_answer = _extract_tavily_ai_answer(content)
+                    if ai_answer:
+                        tavily_ai_answers.append(ai_answer)
 
         if not search_entries and not other_entries:
             return
@@ -160,6 +203,29 @@ class ChatSummaryMixin:
         if not search_entries:
             return
 
+        # tavily_search 已返回 AI 摘要时，直接使用，跳过 LLM 调用
+        # 仅当所有搜索工具都是 tavily_search 时才跳过，混合其他搜索工具时仍走 LLM
+        non_tavily_search = [e for e in search_entries if e.get("name") != "tavily_search"]
+        if tavily_ai_answers and not non_tavily_search:
+            tavily_summary = "；".join(tavily_ai_answers)[:max_chars]
+            tavily_part = f"[搜索工具摘要] {tavily_summary}"
+            if other_entries:
+                other_raw = []
+                for entry in other_entries:
+                    if "result" in entry:
+                        other_raw.append(f"{entry['name']}: {entry['result'][:80]}")
+                    else:
+                        other_raw.append(f"{entry['name']}({json.dumps(entry.get('args', {}), ensure_ascii=False)[:60]})")
+                other_part_str = f"[调用结果] {'; '.join(other_raw)[:max_chars]}"
+                target_msg.tool_call_summary = other_part_str + "\n" + tavily_part
+            else:
+                target_msg.tool_call_summary = tavily_part
+            if config.DEBUG_LEVEL > 0:
+                logger.info(f"[会话: {self.chat_key}] 工具调用摘要(Tavily AI): {target_msg.tool_call_summary}")
+            _save_summary_log(self.chat_key, "tool", "", tavily_summary,
+                              self.chat_preset.context_summary, target_msg.tool_call_summary)
+            return
+
         # 如果已有任务在运行，跳过 LLM 调用（fallback 已就位）
         if self._tool_summary_task and not self._tool_summary_task.done():
             if config.DEBUG_LEVEL > 0:
@@ -167,9 +233,12 @@ class ChatSummaryMixin:
             return
 
         # 启动后台 LLM 摘要任务（仅针对搜索工具）
-        summary_input = json.dumps(search_entries, ensure_ascii=False)
+        # 混合场景：tavily AI 摘要单独拼接，LLM 只总结其他搜索工具
+        llm_search_entries = non_tavily_search if tavily_ai_answers else search_entries
+        summary_input = json.dumps(llm_search_entries, ensure_ascii=False)
         other_part = f"[调用结果] {json.dumps(other_entries, ensure_ascii=False)}" if other_entries else ""
         trigger_part = f"\n触发问题: {trigger_text}" if trigger_text else ""
+        tavily_part = f"[搜索工具摘要] {'；'.join(tavily_ai_answers)[:max_chars]}" if tavily_ai_answers else ""
         chat_key = self.chat_key
         request_profile = self._snapshot_request_profile()
 
@@ -188,11 +257,14 @@ class ChatSummaryMixin:
                     new_summary = res.strip()[:max_chars]
                     if not new_summary.startswith("[搜索工具摘要]"):
                         new_summary = f"[搜索工具摘要] {new_summary}"
-                    # 合并 other 部分和新搜索摘要
-                    final = new_summary
+                    # 拼接：other 结果 + tavily AI 摘要 + LLM 搜索摘要
+                    parts = []
                     if other_part:
-                        final = other_part + "\n" + new_summary
-                    target_msg.tool_call_summary = final
+                        parts.append(other_part)
+                    if tavily_part:
+                        parts.append(tavily_part)
+                    parts.append(new_summary)
+                    target_msg.tool_call_summary = "\n".join(parts)
                     if config.DEBUG_LEVEL > 0:
                         logger.info(f"[会话: {chat_key}] 工具调用摘要(LLM): {target_msg.tool_call_summary}")
                     _save_summary_log(chat_key, "tool", prompt, summary_response,
@@ -422,6 +494,7 @@ class ChatSummaryMixin:
                 self._compressing_overflow_item_ids = set()
                 self._compress_failure_time = time.time()
                 logger.warning(f"[会话: {chat_key}] 摘要生成失败，保留旧摘要和溢出消息（{_COMPRESS_COOLDOWN_SECONDS}秒冷却）")
+                _save_error_log(chat_key, summary_prompt, summary_response, tg.cal_token_count(summary_prompt + summary_response))
 
             _save_summary_log(chat_key, "context", summary_prompt, summary_response,
                               preset.context_summary, preset.tool_call_summary)
@@ -452,6 +525,7 @@ class ChatSummaryMixin:
                         impression_results[uid] = imp.chat_impression
                 except Exception as e:
                     imp_response = f"[异常] {e!r}"
+                    _save_error_log(chat_key, imp_prompt, imp_response, tg.cal_token_count(imp_prompt + str(e)))
                     pass  # 印象生成失败不影响主流程
 
             # 保存印象日志

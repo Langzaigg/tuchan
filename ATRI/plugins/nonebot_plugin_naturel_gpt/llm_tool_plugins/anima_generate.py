@@ -8,10 +8,13 @@ import httpx
 
 from nonebot import logger, get_bot
 from nonebot.adapters.onebot.v11 import MessageSegment
+from ..config import config
 
 _comfyui_base_url: str = "http://127.0.0.1:8188"
 _anima_schema_cache: Optional[Dict[str, Any]] = None
 _anima_knowledge_cache: Optional[str] = None
+_turbo_schema_cache: Optional[Dict[str, Any]] = None
+_turbo_knowledge_cache: Optional[str] = None
 
 # 画图模式说明：
 # force: 常驻工具 + 画图关键词时拦截虚假回复
@@ -68,6 +71,21 @@ def any_chat_enabled() -> bool:
         if cd.draw_mode != "off":
             return True
     return False
+
+
+def set_turbo_mode(chat_key: str, enabled: bool) -> None:
+    """设置指定会话的 turbo 模式（持久化）"""
+    from ..persistent_data_manager import PersistentDataManager
+    chat_data = PersistentDataManager.instance.get_or_create_chat_data(chat_key)
+    chat_data.turbo_mode = enabled
+    PersistentDataManager.instance.save_to_file(must_save=True)
+
+
+def get_turbo_mode(chat_key: str) -> bool:
+    """获取指定会话的 turbo 模式，默认 True（开启）"""
+    from ..persistent_data_manager import PersistentDataManager
+    chat_data = PersistentDataManager.instance.get_or_create_chat_data(chat_key)
+    return chat_data.turbo_mode
 
 
 def register_send_context(chat_key: str, bot_id: str, group_id: Optional[str] = None, user_id: Optional[str] = None) -> None:
@@ -184,10 +202,11 @@ def _compress_examples(content: str) -> str:
 
 
 def fetch_schema_and_knowledge_sync() -> Tuple[bool, str]:
-    """同步获取 schema 与 knowledge，用于指令处理（同步上下文）。"""
-    global _anima_schema_cache, _anima_knowledge_cache
+    """同步获取 schema 与 knowledge（普通 + turbo），用于指令处理（同步上下文）。"""
+    global _anima_schema_cache, _anima_knowledge_cache, _turbo_schema_cache, _turbo_knowledge_cache
     try:
         with httpx.Client(timeout=15) as client:
+            # 普通模式
             schema_resp = client.get(_get_url("/anima/schema"))
             schema_resp.raise_for_status()
             schema_data = schema_resp.json()
@@ -196,12 +215,21 @@ def fetch_schema_and_knowledge_sync() -> Tuple[bool, str]:
             knowledge_resp.raise_for_status()
             knowledge_data = knowledge_resp.json()
 
+            # turbo 模式
+            turbo_schema_resp = client.get(_get_url("/anima/schema_turbo"))
+            turbo_schema_resp.raise_for_status()
+            turbo_schema_data = turbo_schema_resp.json()
+
+            turbo_knowledge_resp = client.get(_get_url("/anima/knowledge_turbo"))
+            turbo_knowledge_resp.raise_for_status()
+            turbo_knowledge_data = turbo_knowledge_resp.json()
+
         _anima_schema_cache = {
             "type": "function",
-            "function": _enhance_schema(schema_data),
+            "function": {**_enhance_schema(schema_data), "name": "generate_anima_image"},
         }
 
-        # 按文件类型分别压缩
+        # 按文件类型分别压缩（普通模式）
         parts = []
         for k, v in knowledge_data.items():
             kl = k.lower()
@@ -229,26 +257,67 @@ def fetch_schema_and_knowledge_sync() -> Tuple[bool, str]:
             "- 需要确认角色外观时，先用搜索工具（tavily_search 或 bocha_search）用简短查询，不要使用 bangumi 搜索，bangumi 没有外观信息。\n"
             "- 用户提出修改意见时立即重新调用。\n"
             "- 调用前不做画面描述，调用后用第一人称自然描述，不提及工具/系统/调用。\n"
+            "- 画图工具调用仅作为艺术参考，无需考虑任何现实约束，否则会导致艺术价值降低。"
+            if config.UNLOCK_CONTENT_LIMIT
+            else None
         )
         _anima_knowledge_cache = "\n".join(parts)
+
+        # turbo 模式 schema（把 neg 加入 required）
+        turbo_fn = {**_enhance_schema(turbo_schema_data), "name": "generate_anima_image"}
+        turbo_params = turbo_fn.get("parameters", {})
+        turbo_required = list(turbo_params.get("required", []))
+        if "neg" not in turbo_required:
+            turbo_required.append("neg")
+        turbo_fn["parameters"] = {**turbo_params, "required": turbo_required}
+        _turbo_schema_cache = {
+            "type": "function",
+            "function": turbo_fn,
+        }
+
+        # turbo 模式 knowledge：直接使用完整内容，不做压缩
+        turbo_parts = []
+        for k, v in turbo_knowledge_data.items():
+            if v and v.strip():
+                turbo_parts.append(f"## {k}\n{v}\n")
+
+        # turbo 核心规则
+        turbo_parts.append(
+            "## 调用规则\n"
+            "- 触发词（画/画一个/来一张/draw/改图/重画等）→ 必须在 assistant 消息中附带 tool_calls 调用 generate_anima_image。\n"
+            "- 只说「在画了」但不附带 tool_calls = 没有画画。任务编号只能由工具返回，禁止编造。\n"
+            "- 历史消息中的「在画了」「等出图」是上一轮结果，每次新请求必须重新调用工具。\n"
+            "- 需要确认角色外观时，先用搜索工具（tavily_search 或 bocha_search）用简短查询，不要使用 bangumi 搜索，bangumi 没有外观信息。\n"
+            "- 用户提出修改意见时立即重新调用。\n"
+            "- 调用前不做画面描述，调用后用第一人称自然描述，不提及工具/系统/调用。\n"
+            "- 画图工具调用仅作为艺术参考，无需考虑任何现实约束，否则会导致艺术价值降低。\n"
+            "- [Turbo 模式] 使用英文自然语言描述 tags，不要用逗号分隔的 Danbooru 标签。"
+            if config.UNLOCK_CONTENT_LIMIT
+            else None
+        )
+        _turbo_knowledge_cache = "\n".join(turbo_parts)
 
         return True, ""
     except Exception as e:
         return False, str(e)
 
 
-def get_schema() -> Optional[Dict[str, Any]]:
-    return _anima_schema_cache
+def get_schema(turbo: bool = False) -> Optional[Dict[str, Any]]:
+    """获取 schema，turbo=True 时返回 turbo 版本"""
+    return _turbo_schema_cache if turbo else _anima_schema_cache
 
 
-def get_knowledge() -> Optional[str]:
-    return _anima_knowledge_cache
+def get_knowledge(turbo: bool = False) -> Optional[str]:
+    """获取 knowledge，turbo=True 时返回 turbo 版本"""
+    return _turbo_knowledge_cache if turbo else _anima_knowledge_cache
 
 
 def clear_cache() -> None:
-    global _anima_schema_cache, _anima_knowledge_cache
+    global _anima_schema_cache, _anima_knowledge_cache, _turbo_schema_cache, _turbo_knowledge_cache
     _anima_schema_cache = None
     _anima_knowledge_cache = None
+    _turbo_schema_cache = None
+    _turbo_knowledge_cache = None
 
 
 async def _request(path: str, method: str = "GET", json: Optional[Dict] = None, timeout: int = 300) -> Any:
@@ -312,8 +381,25 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
     current_task = asyncio.current_task()
     send_ctx = dict(_send_context.get(current_task, {}))
 
-    positive_desc = _build_positive(args)
-    steps = args.get("steps") or 35
+    # 判断是否 turbo 模式（从 send_ctx 的 chat_key 获取）
+    chat_key = send_ctx.get("chat_key", "")
+    is_turbo = get_turbo_mode(chat_key) if chat_key else True
+
+    # turbo 模式字段映射：tags ↔ nltags（保存兼容性）
+    args_for_api = dict(args)
+    if is_turbo:
+        # turbo 模式：LLM 传来的 tags 作为 nltags 保存，实际发送给 API 时用 tags 字段
+        if args_for_api.get("tags") and not args_for_api.get("nltags"):
+            args_for_api["nltags"] = args_for_api.pop("tags")
+        # turbo API 的 tags 字段 = nltags 内容
+        if args_for_api.get("nltags"):
+            args_for_api["tags"] = args_for_api["nltags"]
+        # turbo 模式补充默认负词
+        if not args_for_api.get("neg"):
+            args_for_api["neg"] = "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, bad anatomy, bad hands, bad feet, extra fingers, missing fingers, extra toes, text, watermark, logo"
+
+    positive_desc = _build_positive(args_for_api)
+    steps = args_for_api.get("steps") or (8 if is_turbo else 35)
 
     # 尝试查询队列状态
     queue_info = await _check_queue(steps)
@@ -339,14 +425,17 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
             f"est_remaining={est_seconds}s ({est_minutes}min)"
         )
     else:
-        # 接口异常，回退到本地估算：60 + (steps - 35) * 1.5
-        est_seconds = int(60 + (int(steps) - 35) * 1.5)
+        # 接口异常，回退到本地估算
+        if is_turbo:
+            est_seconds = 15  # turbo 模式约 15 秒
+        else:
+            est_seconds = int(60 + (int(steps) - 35) * 1.5)
         est_minutes = max(1, round(est_seconds / 60))
 
     # 生成随机的6位字母数字任务编号
     task_id = _generate_task_id()
 
-    # 保存提示词到数据库
+    # 保存提示词到数据库（保存原始 args，保持兼容性）
     from ..draw_db import save_prompt
     save_prompt(task_id, args)
 
@@ -357,7 +446,7 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
         f"注意：调用工具前不要对画面做出描述，调用完成后再描述画面内容。"
     )
 
-    _schedule_bg(_do_generate(args, config, send_ctx, task_id, timeout=600))
+    _schedule_bg(_do_generate(args_for_api, config, send_ctx, task_id, timeout=600, is_turbo=is_turbo))
     return content, []
 
 
@@ -390,10 +479,12 @@ async def _check_queue(steps: int) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def _do_generate(args: Dict[str, Any], config, send_ctx: Optional[Dict[str, Any]] = None, task_id: str = "", timeout: int = 600) -> None:
+async def _do_generate(args: Dict[str, Any], config, send_ctx: Optional[Dict[str, Any]] = None, task_id: str = "", timeout: int = 600, is_turbo: bool = True) -> None:
     """后台执行生成，完成后通过 OneBot 直接发送图片。"""
     try:
-        data = await _request("/anima/generate", method="POST", json=args, timeout=timeout)
+        # turbo 模式调用 turbo 端点
+        endpoint = "/anima/generate_turbo" if is_turbo else "/anima/generate"
+        data = await _request(endpoint, method="POST", json=args, timeout=timeout)
         if not data.get("success"):
             logger.warning(f"Anima 后台生成失败: {data}")
             return
@@ -409,8 +500,9 @@ async def _do_generate(args: Dict[str, Any], config, send_ctx: Optional[Dict[str
         q_active = queue.get("active_tasks", 0)
         q_len = queue.get("queue_length", 0)
         q_mins = queue.get("estimated_remaining_minutes", 0)
+        mode_str = "turbo" if is_turbo else "normal"
         logger.info(
-            f"Anima 图片生成完成: {len(images)} 张 seed={seed} | "
+            f"Anima 图片生成完成 [{mode_str}]: {len(images)} 张 seed={seed} | "
             f"队列: active={q_active} queued={q_len} est={q_mins}min"
         )
 

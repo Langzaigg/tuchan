@@ -1,4 +1,4 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from nonebot.config import Config as NBConfig
 from pydantic import BaseModel, Extra
 from nonebot import get_driver
@@ -47,13 +47,13 @@ class Config(BaseModel, extra=Extra.ignore):
     """OpenAI 模型（旧格式兼容，有 OPENAI_PROFILES 时可省略）"""
     CHAT_MODEL_MINI: str = ''
     """OpenAI MINI模型（旧格式兼容，有 OPENAI_PROFILES 时可省略）"""
-    CHAT_TOP_P: float = 0.95
-    CHAT_TEMPERATURE: float = 0.6
-    """温度越高越随机"""
-    CHAT_PRESENCE_PENALTY: float = 0.0
-    """主题重复惩罚"""
-    CHAT_FREQUENCY_PENALTY: float = 0.0
-    """复读惩罚"""
+    CHAT_TOP_P: Optional[float] = None
+    CHAT_TEMPERATURE: Optional[float] = None
+    """温度越高越随机，不定义则不传入API"""
+    CHAT_PRESENCE_PENALTY: Optional[float] = None
+    """主题重复惩罚，不定义则不传入API"""
+    CHAT_FREQUENCY_PENALTY: Optional[float] = None
+    """复读惩罚，不定义则不传入API"""
 
     CHAT_MAX_SUMMARY_TOKENS: int = 800
     """单次总结最大token数（旧格式兼容，有 OPENAI_PROFILES 时可省略）"""
@@ -215,10 +215,10 @@ CONFIG_TEMPLATE = {
     'IGNORE_PREFIX': '#',   # 忽略前缀 以该前缀开头的消息将不会被处理
     'CHAT_MODEL': "gpt-4o",  # 旧格式兼容，有 OPENAI_PROFILES 时可省略
     'CHAT_MODEL_MINI': "gpt-4o-mini",  # 旧格式兼容
-    'CHAT_TOP_P': 1,  # 旧格式兼容
-    'CHAT_TEMPERATURE': 0.4,  # 旧格式兼容
-    'CHAT_PRESENCE_PENALTY': 0.4,  # 旧格式兼容
-    'CHAT_FREQUENCY_PENALTY': 0.4,  # 旧格式兼容
+    'CHAT_TOP_P': None,  # 旧格式兼容，不定义则不传入API
+    'CHAT_TEMPERATURE': None,  # 旧格式兼容，不定义则不传入API
+    'CHAT_PRESENCE_PENALTY': None,  # 旧格式兼容，不定义则不传入API
+    'CHAT_FREQUENCY_PENALTY': None,  # 旧格式兼容，不定义则不传入API
     'CHAT_MAX_SUMMARY_TOKENS': 512,  # 旧格式兼容
     'REPLY_MAX_TOKENS': 1024,  # 旧格式兼容
     'CONTEXT_TOKEN_BUDGET': 4096,  # 上下文窗口token预算
@@ -411,12 +411,12 @@ def _load_config_obj_from_file()->Config:
                         "timeout": config_obj_from_file.get("OPENAI_TIMEOUT", 60),
                         "model": config_obj_from_file.get("CHAT_MODEL", ""),
                         "model_mini": config_obj_from_file.get("CHAT_MODEL_MINI", ""),
-                        "temperature": config_obj_from_file.get("CHAT_TEMPERATURE", 0.6),
-                        "top_p": config_obj_from_file.get("CHAT_TOP_P", 0.95),
+                        "temperature": config_obj_from_file.get("CHAT_TEMPERATURE"),
+                        "top_p": config_obj_from_file.get("CHAT_TOP_P"),
                         "max_tokens": config_obj_from_file.get("REPLY_MAX_TOKENS", 4096),
                         "max_summary_tokens": config_obj_from_file.get("CHAT_MAX_SUMMARY_TOKENS", 800),
-                        "frequency_penalty": config_obj_from_file.get("CHAT_FREQUENCY_PENALTY", 0.0),
-                        "presence_penalty": config_obj_from_file.get("CHAT_PRESENCE_PENALTY", 0.0),
+                        "frequency_penalty": config_obj_from_file.get("CHAT_FREQUENCY_PENALTY"),
+                        "presence_penalty": config_obj_from_file.get("CHAT_PRESENCE_PENALTY"),
                         "extra_prompt": "",
                     },
                     "kimi": {

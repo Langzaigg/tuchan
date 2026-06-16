@@ -248,7 +248,7 @@ class TextGenerator(Singleton["TextGenerator"]):
             "model": profile.get("model", ""),
             "model_mini": profile.get("model_mini", ""),
             "max_tokens": profile.get("max_tokens", 4096),
-            "temperature": profile.get("temperature", 0.6),
+            "temperature": profile.get("temperature"),
             "top_p": profile.get("top_p"),
             "frequency_penalty": profile.get("frequency_penalty"),
             "presence_penalty": profile.get("presence_penalty"),
@@ -272,7 +272,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                 "model": profile.get("model", ""),
                 "model_mini": profile.get("model_mini", ""),
                 "max_tokens": profile.get("max_tokens", 4096),
-                "temperature": profile.get("temperature", 0.6),
+                "temperature": profile.get("temperature"),
                 "top_p": profile.get("top_p"),
                 "frequency_penalty": profile.get("frequency_penalty"),
                 "presence_penalty": profile.get("presence_penalty"),
@@ -328,13 +328,12 @@ class TextGenerator(Singleton["TextGenerator"]):
         kwargs: Dict[str, Any] = {
             "model": model_name,
             "messages": messages,
-            "temperature": request_config.get("temperature", 0.6),
             "max_tokens": request_config.get("max_summary_tokens" if type in {"summarize", "impression"} else "max_tokens", 1024),
             "timeout": request_config.get("timeout", 30),
             "stream": stream,
             "api_key": state.get("api_key", ""),
         }
-        for optional_key in ("top_p", "frequency_penalty", "presence_penalty"):
+        for optional_key in ("temperature", "top_p", "frequency_penalty", "presence_penalty"):
             value = request_config.get(optional_key)
             if value is not None:
                 kwargs[optional_key] = value
@@ -383,6 +382,12 @@ class TextGenerator(Singleton["TextGenerator"]):
                             for ti in text_items:
                                 if not (ti.get("text") or "").strip():
                                     ti["text"] = "[图片]"
+            # Moonshot 等 provider 要求 assistant 消息 content 非空，填充占位符
+            for msg in prompt:
+                if isinstance(msg, dict) and msg.get("role") == "assistant":
+                    c = msg.get("content")
+                    if c is None or (isinstance(c, str) and not c.strip()):
+                        msg["content"] = "[无内容]"
             return prompt
         return [
             {"role": "system", "content": f"You must strictly follow the user's instructions to give {custom.get('bot_name', 'bot')}'s response."},
@@ -692,7 +697,9 @@ class TextGenerator(Singleton["TextGenerator"]):
             })
 
         _fake_retry_count = 0  # 伪造任务编号重试次数
+        _thinking_check_done = False  # reasoning 中提到画图工具但未调用的检查是否已执行
         _force_tools_next = False  # 强制下一轮提供工具定义
+        _image_stripped = False  # 工具调用后续轮是否已剥离图片
 
         round_idx = 0
         while True:
@@ -777,6 +784,16 @@ class TextGenerator(Singleton["TextGenerator"]):
                         final_reasoning_content = reasoning_content or ""
                         raw_merged = _join_intermediate(content)
                         merged = _merge_intermediate(content)
+                        # 工具调用后续轮返回空内容：可能是图片撑爆上下文导致，
+                        # 剥离图片后重试（兜底，正常情况下 except 分支已处理异常场景）
+                        if not content.strip() and not intermediate_texts and tool_messages and not _image_stripped:
+                            _image_stripped = True
+                            for m in messages:
+                                if isinstance(m.get("content"), list):
+                                    text_parts = [c.get("text", "") for c in m["content"] if isinstance(c, dict) and c.get("type") == "text"]
+                                    m["content"] = "\n".join(text_parts) if text_parts else "[图片已省略]"
+                            logger.warning("工具轮返回空内容，已剥离图片并重试")
+                            continue
                         # 拦截模式：检查伪造编号
                         if _intercept_final:
                             has_fake = _contains_fake_draw_reply(raw_merged)
@@ -801,6 +818,28 @@ class TextGenerator(Singleton["TextGenerator"]):
                                     await on_text(safe_text)
                         elif control_stream_buf is not None:
                             await _flush_control_stream_buffer()
+                        # 思考或回复中提到画图工具但未实际调用：注入提示强制重试
+                        if (
+                            not _thinking_check_done
+                            and not has_anima_call
+                            and _draw_mode != "off"
+                            and (
+                                (reasoning_content and "generate_anima_image" in reasoning_content)
+                                or (content and "generate_anima_image" in content)
+                            )
+                        ):
+                            _thinking_check_done = True
+                            _force_tools_next = True
+                            intermediate_texts.clear()
+                            messages.append({
+                                "role": "system",
+                                "content": (
+                                    "你在回复中提到了 generate_anima_image 画图工具，但没有通过 tool_calls 实际调用。"
+                                    "请立即通过 tool_calls 调用 generate_anima_image 画图工具完成绘图。"
+                                ),
+                            })
+                            logger.info("[画图工具检测] 输出中提到 generate_anima_image 但未调用，触发重试")
+                            continue
                         return merged, True, tool_messages, final_reasoning_content
                     if is_last_round and not _allow_terminal_tools:
                         final_reasoning_content = reasoning_content or ""
@@ -808,6 +847,14 @@ class TextGenerator(Singleton["TextGenerator"]):
                             await _flush_control_stream_buffer()
                         if content or intermediate_texts:
                             return _merge_intermediate(content), True, tool_messages, final_reasoning_content
+                        if not _image_stripped:
+                            _image_stripped = True
+                            for m in messages:
+                                if isinstance(m.get("content"), list):
+                                    text_parts = [c.get("text", "") for c in m["content"] if isinstance(c, dict) and c.get("type") == "text"]
+                                    m["content"] = "\n".join(text_parts) if text_parts else "[图片已省略]"
+                            logger.warning("最后一轮返回空内容，已剥离图片并重试")
+                            continue
                         return "", False, tool_messages, final_reasoning_content
                     for i, tc in enumerate(tool_calls):
                         if not tc.get("id"):
@@ -853,6 +900,28 @@ class TextGenerator(Singleton["TextGenerator"]):
                                 })
                                 continue
                         final_reasoning_content = message_dict.get("reasoning_content", "")
+                        # 思考或回复中提到画图工具但未实际调用：注入提示强制重试
+                        if (
+                            not _thinking_check_done
+                            and not has_anima_call
+                            and _draw_mode != "off"
+                            and (
+                                (final_reasoning_content and "generate_anima_image" in final_reasoning_content)
+                                or (content and "generate_anima_image" in content)
+                            )
+                        ):
+                            _thinking_check_done = True
+                            _force_tools_next = True
+                            intermediate_texts.clear()
+                            messages.append({
+                                "role": "system",
+                                "content": (
+                                    "你在回复中提到了 generate_anima_image 画图工具，但没有通过 tool_calls 实际调用。"
+                                    "请立即通过 tool_calls 调用 generate_anima_image 画图工具完成绘图。"
+                                ),
+                            })
+                            logger.info("[画图工具检测] 输出中提到 generate_anima_image 但未调用，触发重试")
+                            continue
                         safe_content = sanitize_draw_reply_text(content, allow_task_ids=has_anima_call)
                         if on_text and safe_content:
                             await on_text(safe_content)
@@ -863,6 +932,14 @@ class TextGenerator(Singleton["TextGenerator"]):
                             await on_text(safe_content)
                         if content or intermediate_texts:
                             return _merge_intermediate(content), True, tool_messages, final_reasoning_content
+                        if not _image_stripped:
+                            _image_stripped = True
+                            for m in messages:
+                                if isinstance(m.get("content"), list):
+                                    text_parts = [c.get("text", "") for c in m["content"] if isinstance(c, dict) and c.get("type") == "text"]
+                                    m["content"] = "\n".join(text_parts) if text_parts else "[图片已省略]"
+                            logger.warning("最后一轮返回空内容，已剥离图片并重试")
+                            continue
                         return "", False, tool_messages, final_reasoning_content
                     tool_calls_from_dict = message_dict.get("tool_calls") or []
                     for i, tc in enumerate(tool_calls_from_dict):
@@ -971,6 +1048,26 @@ class TextGenerator(Singleton["TextGenerator"]):
             except Exception as e:
                 self._set_tool_calling(request_chat_key, False)
                 self._notify_tool_done(request_chat_key)
+                err_text = str(e).lower()
+                # 工具调用后续轮：图片已无用，任何疑似上下文/token 错误都尝试剥离图片重试
+                is_ctx_error = (
+                    "context" in err_text
+                    or "token" in err_text
+                    or "length" in err_text
+                    or "too large" in err_text
+                    or "request too large" in err_text
+                    or "http 400" in err_text
+                    or "status code: 400" in err_text
+                    or "bad request" in err_text
+                )
+                if is_ctx_error and round_idx > 0 and not _image_stripped:
+                    _image_stripped = True
+                    for m in messages:
+                        if isinstance(m.get("content"), list):
+                            text_parts = [c.get("text", "") for c in m["content"] if isinstance(c, dict) and c.get("type") == "text"]
+                            m["content"] = "\n".join(text_parts) if text_parts else "[图片已省略]"
+                    logger.warning(f"工具轮请求失败，已剥离图片并重试: {e!r}")
+                    continue
                 logger.warning(f"LLM 请求失败: {e!r}")
                 self._rotate_key()
                 return f"请求大模型时发生错误: {e!r}", False, tool_messages, ""

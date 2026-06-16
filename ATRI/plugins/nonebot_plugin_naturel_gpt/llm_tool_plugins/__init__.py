@@ -90,8 +90,12 @@ def init_tools(config) -> None:
 
 
 def enable_anima_tool() -> bool:
-    """注册 Anima 画图工具到 TOOL_REGISTRY，返回是否成功。"""
-    schema = anima_generate.get_schema()
+    """注册 Anima 画图工具到 TOOL_REGISTRY，返回是否成功。
+    同时加载普通和 turbo 的 schema，运行时根据 turbo_mode 选择。"""
+    # 同时加载两种 schema
+    schema = anima_generate.get_schema(turbo=False)
+    turbo_schema = anima_generate.get_schema(turbo=True)
+    # 使用普通 schema 作为默认注册（turbo schema 在 prompt 构造时动态替换）
     if schema and "generate_anima_image" not in TOOL_REGISTRY:
         TOOL_REGISTRY["generate_anima_image"] = (schema, anima_generate.run)
         return True

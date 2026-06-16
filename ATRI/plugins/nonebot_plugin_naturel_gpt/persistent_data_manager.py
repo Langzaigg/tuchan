@@ -220,6 +220,7 @@ class ChatData(StoreSerializable):
     active_preset: str = field(default="")
     active_profile: str = field(default="")  # 当前会话使用的 OpenAI profile
     draw_mode: str = field(default="auto")  # 画图模式: force/on/auto/off
+    turbo_mode: bool = field(default=True)  # turbo 模式: True=turbo 工作流, False=普通工作流
     preset_datas: Dict[str, PresetData] = field(default_factory=dict)
     next_message_index: int = field(default=0)
     chat_image_history: List[Dict[str, Any]] = field(default_factory=list)
@@ -244,6 +245,7 @@ class ChatData(StoreSerializable):
         self.active_profile = str(getattr(self, "active_profile", "") or "")
         raw_draw_mode = str(getattr(self, "draw_mode", "auto") or "auto")
         self.draw_mode = raw_draw_mode if raw_draw_mode in ("force", "on", "auto", "off") else "auto"
+        self.turbo_mode = bool(getattr(self, "turbo_mode", True))
 
         raw_presets = getattr(self, "preset_datas", {}) or {}
         self.preset_datas = {

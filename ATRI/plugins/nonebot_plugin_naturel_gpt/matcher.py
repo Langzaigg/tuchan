@@ -556,6 +556,13 @@ def _is_image_download_error(text: Optional[str]) -> bool:
     )
 
 
+def _is_empty_content_error(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    lower_text = text.lower()
+    return "must not be empty" in lower_text
+
+
 def _prompt_contains_images(prompt: List[Dict[str, Any]]) -> bool:
     for message in prompt:
         content = message.get("content")
@@ -652,6 +659,23 @@ def _save_debug_log(chat_key: str, prompt: List[Dict[str, Any]], response: str,
                     tool_messages: List[Dict[str, Any]], reasoning: str,
                     cost_tokens: int, success: bool) -> None:
     """保存每个群最近一次 LLM 请求/响应到 JSON 文件"""
+    # turbo 模式下给画图工具调用补上 neg，使日志完整反映实际发送参数
+    if tool_messages and chat_key:
+        from .llm_tool_plugins import anima_generate as _ag
+        if _ag.get_turbo_mode(chat_key):
+            _TURBO_DEFAULT_NEG = "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, bad anatomy, bad hands, bad feet, extra fingers, missing fingers, extra toes, text, watermark, logo"
+            for msg in tool_messages:
+                for tc in (msg.get("tool_calls") or []):
+                    fn = tc.get("function", {})
+                    if fn.get("name") == "generate_anima_image":
+                        try:
+                            args = json.loads(fn.get("arguments", "{}"))
+                            if not args.get("neg"):
+                                args["neg"] = _TURBO_DEFAULT_NEG
+                                fn["arguments"] = json.dumps(args, ensure_ascii=False)
+                        except Exception:
+                            pass
+
     log_dir = Path(config.NG_LOG_PATH)
     log_dir.mkdir(parents=True, exist_ok=True)
     safe_key = chat_key.replace("/", "_").replace("\\", "_")
@@ -685,7 +709,7 @@ def _save_debug_log(chat_key: str, prompt: List[Dict[str, Any]], response: str,
 def _save_error_log(chat_key: str, prompt: List[Dict[str, Any]], response: str,
                     tool_messages: List[Dict[str, Any]], reasoning: str,
                     cost_tokens: int) -> None:
-    """保存失败请求的完整未脱敏 prompt，每个群只保留最新一份，用于排查 API 兼容性问题"""
+    """保存失败请求的 prompt（base64 图片已省略），每个群只保留最新一份，用于排查 API 兼容性问题"""
     log_dir = Path(config.NG_LOG_PATH)
     log_dir.mkdir(parents=True, exist_ok=True)
     safe_key = chat_key.replace("/", "_").replace("\\", "_")
@@ -694,11 +718,11 @@ def _save_error_log(chat_key: str, prompt: List[Dict[str, Any]], response: str,
         "chat_key": chat_key,
         "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
         "cost_tokens": cost_tokens,
-        "prompt": prompt,
+        "prompt": _sanitize_prompt_for_log(prompt),
         "response": response,
     }
     if tool_messages:
-        data["tool_messages"] = tool_messages
+        data["tool_messages"] = _sanitize_prompt_for_log(tool_messages)
     if reasoning:
         data["reasoning"] = reasoning
     try:
@@ -1102,8 +1126,9 @@ async def do_msg_response(
             await on_text_chunk(chunk)
 
     try:
-        # 生成对话结果（含图片 400 重试，最多 2 次）
+        # 生成对话结果（含图片 400 重试 + 空响应上下文清理重试）
         MAX_RETRIES = 2
+        _empty_retried = False
         for _retry in range(1 + MAX_RETRIES):
             raw_res, success, tool_messages, reasoning_content = await tg.stream_response(
                 prompt=prompt_template,
@@ -1120,8 +1145,43 @@ async def do_msg_response(
                 failure_cost = tg.cal_token_count(str(prompt_template) + str(raw_res or ""))
                 _save_error_log(chat_key, prompt_template, str(raw_res or ""), tool_messages, reasoning_content, failure_cost)
 
-            # 成功或无图片可剥离时不再重试
-            if success or not _prompt_contains_images(prompt_template):
+            # 成功时不再重试
+            if success:
+                break
+
+            # 空响应（token 超限兜底）：清理上下文后重试一次
+            if not raw_res and not _empty_retried:
+                _empty_retried = True
+                logger.warning("模型返回空响应，可能 token 超限，清理上下文并重试...")
+                chat.cleanup_after_bad_request(keep_history=5)
+                PersistentDataManager.instance.save_to_file(must_save=True)
+                raw_parts.clear()
+                stream_buffer = ""
+                sent_segments = 0
+                prompt_template = await chat.get_chat_prompt_template(
+                    userid=trigger_userid,
+                    chat_type=chat_type,
+                    include_images=False,
+                    has_draw_request=_has_draw_request,
+                    mentioned_userids=mentioned_userids or None,
+                )
+                continue
+
+            # assistant 消息 content 为空导致 400（如 Moonshot）：填充占位符后重试
+            if _is_empty_content_error(raw_res) and _retry < MAX_RETRIES:
+                logger.warning(f"assistant 消息 content 为空导致 400 (第 {_retry + 1} 次)，填充占位符后重试...")
+                for msg in prompt_template:
+                    if isinstance(msg, dict) and msg.get("role") == "assistant":
+                        c = msg.get("content")
+                        if c is None or (isinstance(c, str) and not c.strip()):
+                            msg["content"] = "[无内容]"
+                raw_parts.clear()
+                stream_buffer = ""
+                sent_segments = 0
+                continue
+
+            # 无图片可剥离时不再重试
+            if not _prompt_contains_images(prompt_template):
                 break
             # 仅在图片相关 400 错误时重试（非图片 400 如工具调用格式错误，剥离图片无意义）
             if not _is_image_download_error(raw_res):
@@ -1233,6 +1293,10 @@ async def do_msg_response(
                 chat.cleanup_after_bad_request(keep_history=5)
                 PersistentDataManager.instance.save_to_file(must_save=True)
                 await matcher.send("[系统] 对话历史过长已自动清理，请继续对话")
+                return
+            if not raw_res:
+                logger.warning("模型返回空响应（重试后仍失败），error 日志已保存")
+                await matcher.send("[系统] 模型响应为空，可能上下文过长，请发送消息触发新对话")
                 return
             if not raw_parts and raw_res:
                 if is_model_request_error_text(raw_res):
