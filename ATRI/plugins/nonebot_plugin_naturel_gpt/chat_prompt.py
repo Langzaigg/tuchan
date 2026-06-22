@@ -25,30 +25,11 @@ _TASK_ID_HIDE_PLACEHOLDER = '[请调用 generate_anima_image 画图工具获取�
 class ChatPromptMixin:
     """Prompt 构造 Mixin，提供对话 prompt 模板生成功能"""
 
-    async def get_chat_prompt_template(self, userid: str, chat_type: str = '', include_images: bool = True, has_draw_request: bool = False, mentioned_userids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    async def get_chat_prompt_template(self, userid: str, chat_type: str = '', include_images: bool = True, has_draw_request: bool = False) -> List[Dict[str, Any]]:
         """对话 prompt 模板生成。has_draw_request 表示当前消息是否含画图关键词，用于 auto 模式判断是否注入画图知识。
-        mentioned_userids 为触发消息中 @或昵称提到的用户 ID 列表，用于附带其个人印象。"""
-        # 印象描述：触发用户 + 被提到的用户
-        impression_parts: List[str] = []
-        _impression_userids: List[str] = [userid] + (mentioned_userids or [])
-        _seen_uids: set = set()
-        for uid in _impression_userids:
-            if uid in _seen_uids:
-                continue
-            _seen_uids.add(uid)
-            if uid not in self.chat_preset.chat_impressions:
-                continue
-            imp_data = self.chat_preset.chat_impressions[uid]
-            imp_text = imp_data.chat_impression.strip()
-            if not imp_text:
-                continue
-            if uid == userid:
-                impression_parts.append(f"[impression]\n{imp_text}")
-            else:
-                label = f"[用户印象: {imp_data.nickname or uid}]"
-                impression_parts.append(f"{label}\n{imp_text}")
-        impression_text = "\n\n".join(impression_parts) if impression_parts else ""
-
+        个人印象不再在此处集中注入：印象 system 由 update_chat_history_row 在触发用户消息前按需插入 prompt_messages，
+        绑定到该用户首次触发的轮次，随对应轮次一同裁剪/摘要。这样同一角色的印象在整个上下文中只出现一次，
+        历史轮一旦写入即固定不变，从而保证多人使用时历史前缀稳定、prompt 缓存可稳定命中。"""
         # 记忆模块 - 群记忆
         group_memory_text = ''
         group_memory = ''
@@ -68,26 +49,15 @@ class ChatPromptMixin:
         if len(chat_memory_filtered) > config.MEMORY_MAX_LENGTH:
             logger.warning(f"群记忆已超出上限: {len(chat_memory_filtered)}/{config.MEMORY_MAX_LENGTH}")
 
-        # 记忆模块 - 用户个人记忆
-        user_memory_text = ''
-        user_memory = ''
-        user_mem = self._get_user_memory(userid)
-        user_mem_filtered = {k: v for k, v in user_mem.items() if v}
-        if user_mem_filtered:
-            idx = 0
-            for k, v in user_mem_filtered.items():
-                idx += 1
-                user_memory_text += f"{idx}. {k}: {v}\n"
-
+        # 记忆模块 - 用户个人记忆（已移至 impression system 中，与用户印象绑定）
+        # 仅保留群记忆在 System 3
         if config.MEMORY_ACTIVE:
             if group_memory_text:
                 group_memory = f"[群记忆]\n{group_memory_text}\n"
-            if user_memory_text:
-                user_memory = f"[你的记忆]\n{user_memory_text}\n"
 
-        memory = group_memory + user_memory
+        memory = group_memory
 
-        # 记忆接近上限时的整理提醒
+        # 记忆接近上限时的整理提醒（仅群记忆，用户记忆提醒已移至 impression system）
         memory_reminder = ''
         if config.MEMORY_ACTIVE:
             max_len_mem = config.MEMORY_MAX_LENGTH
@@ -95,9 +65,6 @@ class ChatPromptMixin:
             group_count = len(chat_memory_filtered)
             if group_count >= threshold:
                 memory_reminder += f"\n[记忆提醒] 群记忆已达 {group_count}/{max_len_mem}，建议调用记忆整理工具精简。\n"
-            user_count = len(user_mem_filtered)
-            if user_count >= threshold:
-                memory_reminder += f"\n[记忆提醒] 用户记忆已达 {user_count}/{max_len_mem}，建议调用记忆整理工具精简。\n"
 
         summary = f"[压缩上下文摘要]\n{self.chat_preset.context_summary}\n\n" if self.chat_preset.context_summary else ''
 
@@ -152,21 +119,55 @@ class ChatPromptMixin:
         # System 2: 条件追加（画图知识 + extra_prompt）—— draw_mode/profile 变化时才变
         from .llm_tool_plugins import anima_generate
         _draw_mode = anima_generate.get_chat_mode(self.chat_key)
+        _is_manga = anima_generate.get_manga_mode(self.chat_key)
+        # auto 模式惯性注入：当前消息有画图关键词，或过去 CONTEXT_WINDOW_SIZE 轮中有画图活动时保持注入
+        _has_recent_draw_activity = False
+        if _draw_mode == "auto" and not has_draw_request:
+            _DRAWING_KEYWORDS = ("画", "draw", "改图", "重画", "来一张", "整一张")
+            _recent_msgs = self.chat_preset.prompt_messages[-config.CONTEXT_WINDOW_SIZE * 4:]
+            for _item in _recent_msgs:
+                if not isinstance(_item, ChatMessageData):
+                    continue
+                if _item.role == "assistant" and _item.tool_calls:
+                    for _tc in _item.tool_calls:
+                        _func = _tc.get("function", {}) if isinstance(_tc, dict) else {}
+                        if _func.get("name") == "generate_anima_image":
+                            _has_recent_draw_activity = True
+                            break
+                if _item.role == "user" and not _item.context_only:
+                    _text = (_item.text or "").lower()
+                    if any(_kw in _text for _kw in _DRAWING_KEYWORDS):
+                        _has_recent_draw_activity = True
+                if _has_recent_draw_activity:
+                    break
         _should_inject_anima = (
-            _draw_mode == "force" or _draw_mode == "on"
-            or (_draw_mode == "auto" and has_draw_request)
+            _is_manga  # 漫画模式始终注入
+            or _draw_mode == "force" or _draw_mode == "on"
+            or (_draw_mode == "auto" and (has_draw_request or _has_recent_draw_activity))
         )
         extra_prompt = getattr(tg, 'extra_prompt', '') or ''
         if extra_prompt and not extra_prompt.startswith('\n'):
             extra_prompt = '\n' + extra_prompt
         conditional_parts = []
         if config.LLM_ENABLE_TOOLS and _should_inject_anima:
-            # 根据 turbo_mode 选择 knowledge
-            is_turbo = anima_generate.get_turbo_mode(self.chat_key)
-            anima_knowledge = anima_generate.get_knowledge(turbo=is_turbo)
-            if anima_knowledge:
-                mode_label = "Turbo 绘画技能" if is_turbo else "绘画技能"
-                conditional_parts.append(f"[你的{mode_label}]\n{anima_knowledge}")
+            if _is_manga:
+                # 漫画模式：使用 turbo knowledge + 漫画规则
+                anima_knowledge = anima_generate.get_knowledge(turbo=True)
+                if anima_knowledge:
+                    manga_style = anima_generate.get_manga_style(self.chat_key)
+                    # 自定义画风放在最前面，确保 LLM 优先看到
+                    manga_knowledge = ""
+                    if manga_style:
+                        manga_knowledge += f"## 自定义画风（必须遵循）\n{manga_style}\n\n"
+                    manga_knowledge += anima_generate.MANGA_RULES + "\n\n" + anima_knowledge
+                    conditional_parts.append(f"[你的漫画技能]\n{manga_knowledge}")
+            else:
+                # 普通模式：根据 turbo_mode 选择 knowledge
+                is_turbo = anima_generate.get_turbo_mode(self.chat_key)
+                anima_knowledge = anima_generate.get_knowledge(turbo=is_turbo)
+                if anima_knowledge:
+                    mode_label = "Turbo 绘画技能" if is_turbo else "绘画技能"
+                    conditional_parts.append(f"[你的{mode_label}]\n{anima_knowledge}")
         if extra_prompt:
             conditional_parts.append(extra_prompt)
         if conditional_parts:
@@ -178,9 +179,10 @@ class ChatPromptMixin:
             f"当前日期: {time.strftime('%Y-%m-%d %A')}"
         )})
 
-        # System 4: 摘要 + 印象（会话级变化）
-        if summary or impression_text:
-            messages.append({'role': 'system', 'content': f"{summary}{impression_text}".strip()})
+        # System 4: 压缩上下文摘要（会话级变化，仅在摘要更新时变动）
+        # 个人印象不再放在此处，改为 per-turn 的 system 段跟随触发者注入到历史消息中。
+        if summary:
+            messages.append({'role': 'system', 'content': summary.strip()})
         messages.extend(await self._build_openai_history_messages(include_images=include_images))
         self._trim_messages_to_request_budget(messages)
 
@@ -197,6 +199,12 @@ class ChatPromptMixin:
             text = _TASK_ID_HIDE_PREFIX_RE.sub(_TASK_ID_HIDE_PLACEHOLDER, text)
             text = _TASK_ID_HIDE_DRAW_RE.sub(_TASK_ID_HIDE_PLACEHOLDER, text)
             return text
+        # 印象 system：带昵称标签的纯文本，不附加时间戳/发送者前缀
+        if item.is_impression:
+            imp_data = self.chat_preset.chat_impressions.get(item.impression_user_id)
+            nickname = (imp_data.nickname or "").strip() if imp_data else ""
+            label = f"[用户印象: {nickname}]" if nickname else "[用户印象]"
+            return f"{label}\n{(item.text or '').strip()}"
         if item.content_is_labeled:
             return (item.text or "").strip()
         # context_only 消息直接返回文本（已有每行时间戳，不需要外层前缀）
@@ -217,7 +225,7 @@ class ChatPromptMixin:
         """获取消息内容用于 prompt，可能包含图片（通过缓存转为 data URI）"""
         text = self._message_text_for_prompt(item)
         images: List[str] = []
-        if include_images and config.MULTIMODAL_ENABLE and self._image_is_fresh(item.timestamp):
+        if include_images and config.MULTIMODAL_ENABLE:
             images.extend([url for url in item.images if self._is_supported_image_url(url)])
         if not images:
             return text
@@ -262,7 +270,8 @@ class ChatPromptMixin:
         normal_items: List[ChatMessageData],
         item_to_msg_idx: Dict[int, int],
     ) -> None:
-        """图片门控：为所有含图 user 消息和 context_only 消息注入图片"""
+        """图片门控：为含图 user 消息和 context_only 消息注入图片。
+        超出图片上限时清空所有历史图片，仅保留触发消息图片，避免滚动清理导致缓存不命中。"""
         image_keywords = ("图", "画", "看", "照片", "截图", "image", "pic", "photo", "前", "上", "这")
 
         # 找到触发消息（最后一条非 context_only 的 user）
@@ -271,10 +280,7 @@ class ChatPromptMixin:
             if item.role == "user" and not item.context_only:
                 trigger_item = item
 
-        trigger_msg_idx = item_to_msg_idx.get(id(trigger_item)) if trigger_item else None
-
-        # 为所有含图 user 消息注入图片（触发消息 + 历史用户消息）
-        # context_only 图片在下方专用分支处理，避免同一张图被重复注入。
+        # 为所有含图 user 消息注入图片（不限窗口、不限时效）
         for item in normal_items:
             if item.role != "user" or item.context_only or not item.images:
                 continue
@@ -285,78 +291,75 @@ class ChatPromptMixin:
             if isinstance(content, list):
                 normal_messages[msg_idx]["content"] = content
 
-        # 关键词检测（同时检查触发消息和 context_only 群聊上下文）
+        # 关键词检测（仅检查触发消息，控制是否注入 context_only 图片）
         trigger_text = trigger_item.text if trigger_item else ""
-        context_text = " ".join(
-            item.text for item in normal_items if item.context_only and item.text
-        )
-        has_image_keyword = any(kw in trigger_text or kw in context_text for kw in image_keywords)
+        trigger_has_image_keyword = any(kw in trigger_text for kw in image_keywords)
 
-        # 收集 context_only 消息的图片（始终收集注入，关键词仅控制去重）
-        context_only_items_with_images: List[tuple] = []  # (item, filtered_images)
+        # 仅当触发句含关键词时，收集并注入 context_only 消息的图片
+        context_only_images: List[str] = []
         used_images: Set[str] = set()
         if trigger_item:
             used_images.update(
                 url for url in trigger_item.images
-                if self._is_supported_image_url(url) and self._image_is_fresh(trigger_item.timestamp))
+                if self._is_supported_image_url(url))
 
-        for item in reversed(normal_items):
-            if item is trigger_item or not item.context_only:
-                continue
-            if not item.images:
-                continue
-            if has_image_keyword:
+        if trigger_has_image_keyword:
+            for item in reversed(normal_items):
+                if item is trigger_item or not item.context_only:
+                    continue
+                if not item.images:
+                    continue
                 imgs = [url for url in item.images
                         if self._is_supported_image_url(url) and url not in used_images]
-            else:
-                imgs = [url for url in item.images
-                        if self._is_supported_image_url(url)]
-            if imgs:
-                context_only_items_with_images.append((item, imgs))
+                for url in imgs:
+                    if url not in used_images:
+                        context_only_images.append(url)
+                        used_images.add(url)
 
-        # 将 context_only 图片注入对应的 context_only 消息本身
-        for item, imgs in context_only_items_with_images:
-            msg_idx = item_to_msg_idx.get(id(item))
-            if msg_idx is None or msg_idx >= len(normal_messages):
-                continue
-            resolved_ctx_imgs = await image_cache.resolve_urls(imgs)
-            if not resolved_ctx_imgs:
-                continue
-            ctx_msg = normal_messages[msg_idx]
-            existing = ctx_msg.get("content")
-            if isinstance(existing, list):
-                # 去重：收集已有 image_url 避免重复注入
-                existing_urls = {
-                    item.get("image_url", {}).get("url", "")
-                    for item in existing
-                    if isinstance(item, dict) and item.get("type") == "image_url"
-                }
-                for url in resolved_ctx_imgs:
-                    if url and url not in existing_urls:
-                        existing.append({"type": "image_url", "image_url": {"url": url}})
-                        existing_urls.add(url)
-            elif isinstance(existing, str):
-                ctx_msg["content"] = [{"type": "text", "text": existing}] + [
-                    {"type": "image_url", "image_url": {"url": url}} for url in resolved_ctx_imgs if url
-                ]
+        # 将 context_only 图片注入触发 user 消息
+        if context_only_images and trigger_item:
+            trigger_msg_idx = item_to_msg_idx.get(id(trigger_item))
+            if trigger_msg_idx is not None and trigger_msg_idx < len(normal_messages):
+                resolved_ctx_imgs = await image_cache.resolve_urls(context_only_images)
+                if resolved_ctx_imgs:
+                    trigger_msg = normal_messages[trigger_msg_idx]
+                    existing = trigger_msg.get("content")
+                    if isinstance(existing, list):
+                        existing_urls = {
+                            item.get("image_url", {}).get("url", "")
+                            for item in existing
+                            if isinstance(item, dict) and item.get("type") == "image_url"
+                        }
+                        for url in resolved_ctx_imgs:
+                            if url and url not in existing_urls:
+                                existing.append({"type": "image_url", "image_url": {"url": url}})
+                                existing_urls.add(url)
+                    elif isinstance(existing, str):
+                        trigger_msg["content"] = [{"type": "text", "text": existing}] + [
+                            {"type": "image_url", "image_url": {"url": url}} for url in resolved_ctx_imgs if url
+                        ]
 
-        # 全局图片数量限制：从最旧的开始剥离图片直到不超限
+        # 全局图片数量限制：超限时清空所有历史图片，仅保留触发消息的图片
         max_img_msgs = max(0, config.MULTIMODAL_MAX_MESSAGES_WITH_IMAGES)
         img_msg_indices = []
+        trigger_msg_idx = item_to_msg_idx.get(id(trigger_item)) if trigger_item else None
         for i, msg in enumerate(normal_messages):
             content = msg.get("content")
             if isinstance(content, list) and any(
                 isinstance(item, dict) and item.get("type") == "image_url" for item in content
             ):
                 img_msg_indices.append(i)
-        excess = len(img_msg_indices) - max_img_msgs
-        for idx in img_msg_indices[:excess]:
-            msg = normal_messages[idx]
-            content = msg.get("content")
-            if isinstance(content, list):
-                msg["content"] = [item for item in content if not (isinstance(item, dict) and item.get("type") == "image_url")]
-                if not msg["content"]:
-                    msg["content"] = "[图片已省略]"
+        if len(img_msg_indices) > max_img_msgs and trigger_msg_idx is not None:
+            # 清空所有非触发消息的图片
+            for idx in img_msg_indices:
+                if idx == trigger_msg_idx:
+                    continue
+                msg = normal_messages[idx]
+                content = msg.get("content")
+                if isinstance(content, list):
+                    msg["content"] = [item for item in content if not (isinstance(item, dict) and item.get("type") == "image_url")]
+                    if not msg["content"]:
+                        msg["content"] = "[图片已省略]"
 
     @staticmethod
     def _is_tool_summary_system_message(msg: Dict[str, Any]) -> bool:
@@ -365,25 +368,42 @@ class ChatPromptMixin:
         content = str(msg.get("content") or "")
         return content.startswith("[调用结果]") or content.startswith("[搜索工具摘要]")
 
+    @staticmethod
+    def _is_impression_system_message(msg: Dict[str, Any]) -> bool:
+        """识别注入到历史轮中的个人印象 system 消息（按 content 前缀判断）。"""
+        if msg.get("role") != "system":
+            return False
+        content = str(msg.get("content") or "")
+        return content.startswith("[用户印象") or content.startswith("[impression]")
+
     @classmethod
     def _oldest_removable_round_indices(cls, messages: List[Dict[str, Any]], trigger_idx: int) -> List[int]:
-        """返回最旧可删除真实轮次的消息下标，跳过 context_only 等普通 system 消息。"""
+        """返回最旧可删除真实轮次的消息下标，跳过 context_only 等普通 system 消息。
+        印象 system 绑定到其后的 user 轮，随该 user 一起删除，避免删除 user 后留下孤立印象。"""
         for i, msg in enumerate(messages):
             if i == trigger_idx:
                 break
             if msg.get("role") != "user":
                 continue
             indices: List[int] = []
+            # 回溯纳入 user 前面紧邻的印象 system（绑定到本轮）
+            k = i - 1
+            while k >= 0 and cls._is_impression_system_message(messages[k]):
+                indices.append(k)
+                k -= 1
             j = i
             while j < len(messages) and j != trigger_idx:
                 role = messages[j].get("role", "")
                 if j != i and role == "user":
                     break
+                # 印象 system 是下一轮 user 的前缀，不属于本轮，停止收集（避免误删下一轮印象）
+                if j != i and cls._is_impression_system_message(messages[j]):
+                    break
                 if role != "system" or cls._is_tool_summary_system_message(messages[j]):
                     indices.append(j)
                 j += 1
             if indices:
-                return indices
+                return sorted(indices)
         return []
 
     @classmethod
@@ -405,7 +425,7 @@ class ChatPromptMixin:
         tool_context_mode = getattr(config, 'TOOL_CONTEXT_MODE', 3)
         source_messages = [
             item for item in preset.prompt_messages
-            if isinstance(item, ChatMessageData) and (item.role in {"user", "assistant", "tool"} or item.context_only)
+            if isinstance(item, ChatMessageData) and (item.role in {"user", "assistant", "tool"} or item.context_only or item.is_impression)
         ]
 
         # 按轮选取：从末尾向前找独立缓冲窗口的起始位置（排除 context_only）
@@ -422,10 +442,14 @@ class ChatPromptMixin:
                 rounds += 1
                 if rounds > max_rounds:
                     start_idx = i + 1
+                    # 跳过截断点之后的 assistant/tool 残留（被裁 user 的回复等），
+                    # 停在下一个保留轮的开始：下一个 user、其前的印象 system、或 context_only。
+                    # 注意不能跳过印象 system，否则保留的最旧轮会丢失其绑定印象。
                     while (
                         start_idx < len(source_messages)
                         and source_messages[start_idx].role != "user"
                         and not source_messages[start_idx].context_only
+                        and not source_messages[start_idx].is_impression
                     ):
                         start_idx += 1
                     break
@@ -466,6 +490,8 @@ class ChatPromptMixin:
             content = await self._message_content_for_prompt(item, include_images=False)
             # context_only 消息使用 system 角色
             if item.context_only:
+                msg_role = "system"
+            elif item.is_impression:
                 msg_role = "system"
             elif item.role == "assistant":
                 msg_role = "assistant"
