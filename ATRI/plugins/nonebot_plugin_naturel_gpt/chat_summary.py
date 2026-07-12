@@ -31,7 +31,7 @@ def _extract_tavily_ai_answer(content: str) -> str:
     return answer
 
 
-def _save_error_log(chat_key: str, prompt: str, response: str, cost_tokens: int) -> None:
+def _save_error_log(chat_key: str, prompt: Any, response: str, cost_tokens: int) -> None:
     """保存摘要/印象任务的失败请求到 error log，便于排查 API 兼容性问题"""
     log_dir = Path(config.NG_LOG_PATH)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -53,7 +53,7 @@ def _save_error_log(chat_key: str, prompt: str, response: str, cost_tokens: int)
 
 
 def _save_summary_log(chat_key: str, summary_type: str,
-                      summary_prompt: str, summary_response: str,
+                      summary_prompt: Any, summary_response: str,
                       context_summary: str, tool_call_summary: str,
                       impressions: Optional[Dict[str, str]] = None) -> None:
     """保存摘要日志：包含摘要 LLM 的请求/响应和最终摘要结果"""
@@ -322,7 +322,9 @@ class ChatSummaryMixin:
             # 冷却期已过，重置
             self._compress_failure_time = 0
 
-        # 找到溢出轮的截断点：第 overflow_rounds+1 个真实 user 之前的完整消息段需要摘要/裁剪。
+        # 找到溢出轮的截断点：第 overflow_rounds+1 个真实 user 是保留的最旧轮，
+        # 其之前的完整消息段需要摘要/裁剪。注意保留轮 user 前的前导印象 system
+        # 属于保留轮，需回溯排除，避免把保留轮的印象误纳入溢出部分。
         user_count = 0
         cut_index = 0
         for i, msg in enumerate(preset.prompt_messages):
@@ -330,6 +332,8 @@ class ChatSummaryMixin:
                 user_count += 1
                 if user_count > overflow_rounds:
                     cut_index = i
+                    while cut_index > 0 and isinstance(preset.prompt_messages[cut_index - 1], ChatMessageData) and preset.prompt_messages[cut_index - 1].is_impression:
+                        cut_index -= 1
                     break
 
         overflow_span = [
@@ -370,9 +374,11 @@ class ChatSummaryMixin:
         # 摘要任务完成后再删除已总结的溢出消息
 
         # 构建本次需要摘要的文本（新溢出 + 之前累积的 pending）
+        # 印象 system 不是对话内容，跳过它，避免把旧印象文本混入对话摘要
         new_overflow_text = "\n".join(
             self._format_prompt_message_for_summary(item)
             for item in new_overflow_messages
+            if not getattr(item, "is_impression", False)
         )
 
         # 如果没有需要摘要的文本，直接返回
@@ -426,16 +432,40 @@ class ChatSummaryMixin:
             summary_response = ""
             # 从配置读取摘要字数限制（中文约 1 token ≈ 1 字）
             max_summary_chars = max(200, tg.config.get('max_summary_tokens', 800))
-            hard_summary_limit = max_summary_chars * 2
+            hard_summary_limit = max(1000, max_summary_chars * 2)  # 安全兜底：最大 1000 字或 2 倍软限制
             # 读取最新的 previous_summary（可能已被前一个任务更新）
             latest_previous = preset.context_summary.strip()
             for attempt in range(max_retries):
-                prompt = (
+                current_date = time.strftime('%Y-%m-%d')
+                summary_prompt_text = (
                     f"[已有压缩摘要]\n{latest_previous or '无'}\n\n"
-                    f"[本次需要压缩的旧对话]\n{overflow_text}\n\n"
-                    "请把旧对话压缩成一段持续可用的上下文摘要，全面保留事实、用户偏好、未完成事项、重要图片描述、已达成结论和关键对话细节。"
-                    f"不要加入不存在的信息，控制在{max_summary_chars}字以内。"
+                    f"[本次需要合并的旧对话]\n{overflow_text}\n\n"
+                    "请把旧对话中的关键信息合并进已有摘要，按上述格式输出新的上下文摘要。"
                 )
+                prompt = [
+                    {"role": "system", "content": (
+                        "你是上下文摘要助手。请将提供的对话历史合并进已有摘要，生成一份持续可用的上下文速查。\n\n"
+                        "要求：\n"
+                        "1. 与用户个人印象互补。个人印象里已经记录的性格、兴趣、说话风格等不要在本摘要中重复；"
+                        "本摘要只保留会话/群层面的事实、事件、共识、待办和需要后续记住的信息。\n"
+                        "2. 按固定格式输出，不要添加格式以外的内容。\n"
+                        "3. 功能调用性质的聊天记录（画图指令、搜索指令、工具调用请求等）不作为事实依据或共识纳入摘要；"
+                        "但从中反映出的用户的偏好倾向（如画风偏好、常用搜索主题等）可以适度记录。\n\n"
+                        "输出格式：\n\n"
+                        "[上下文摘要]\n"
+                        "概括当前会话状态、关键事实、共识、未完成的讨论和需要后续记住的信息。"
+                        "只保留对后续对话有价值的内容。\n\n"
+                        "[时间线]\n"
+                        f"按日期（到天）列出对后续对话仍有价值的事件、话题转折、共同约定、关键决策。当前日期为 {current_date}。"
+                        "只保留高信号事件，不要记录每一句闲聊。\n\n"
+                        "注意：\n"
+                        "- 新信息应覆盖旧摘要中重复或过时的部分，避免同一件事反复累积。\n"
+                        "- 不编造不存在的信息。\n"
+                        "- 如果总长度可能超过限制，优先删除[时间线]中价值较低的条目，核心[上下文摘要]最后保留。\n"
+                        f"- 总长度控制在 {max_summary_chars} 字以内。"
+                    )},
+                    {"role": "user", "content": summary_prompt_text},
+                ]
                 summary_prompt = prompt
                 try:
                     res, success = await tg.get_response(prompt, type='summarize', request_profile=request_profile)
@@ -494,24 +524,53 @@ class ChatSummaryMixin:
                 self._compressing_overflow_item_ids = set()
                 self._compress_failure_time = time.time()
                 logger.warning(f"[会话: {chat_key}] 摘要生成失败，保留旧摘要和溢出消息（{_COMPRESS_COOLDOWN_SECONDS}秒冷却）")
-                _save_error_log(chat_key, summary_prompt, summary_response, tg.cal_token_count(summary_prompt + summary_response))
+                _save_error_log(chat_key, summary_prompt, summary_response, tg.cal_token_count(summary_prompt) + tg.cal_token_count(summary_response))
 
             _save_summary_log(chat_key, "context", summary_prompt, summary_response,
                               preset.context_summary, preset.tool_call_summary)
 
-            # 并入印象生成：仅对本次溢出中实际产生互动的用户生成印象（结合老印象）
+            # 并入印象生成：仅对本次溢出中实际产生互动的用户生成印象（结合老印象）。
+            # 更新依据为本次溢出部分中该用户的对话（而非累积的 chat_history）：
+            # 摘要裁剪掉溢出轮次（含其绑定的旧印象 system）后，下次该用户触发时
+            # 上下文中不再有他的印象，自然注入此处更新后的新印象，避免旧印象残留。
             impression_results: Dict[str, str] = {}
             for uid in _active_user_ids:
                 imp = preset.chat_impressions.get(uid)
-                if not imp or not imp.chat_history:
+                if not imp:
+                    continue
+                # 从溢出部分提取该用户的 user 消息作为印象更新依据
+                user_lines: List[str] = []
+                for msg in new_overflow_messages:
+                    if getattr(msg, "is_impression", False):
+                        continue
+                    if msg.role == "user" and not msg.context_only:
+                        msg_uid = self._message_user_id_for_impression(preset, msg)
+                        if msg_uid == uid:
+                            sender = (msg.sender or "").strip() or "用户"
+                            text = (msg.text or "").strip()
+                            user_lines.append(f"{sender}: {text}")
+                if not user_lines:
                     continue
                 nickname_info = f"（群昵称: {imp.nickname}）" if imp.nickname else ""
-                imp_prompt = (
-                    f"[用户{nickname_info}]\n"
-                    f"[已有印象]\n{imp.chat_impression or '无'}\n\n"
-                    f"[近期对话]\n{chr(10).join(imp.chat_history[-20:])}\n\n"
-                    f"请以{preset_key}的视角简要更新对该用户的印象，包括该用户的性格特点、兴趣爱好、说话风格等关键信息，300字内，只输出印象文本。"
-                )
+                imp_prompt = [
+                    {"role": "system", "content": (
+                        f"你是{preset_key}。根据用户的对话历史，简洁地更新对用户的印象。"
+                        "包括性格特点、兴趣爱好、说话风格等关键信息。\n\n"
+                        "重要规则：\n"
+                        "- 功能调用性质的语句（如画图指令\"帮我画一张XX\"、搜索指令\"搜索一下XX\"、工具调用请求等）"
+                        "不作为该用户的性格或事实依据，不应纳入印象描述。\n"
+                        "- 但从功能调用中反映出的偏好倾向可以适度总结："
+                        "如画风偏好（常用画师风格）、常用搜索主题、喜欢的功能类型等。\n"
+                        "- 用户在画图后发表的对结果的评价（\"好看\"\"不对\"\"太暗了\"等）属于用户反馈，可以反映审美偏好。\n\n"
+                        "直接输出印象文本，不要添加前缀或标签。"
+                    )},
+                    {"role": "user", "content": (
+                        f"[用户{nickname_info}]\n"
+                        f"[已有印象]\n{imp.chat_impression or '无'}\n\n"
+                        f"[近期对话]\n{chr(10).join(user_lines)}\n\n"
+                        f"请以{preset_key}的视角简要更新对该用户的印象，包括该用户的性格特点、兴趣爱好、说话风格等关键信息，300字内，只输出印象文本。"
+                    )},
+                ]
                 imp_response = ""
                 try:
                     imp_res, imp_success = await tg.get_response(imp_prompt, type='summarize', request_profile=request_profile)
@@ -525,7 +584,7 @@ class ChatSummaryMixin:
                         impression_results[uid] = imp.chat_impression
                 except Exception as e:
                     imp_response = f"[异常] {e!r}"
-                    _save_error_log(chat_key, imp_prompt, imp_response, tg.cal_token_count(imp_prompt + str(e)))
+                    _save_error_log(chat_key, imp_prompt, imp_response, tg.cal_token_count(imp_prompt) + tg.cal_token_count(imp_response))
                     pass  # 印象生成失败不影响主流程
 
             # 保存印象日志

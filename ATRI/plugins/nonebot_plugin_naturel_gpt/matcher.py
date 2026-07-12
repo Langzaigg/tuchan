@@ -26,6 +26,8 @@ from .openai_func import (
     is_model_request_error_text,
     sanitize_draw_reply_text,
     sanitize_internal_control_text,
+    contains_tool_call_xml,
+    strip_tool_call_xml,
 )
 from .command_func import cmd
 
@@ -143,8 +145,9 @@ def _push_recent_context_buffer(
         )
 
 
-def _flush_recent_context_buffer(chat_key: str) -> Tuple[str, List[str]]:
-    """清空入口层非触发缓冲，返回 (合并文本, 图片URL列表)。"""
+def _flush_recent_context_buffer(chat_key: str, trigger_sender: str = "") -> Tuple[str, List[str]]:
+    """清空入口层非触发缓冲，返回 (合并文本, 图片URL列表)。
+    仅保留最后一条消息和触发者本人的图片，忽略其他人的图片。"""
     buf = _recent_context_buffers.pop(chat_key, None)
     if not buf:
         return "", []
@@ -152,26 +155,40 @@ def _flush_recent_context_buffer(chat_key: str) -> Tuple[str, List[str]]:
     parts: List[str] = []
     images: List[str] = []
     img_counter = 0
+    last_item = buf[-1] if buf else None
+
     for item in buf:
         item_images = list(item.get("images") or [])
         text = str(item.get("text") or "").strip()
         if not text and item_images:
             text = " ".join(f"[图片{i + 1}]" for i in range(len(item_images)))
 
-        for i in range(len(item_images)):
-            img_counter += 1
-            marker = f"[图片{i + 1}]"
-            replacement = f"[图片{img_counter}]"
-            if marker in text:
-                text = text.replace(marker, replacement, 1)
-            else:
-                text = f"{text} {replacement}".strip()
+        # 仅保留最后一条消息或触发者本人的图片
+        keep_images = (
+            item is last_item
+            or (trigger_sender and item.get("sender") == trigger_sender)
+        )
 
-        if not text and not item_images:
+        if keep_images and item_images:
+            for i in range(len(item_images)):
+                img_counter += 1
+                marker = f"[图片{i + 1}]"
+                replacement = f"[图片{img_counter}]"
+                if marker in text:
+                    text = text.replace(marker, replacement, 1)
+                else:
+                    text = f"{text} {replacement}".strip()
+            images.extend(item_images)
+        elif item_images:
+            # 不保留图片时，移除文本中的图片标记
+            for i in range(len(item_images)):
+                marker = f"[图片{i + 1}]"
+                text = text.replace(marker, "").strip()
+
+        if not text:
             continue
         ts = time.strftime('%H:%M', time.localtime(float(item.get("timestamp") or time.time())))
         parts.append(f"[{ts}] {item.get('sender') or 'anonymous'}: {text}")
-        images.extend(item_images)
 
     return "\n".join(parts), images
 
@@ -659,23 +676,6 @@ def _save_debug_log(chat_key: str, prompt: List[Dict[str, Any]], response: str,
                     tool_messages: List[Dict[str, Any]], reasoning: str,
                     cost_tokens: int, success: bool) -> None:
     """保存每个群最近一次 LLM 请求/响应到 JSON 文件"""
-    # turbo 模式下给画图工具调用补上 neg，使日志完整反映实际发送参数
-    if tool_messages and chat_key:
-        from .llm_tool_plugins import anima_generate as _ag
-        if _ag.get_turbo_mode(chat_key):
-            _TURBO_DEFAULT_NEG = "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, bad anatomy, bad hands, bad feet, extra fingers, missing fingers, extra toes, text, watermark, logo"
-            for msg in tool_messages:
-                for tc in (msg.get("tool_calls") or []):
-                    fn = tc.get("function", {})
-                    if fn.get("name") == "generate_anima_image":
-                        try:
-                            args = json.loads(fn.get("arguments", "{}"))
-                            if not args.get("neg"):
-                                args["neg"] = _TURBO_DEFAULT_NEG
-                                fn["arguments"] = json.dumps(args, ensure_ascii=False)
-                        except Exception:
-                            pass
-
     log_dir = Path(config.NG_LOG_PATH)
     log_dir.mkdir(parents=True, exist_ok=True)
     safe_key = chat_key.replace("/", "_").replace("\\", "_")
@@ -730,24 +730,6 @@ def _save_error_log(chat_key: str, prompt: List[Dict[str, Any]], response: str,
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning(f"保存 error 日志失败: {e!r}")
-
-
-
-def _estimate_cache_hit_tokens(prompt: List[Dict[str, Any]], tg: TextGenerator) -> int:
-    """估算 prompt 前缀可命中的缓存 token 数。前 2 条 system 消息在同会话内稳定。"""
-    if len(prompt) < 2:
-        return 0
-    # 取前 2 条 system 消息的 token 数作为稳定前缀
-    prefix_text_parts: List[str] = []
-    for msg in prompt[:2]:
-        content = msg.get("content")
-        if isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    prefix_text_parts.append(str(item.get("text") or ""))
-        elif content is not None:
-            prefix_text_parts.append(str(content))
-    return tg.cal_token_count("\n".join(prefix_text_parts)) if prefix_text_parts else 0
 
 
 def _strip_think_tags(text: str) -> Tuple[str, str]:
@@ -954,7 +936,7 @@ async def do_msg_response(
     # 将缓冲区的非触发消息和中断回复合并为一条 context_only 消息注入。
     # 放在节流之后，确保触发消息附近新出现的非触发群聊也能进入本轮 prompt。
     legacy_context, legacy_images = chat.flush_context_buffer()
-    recent_context, recent_images = _flush_recent_context_buffer(chat_key)
+    recent_context, recent_images = _flush_recent_context_buffer(chat_key, trigger_sender=sender_name)
     buffered_context = "\n".join(part for part in [legacy_context, recent_context] if part)
     buffered_images = legacy_images + recent_images
     interrupted = chat.pop_interrupted_response()
@@ -984,30 +966,11 @@ async def do_msg_response(
     _DRAWING_KEYWORDS = ("画", "draw", "改图", "重画", "来一张", "整一张")
     _has_draw_request = any(kw in (trigger_text or "").lower() for kw in _DRAWING_KEYWORDS)
 
-    # 提取触发消息中 @或昵称提到的用户 ID，用于附带其个人印象
-    mentioned_userids: List[str] = []
-    if event and isinstance(event, MessageEvent):
-        # 从原始消息提取 @段（event.message 可能已被 _check_reply/_check_at_me 修改）
-        _orig_msg = getattr(event, 'original_message', None) or event.message
-        for seg in _orig_msg:
-            if seg.type == "at":
-                qq = str(seg.data.get("qq", ""))
-                if qq and qq != "all" and qq != str(bot.self_id):
-                    mentioned_userids.append(qq)
-    # 从触发文本匹配已知用户的群昵称
-    if trigger_text and chat.chat_preset.chat_impressions:
-        _text_lower = trigger_text.lower()
-        for uid, imp_data in chat.chat_preset.chat_impressions.items():
-            if uid == trigger_userid or uid in mentioned_userids:
-                continue
-            nick = (imp_data.nickname or "").strip()
-            if nick and len(nick) >= 2 and nick.lower() in _text_lower:
-                mentioned_userids.append(uid)
-    if mentioned_userids and config.DEBUG_LEVEL > 0:
-        logger.info(f"触发消息提到的用户: {mentioned_userids}")
-
     # 生成对话 prompt 模板
-    prompt_template = await chat.get_chat_prompt_template(userid=trigger_userid, chat_type=chat_type, has_draw_request=_has_draw_request, mentioned_userids=mentioned_userids or None)
+    # 个人印象不再根据触发句中提到的角色逐个列出，而是固定只注入触发者的印象：
+    # 由 update_chat_history_row 在触发消息前按需注入一条印象 system，绑定到该轮，
+    # 随轮次一同裁剪/摘要，保证一个角色印象只注入一次且历史前缀稳定命中缓存。
+    prompt_template = await chat.get_chat_prompt_template(userid=trigger_userid, chat_type=chat_type, has_draw_request=_has_draw_request)
 
     # 注册 Anima 发送上下文，供后台作画任务完成后直接通过 OneBot 发送图片
     from .llm_tool_plugins import anima_generate
@@ -1025,12 +988,10 @@ async def do_msg_response(
     tg._current_trigger_userid = trigger_userid  # 设置当前用户id供工具使用
     request_profile = _snapshot_request_profile(chat)
     text_tokens, prompt_image_count = _count_prompt_text_and_images(prompt_template, tg)
-    cache_hit_tokens = _estimate_cache_hit_tokens(prompt_template, tg)
     logger.info(
         f"触发回复 | 会话: {chat_key} | 预设: {chat.preset_key} | "
         f"原因: {','.join(reply_reasons) or 'unknown'} | "
-        f"tokens: {text_tokens} + {prompt_image_count}图 | "
-        f"缓存命中: ~{cache_hit_tokens} tokens"
+        f"tokens: {text_tokens} + {prompt_image_count}图"
     )
     def _content_to_log_str(content: Any) -> str:
         if isinstance(content, list):
@@ -1059,6 +1020,9 @@ async def do_msg_response(
     _in_think = False          # 是否正在 <think> 块内
     _think_buffer = ""          # 当前思考块的累积内容
     _extracted_reasoning = ""   # 从 content 中提取的完整思考内容
+    _thinking_mode = bool(request_profile.get("thinking", True))  # 该 profile 是否为思考模式（默认开启）
+    _saw_reasoning = False      # 本次是否收到过 reasoning_content（模型走了正常思考通道）
+    _skip_think_buffer_mode = False  # 模型跳过思考标签、content 可能混入思考时，收完再发避免泄漏
 
     async def send_segment(segment: str) -> None:
         nonlocal sent_segments, last_send_time
@@ -1081,7 +1045,7 @@ async def do_msg_response(
         last_send_time = time.time()
 
     async def on_text_chunk(chunk: str) -> None:
-        nonlocal stream_buffer, _think_buffer, _in_think
+        nonlocal stream_buffer, _think_buffer, _in_think, _skip_think_buffer_mode
         raw_parts.append(chunk)
         # 实时拦截 <think>...</think> 标签（Grok 等模型在 content 中返回思考内容）
         _think_buffer_local = _think_buffer
@@ -1115,6 +1079,18 @@ async def do_msg_response(
                     # 无 think 标签，正常输出
                     stream_buffer += remaining
                     remaining = ""
+        # 思考模式兜底：模型跳过思考（无 reasoning_content 且无 <think> 标签）却直接输出 content，
+        # 说明思考过程可能混入 content。此时收完再发，避免思考被分段泄漏到群里。
+        if (
+            _thinking_mode
+            and not _saw_reasoning
+            and not _extracted_reasoning
+            and not _in_think
+            and stream_buffer
+        ):
+            _skip_think_buffer_mode = True
+        if _skip_think_buffer_mode:
+            return  # 收完再发：全部缓冲到 stream_buffer，流结束后统一处理
         if not config.NG_ENABLE_MSG_SPLIT:
             return
         while sent_segments < max(1, config.REPLY_MAX_SEGMENTS) - 1 and "\n\n" in stream_buffer:
@@ -1122,6 +1098,8 @@ async def do_msg_response(
             await send_segment(segment)
 
     async def on_reasoning_chunk(chunk: str) -> None:
+        nonlocal _saw_reasoning
+        _saw_reasoning = True  # 记录模型走了正常思考通道，content 即纯回复，无需收完再发兜底
         if config.LLM_SHOW_REASONING:
             await on_text_chunk(chunk)
 
@@ -1145,8 +1123,21 @@ async def do_msg_response(
                 failure_cost = tg.cal_token_count(str(prompt_template) + str(raw_res or ""))
                 _save_error_log(chat_key, prompt_template, str(raw_res or ""), tool_messages, reasoning_content, failure_cost)
 
-            # 成功时不再重试
+            # 成功时检查是否含有工具调用 XML 泄漏
             if success:
+                if contains_tool_call_xml(raw_res or "") and _retry < MAX_RETRIES:
+                    logger.warning(f"模型在 content 中输出了工具调用 XML（第 {_retry + 1} 次），清理并重试...")
+                    raw_parts.clear()
+                    stream_buffer = ""
+                    sent_segments = 0
+                    prompt_template.append({
+                        "role": "system",
+                        "content": (
+                            "你刚才在回复文本中输出了工具调用的 XML 标签（如 <function_calls>）而非使用 system 的 tool_calls 接口。"
+                            "调用工具时必须使用 tool_calls，禁止在 content 中输出 <function_calls>、<invoke>、<parameter> 等 XML 标签。重新回复。"
+                        ),
+                    })
+                    continue
                 break
 
             # 空响应（token 超限兜底）：清理上下文后重试一次
@@ -1163,7 +1154,6 @@ async def do_msg_response(
                     chat_type=chat_type,
                     include_images=False,
                     has_draw_request=_has_draw_request,
-                    mentioned_userids=mentioned_userids or None,
                 )
                 continue
 
@@ -1201,8 +1191,19 @@ async def do_msg_response(
                 chat_type=chat_type,
                 include_images=False,
                 has_draw_request=_has_draw_request,
-                mentioned_userids=mentioned_userids or None,
             )
+
+        # 回复完成日志：合并缓存命中和 token 统计
+        _usage = getattr(tg, "_last_stream_usage", None) or {}
+        _prompt_t = _usage.get("prompt_tokens", 0) or 0
+        _cached_t = (_usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
+        _comp_t = _usage.get("completion_tokens", 0) or 0
+        _total_t = _usage.get("total_tokens", 0) or 0
+        _ratio = f"{_cached_t / _prompt_t * 100:.0f}%" if _prompt_t > 0 else "N/A"
+        logger.info(
+            f"回复完成 | 会话: {chat_key} | "
+            f"prompt={_prompt_t} cached={_cached_t}({_ratio}) completion={_comp_t} total={_total_t}"
+        )
 
         # 工具产生的图片（如pixiv搜图）始终发送，不受后续错误影响
         for tool_output in tg.consume_tool_outputs(chat_key):
@@ -1267,6 +1268,16 @@ async def do_msg_response(
                 raw_res_for_save, _ = _strip_think_tags(raw_res_for_save)
                 if is_model_request_error_text(raw_res_for_save):
                     raw_res_for_save = ""
+                # 思考泄漏兜底（失败路径）：避免思考内容随部分回复进入对话历史
+                if _skip_think_buffer_mode and not reasoning_content and raw_res_for_save:
+                    _candidate = raw_res_for_save.strip()
+                    _threshold = int(getattr(config, "THINK_LEAK_THRESHOLD", 300))
+                    if len(_candidate) > _threshold and "\n\n" in _candidate:
+                        _parts = _candidate.rsplit("\n\n", 1)
+                        _leaked = _parts[0].strip()
+                        _reply = _parts[1].strip() if len(_parts) > 1 else ""
+                        if _leaked and _reply:
+                            raw_res_for_save = _reply
             if raw_res_for_save:
                 await chat.update_chat_history_row(sender=chat.preset_key, msg=raw_res_for_save, require_summary=False, record_time=False, is_bot_reply=True)
                 if config.DEBUG_LEVEL > 0:
@@ -1315,6 +1326,25 @@ async def do_msg_response(
         if think_reasoning and not reasoning_content:
             reasoning_content = think_reasoning
 
+        # 思考泄漏兜底：模型跳过思考标签，把思考过程混入 content（无 reasoning_content 也无 <think> 标签）。
+        # 此时 stream_buffer 为全部 content（收完再发模式下未分段发送），取最后一个 \n\n 后的部分作为实际回复，
+        # 前段视为思考存入 reasoning_content（仅用于 debug 日志，不进入历史、不发送到群里）。
+        if _skip_think_buffer_mode and not reasoning_content:
+            candidate = (raw_res or stream_buffer).strip()
+            threshold = int(getattr(config, "THINK_LEAK_THRESHOLD", 300))
+            if len(candidate) > threshold and "\n\n" in candidate:
+                parts = candidate.rsplit("\n\n", 1)
+                leaked = parts[0].strip()
+                reply = parts[1].strip() if len(parts) > 1 else ""
+                if leaked and reply:
+                    reasoning_content = leaked
+                    raw_res = reply
+                    stream_buffer = reply
+                    logger.info(
+                        f"[思考泄漏兜底] 检测到 content 混入思考({len(leaked)}字)，"
+                        f"已截取最后一段作为回复({len(reply)}字)"
+                    )
+
         if stream_buffer:
             await send_segment(stream_buffer)
 
@@ -1327,6 +1357,13 @@ async def do_msg_response(
 
         # 保存 debug 日志（每个群最近一次请求/响应）
         _save_debug_log(chat_key, prompt_template, raw_res, tool_messages, reasoning_content, cost_token, success)
+
+        # 统计触发回复次数（成功且非空才计数）
+        try:
+            from .stats import stats
+            stats.inc_trigger()
+        except Exception:
+            pass
         
         # 保存工具调用消息到内存（不持久化）
         if tool_messages:
@@ -1345,6 +1382,30 @@ async def do_msg_response(
         await chat.update_chat_history_row_for_user(sender=chat.preset_key, msg=raw_res, userid=trigger_userid, username=sender_name, require_summary=True)
         PersistentDataManager.instance.save_to_file()
         if config.DEBUG_LEVEL > 0: logger.info(f"对话响应完成 | 耗时: {time.time() - sta_time}s")
+        
+        # 漫画模式：增加轮数计数，检查是否需要自动画图
+        from .llm_tool_plugins import anima_generate
+        anima_generate.increment_manga_round(chat_key)
+        
+        _draw_mode = anima_generate.get_chat_mode(chat_key)
+        _is_manga = anima_generate.get_manga_mode(chat_key)
+        
+        # manga + force + 画图关键词 + 本轮未画 → 直接用 mini 模型强制画图
+        if _is_manga and _draw_mode == "force" and _has_draw_request:
+            _drew_this_round = False
+            if tool_messages:
+                for tm in tool_messages:
+                    if isinstance(tm, dict):
+                        for tc in tm.get("tool_calls", []):
+                            if isinstance(tc, dict) and tc.get("function", {}).get("name") == "generate_anima_image":
+                                _drew_this_round = True
+                                break
+            if not _drew_this_round:
+                logger.info(f"[漫画强制画图] 群 {chat_key} manga+force 模式，触发句含画图关键词但本轮未画，强制画图")
+                anima_generate.mark_manga_drawn(chat_key)
+                asyncio.create_task(anima_generate.manga_idle_draw(chat_key, chat, config, bot))
+        elif anima_generate.should_inject_manga_idle(chat_key):
+            asyncio.create_task(anima_generate.manga_idle_draw(chat_key, chat, config, bot))
         
         # 检查是否有待合并的输入
         pending_input = tg.get_pending_merge_input(chat_key)

@@ -167,3 +167,5 @@ data/source/
 _temp_*.py
 export_group_chat.py
 test_llm_request.py
+
+nonebot_plugin_dice

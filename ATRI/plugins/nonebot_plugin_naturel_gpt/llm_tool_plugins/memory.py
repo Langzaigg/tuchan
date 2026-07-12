@@ -9,6 +9,14 @@ schema = {
             "你应该积极使用此工具，不要等到用户明确要求才记录。"
             "当对话中出现以下情况时应立即调用：用户提到自己的名字、称呼、偏好、习惯、生日等个人信息；"
             "群内讨论的规则、约定、重要决定、共同话题；任何你觉得以后会用到的关键信息。宁可多记不可遗漏。"
+            "\n\n"
+            "【关键规则】当用户明确要求记忆相关操作时，必须立即调用本工具，不得有任何延迟或推诿：\n"
+            "- 用户说\"记住…\"\"记下…\"\"帮我记住…\"\"别忘了…\"\"保存这个…\"等 → 立即 save\n"
+            "- 用户说\"忘记…\"\"忘掉…\"\"删除记忆…\"\"把…删了\"等 → 立即 delete 或 consolidate\n"
+            "- 用户说\"把记忆改一下\"\"更新我的XX\"\"XX不需要了\"等 → 立即 save 更新或 delete 删除\n"
+            "注意：用户说\"记住\"时，要区分是指\"请你记住\"（save到记忆）还是\"我记得…\"（回忆性陈述）。如果是前者，立即调用本工具。\n"
+            "多个记忆同时操作时优先使用 consolidate 一次性批量完成。"
+            "\n\n"
             "scope 选择：个人信息用 user，群信息用 group。"
             "consolidate 操作用于批量增删记忆：当需要同时修改多条记忆、合并去重或精简时使用，不受条数上限限制。"
         ),
@@ -67,12 +75,8 @@ def _get_memories(chat, preset, scope: str, trigger_userid: str = None) -> Dict[
     if scope == "user":
         if not trigger_userid:
             return {}
-        if chat.chat_data.global_memory_enabled:
-            from ..persistent_data_manager import PersistentDataManager
-            return PersistentDataManager.instance.get_global_user_memories(trigger_userid)
-        if trigger_userid not in preset.user_memories:
-            preset.user_memories[trigger_userid] = {}
-        return preset.user_memories[trigger_userid]
+        from ..persistent_data_manager import PersistentDataManager
+        return PersistentDataManager.instance.get_global_user_memories(trigger_userid)
     if chat.chat_data.global_memory_enabled:
         return chat.chat_data.global_chat_memory
     return preset.chat_memory
@@ -82,11 +86,8 @@ def _set_memories(chat, preset, scope: str, memories: Dict[str, str], trigger_us
     if scope == "user":
         if not trigger_userid:
             return
-        if chat.chat_data.global_memory_enabled:
-            from ..persistent_data_manager import PersistentDataManager
-            PersistentDataManager.instance.set_global_user_memories(trigger_userid, memories)
-        else:
-            preset.user_memories[trigger_userid] = memories
+        from ..persistent_data_manager import PersistentDataManager
+        PersistentDataManager.instance.set_global_user_memories(trigger_userid, memories)
     else:
         if chat.chat_data.global_memory_enabled:
             chat.chat_data.global_chat_memory.clear()

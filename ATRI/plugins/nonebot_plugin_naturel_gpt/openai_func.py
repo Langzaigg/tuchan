@@ -32,6 +32,25 @@ _INTERNAL_CONTROL_PATTERNS = (
 )
 _MODEL_REQUEST_ERROR_PREFIX = "请求大模型时发生错误:"
 
+# 工具调用 XML 泄漏检测（模型可能在 content 中输出 <function_calls> 或 <tool_call> 格式）
+_TOOL_CALL_XML_RE = re.compile(
+    r'<(?:function_calls|tool_call)[\s>].*?</(?:function_calls|tool_call)>',
+    re.DOTALL,
+)
+
+
+def contains_tool_call_xml(content: str) -> bool:
+    """检测文本中是否包含工具调用 XML 标签（模型在 content 中输出 tool_calls 格式）。"""
+    return bool(_TOOL_CALL_XML_RE.search(content))
+
+
+def strip_tool_call_xml(content: str) -> str:
+    """移除文本中的工具调用 XML 标签及其残留。"""
+    content = _TOOL_CALL_XML_RE.sub('', content)
+    content = re.sub(r'<(?:invoke|parameter)[^>]*>', '', content)
+    return _normalize_draw_cleanup(content)
+
+
 # 伪造任务编号检测正则
 # 匹配带前缀的格式（任务编号/单号 + 可选分隔符 + 可选markdown加粗 + 可选draw- + 6位字母数字）
 _FAKE_TASK_ID_PREFIX_RE = re.compile(
@@ -66,8 +85,8 @@ def sanitize_internal_control_text(content: str) -> str:
     content = content.replace(_SEARCH_TOOL_LIMIT_TEXT, "")
     for pattern in _INTERNAL_CONTROL_PATTERNS:
         content = pattern.sub("", content)
-    # 过滤 LLM 输出的 tool_call XML 标签（模型可能在 content 中输出 tool_call 格式）
-    content = re.sub(r'<tool_call>.*?</tool_call>', '', content, flags=re.DOTALL)
+    # 过滤 LLM 输出的工具调用 XML 标签（模型可能在 content 中输出 function_calls 或 tool_call 格式）
+    content = _TOOL_CALL_XML_RE.sub('', content)
     return _normalize_draw_cleanup(content)
 
 
@@ -104,6 +123,13 @@ def _clean_fake_task_ids(content: str, warn: bool = False) -> str:
     return _normalize_draw_cleanup(content)
 
 
+_FAKE_DRAW_PATTERNS = [
+    re.compile(r'\d+\s*秒出图'),        # "82秒出图" "178 秒出图"
+    re.compile(r'编号.{0,6}(系统|返回|等)'),  # "编号等系统返回" "编号和图一起出来"
+    re.compile(r'(系统|返回).{0,6}编号'),
+]
+
+
 def _contains_fake_draw_reply(content: str) -> bool:
     """判断模型是否在未调用画图工具时伪造了画图确认信息。"""
     return bool(
@@ -112,6 +138,10 @@ def _contains_fake_draw_reply(content: str) -> bool:
         or _TASK_ID_PLACEHOLDER_RE.search(content)
         or _TASK_ID_PLACEHOLDER in content
         or "generate_anima_image" in content
+        or ("任务编号" in content and "工具" in content)
+        or ("任务编号" in content and "返回" in content)
+        or "在画了" in content
+        or any(p.search(content) for p in _FAKE_DRAW_PATTERNS)
     )
 
 
@@ -189,6 +219,7 @@ class TextGenerator(Singleton["TextGenerator"]):
         self._current_chat_key: str = ""  # 当前会话的chat_key，供工具使用
         self._current_trigger_userid: str = ""  # 当前触发用户的userid，供工具使用
         self._pending_merge_input: Dict[str, Dict[str, Any]] = {}  # chat_key → 待合并的输入
+        self._last_stream_usage: Optional[Dict[str, Any]] = None  # 最近一次流式请求的 usage 信息
 
     @property
     def _current_chat_key(self) -> str:
@@ -307,9 +338,29 @@ class TextGenerator(Singleton["TextGenerator"]):
     ) -> Dict[str, Any]:
         state = request_state or self._request_state()
         request_config = state.get("config") or self.config
+        # 为 API 请求准备消息副本：清理非标准字段，并确保 assistant tool_calls 消息 content 非空
+        # 避免 provider（如 Moonshot）因空 content 或 reasoning_content 拒绝多轮工具调用
+        api_messages: List[Dict[str, Any]] = []
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                needs_copy = False
+                c = msg.get("content")
+                # 剥离非标准响应侧字段 reasoning_content，避免 provider 拒绝
+                if "reasoning_content" in msg:
+                    needs_copy = True
+                # assistant 消息 content 不能为空（Moonshot 等 provider 会 400）
+                if c is None or (isinstance(c, str) and not c.strip()):
+                    needs_copy = True
+                if needs_copy:
+                    msg = dict(msg)
+                    msg.pop("reasoning_content", None)
+                    c = msg.get("content")
+                    if c is None or (isinstance(c, str) and not c.strip()):
+                        msg["content"] = "[无内容]"
+            api_messages.append(msg)
         # 当前 profile 不支持多模态时，剥离 image_url 内容
         if not state.get("multimodal", True):
-            for msg in messages:
+            for msg in api_messages:
                 content = msg.get("content")
                 if isinstance(content, list):
                     text_parts = []
@@ -327,12 +378,13 @@ class TextGenerator(Singleton["TextGenerator"]):
         model_name = request_config.get(model_key, "") or request_config.get("model", "")
         kwargs: Dict[str, Any] = {
             "model": model_name,
-            "messages": messages,
-            "max_tokens": request_config.get("max_summary_tokens" if type in {"summarize", "impression"} else "max_tokens", 1024),
+            "messages": api_messages,
             "timeout": request_config.get("timeout", 30),
             "stream": stream,
             "api_key": state.get("api_key", ""),
         }
+        if type not in {"summarize", "impression"}:
+            kwargs["max_tokens"] = request_config.get("max_tokens", 1024)
         for optional_key in ("temperature", "top_p", "frequency_penalty", "presence_penalty"):
             value = request_config.get(optional_key)
             if value is not None:
@@ -482,6 +534,7 @@ class TextGenerator(Singleton["TextGenerator"]):
             "model": model,
             "messages": messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
 
         if "temperature" in kwargs:
@@ -547,10 +600,15 @@ class TextGenerator(Singleton["TextGenerator"]):
         content_parts: List[str] = []
         reasoning_parts: List[str] = []
         tool_call_chunks: Dict[int, Dict[str, Any]] = {}
+        last_usage: Optional[Dict[str, Any]] = None
 
         async for chunk in self._stream_iter_openai(kwargs):
             choices = _get(chunk, "choices", [])
             if not choices:
+                # 空 choices 可能是携带 usage 的最终 chunk
+                usage = _get(chunk, "usage")
+                if usage:
+                    last_usage = usage
                 continue
             delta = _get(choices[0], "delta", {})
 
@@ -587,9 +645,21 @@ class TextGenerator(Singleton["TextGenerator"]):
                 if _get(function, "arguments"):
                     state["function"]["arguments"] += str(_get(function, "arguments"))
 
+            # 某些 provider 在最后一个 choice chunk 中携带 usage
+            usage = _get(chunk, "usage")
+            if usage:
+                last_usage = usage
+
+        self._last_stream_usage = last_usage
+        # 统计本次请求的 token 消耗（按实际模型名分桶）
+        try:
+            from .stats import stats
+            stats.record_model_usage(kwargs.get("model"), last_usage)
+        except Exception:
+            pass
         return (
             "".join(content_parts),
-            [v for _, v in sorted(tool_call_chunks.items()) if v["function"]["name"]],
+            [v for _, v in sorted(tool_call_chunks.items()) if v["function"]["name"] or v.get("id")],
             "".join(reasoning_parts),
         )
 
@@ -606,6 +676,14 @@ class TextGenerator(Singleton["TextGenerator"]):
         message_dict = _message_to_dict(message)
         content = str(message_dict.get("content") or "")
         tool_calls = message_dict.get("tool_calls") or []
+        # 统计非流式请求的 token 消耗
+        usage = _get(response, "usage")
+        self._last_stream_usage = usage
+        try:
+            from .stats import stats
+            stats.record_model_usage(kwargs.get("model"), usage)
+        except Exception:
+            pass
         return content, tool_calls, message_dict
 
     async def _execute_tool_calls(self, messages: List[Dict[str, Any]], tool_calls: List[Dict[str, Any]], plugin_config) -> None:
@@ -622,8 +700,19 @@ class TextGenerator(Singleton["TextGenerator"]):
             tool_call_id = _get(tool_call, "id", "") or ""
             if not tool_call_id:
                 tool_call_id = f"call_{idx}"
-            tool_content, attachments = await execute_tool(name, args, plugin_config)
-            logger.info(f"[工具返回] {name} → {tool_content[:200]}{'...' if len(tool_content) > 200 else ''}")
+            # 统计工具调用次数（无论成功失败）
+            try:
+                from .stats import stats
+                stats.inc_tool_call(name)
+            except Exception:
+                pass
+            try:
+                tool_content, attachments = await execute_tool(name, args, plugin_config)
+                logger.info(f"[工具返回] {name} → {tool_content[:200]}{'...' if len(tool_content) > 200 else ''}")
+            except Exception as e:
+                logger.error(f"[工具调用失败] {name}(tool_call_id={tool_call_id}): {e}")
+                tool_content = f"工具调用失败: {e}"
+                attachments = []
             chat_key = self._current_chat_key
             if chat_key:
                 if not hasattr(self, "_last_tool_outputs_by_chat"):
@@ -680,11 +769,17 @@ class TextGenerator(Singleton["TextGenerator"]):
         # 获取画图模式并决定工具注入和拦截策略
         from .llm_tool_plugins import anima_generate as _ag
         _draw_mode = _ag.get_chat_mode(request_chat_key) if request_chat_key else "auto"
-        if _draw_mode == "auto" and not _has_draw_request:
-            # auto 模式：无画图关键词时过滤掉画图工具
+        _is_manga = _ag.get_manga_mode(request_chat_key) if request_chat_key else False
+        if _is_manga:
+            # 漫画模式：始终启用画图工具，不拦截（不需要任务编号保护）
+            _enable_intercept = False
+        elif _draw_mode == "off" or (_draw_mode == "auto" and not _has_draw_request):
+            # off 模式或 auto 无画图关键词：过滤掉画图工具
             tool_schemas = [s for s in tool_schemas if s.get("function", {}).get("name") != "generate_anima_image"]
-        # force 模式：画图关键词时启用拦截；其他模式不拦截
-        _enable_intercept = (_draw_mode == "force" and _has_draw_request)
+            _enable_intercept = False
+        else:
+            # force 模式：画图关键词时启用拦截；其他模式不拦截
+            _enable_intercept = (_draw_mode == "force" and _has_draw_request)
         # force 模式 + 画图关键词：预先注入引导消息，减少模型编造编号的概率
         if _enable_intercept:
             messages.append({
@@ -780,6 +875,24 @@ class TextGenerator(Singleton["TextGenerator"]):
                         content, tool_calls, reasoning_content = await self._stream_once(
                             messages, type, current_tools, effective_on_text, round_on_reasoning, request_state
                         )
+                    # 过滤参数 JSON 不完整的 tool_calls（流式截断导致），让模型重试
+                    if tool_calls:
+                        _valid_tool_calls = []
+                        for tc in tool_calls:
+                            raw_args = _get(tc, "function", {}).get("arguments", "")
+                            try:
+                                json.loads(raw_args) if isinstance(raw_args, str) and raw_args.strip() else raw_args
+                                _valid_tool_calls.append(tc)
+                            except (json.JSONDecodeError, ValueError):
+                                func_name = _get(tc, "function", {}).get("name", "?")
+                                logger.warning(f"[工具调用] 丢弃参数不完整的 tool_call: {func_name}({raw_args!r})")
+                        if len(_valid_tool_calls) < len(tool_calls):
+                            if not _valid_tool_calls:
+                                # 全部丢弃，注入提示让模型重新调用
+                                tool_calls = []
+                                messages.append({"role": "system", "content": "你刚才的工具调用参数不完整（JSON 截断），请重新调用。"})
+                                continue
+                            tool_calls = _valid_tool_calls
                     if not tool_calls:
                         final_reasoning_content = reasoning_content or ""
                         raw_merged = _join_intermediate(content)
@@ -818,11 +931,14 @@ class TextGenerator(Singleton["TextGenerator"]):
                                     await on_text(safe_text)
                         elif control_stream_buf is not None:
                             await _flush_control_stream_buffer()
-                        # 思考或回复中提到画图工具但未实际调用：注入提示强制重试
+                        # 思考或回复中提到画图工具但未实际调用：注入提示强制重试（漫画模式不强制）
+                        # 仅在工具实际可用时检查：auto+无画图关键词时工具已从 schemas 中过滤，不误判
+                        _draw_tool_available = _draw_mode not in ("off",) and (_draw_mode != "auto" or _has_draw_request)
                         if (
                             not _thinking_check_done
                             and not has_anima_call
-                            and _draw_mode != "off"
+                            and not _is_manga
+                            and _draw_tool_available
                             and (
                                 (reasoning_content and "generate_anima_image" in reasoning_content)
                                 or (content and "generate_anima_image" in content)
@@ -879,6 +995,23 @@ class TextGenerator(Singleton["TextGenerator"]):
                     tool_messages.append(assistant_msg)
                 else:
                     content, tool_calls, message_dict = await self._complete_once(messages, type, current_tools, request_state)
+                    # 过滤参数 JSON 不完整的 tool_calls
+                    if tool_calls:
+                        _valid_tool_calls = []
+                        for tc in tool_calls:
+                            raw_args = _get(tc, "function", {}).get("arguments", "")
+                            try:
+                                json.loads(raw_args) if isinstance(raw_args, str) and raw_args.strip() else raw_args
+                                _valid_tool_calls.append(tc)
+                            except (json.JSONDecodeError, ValueError):
+                                func_name = _get(tc, "function", {}).get("name", "?")
+                                logger.warning(f"[工具调用] 丢弃参数不完整的 tool_call: {func_name}({raw_args!r})")
+                        if len(_valid_tool_calls) < len(tool_calls):
+                            if not _valid_tool_calls:
+                                tool_calls = []
+                                messages.append({"role": "system", "content": "你刚才的工具调用参数不完整（JSON 截断），请重新调用。"})
+                                continue
+                            tool_calls = _valid_tool_calls
                     if not tool_calls:
                         # 检测伪造任务编号并重试（拦截不发送）
                         # 仅在工具仍可用时拦截（非最后一轮），最后一轮模型无法调工具则跳过
@@ -900,11 +1033,14 @@ class TextGenerator(Singleton["TextGenerator"]):
                                 })
                                 continue
                         final_reasoning_content = message_dict.get("reasoning_content", "")
-                        # 思考或回复中提到画图工具但未实际调用：注入提示强制重试
+                        # 思考或回复中提到画图工具但未实际调用：注入提示强制重试（漫画模式不强制）
+                        # 仅在工具实际可用时检查：auto+无画图关键词时工具已从 schemas 中过滤，不误判
+                        _draw_tool_available = _draw_mode not in ("off",) and (_draw_mode != "auto" or _has_draw_request)
                         if (
                             not _thinking_check_done
                             and not has_anima_call
-                            and _draw_mode != "off"
+                            and not _is_manga
+                            and _draw_tool_available
                             and (
                                 (final_reasoning_content and "generate_anima_image" in final_reasoning_content)
                                 or (content and "generate_anima_image" in content)
@@ -958,6 +1094,8 @@ class TextGenerator(Singleton["TextGenerator"]):
                         round_idx = max_rounds
                         _allow_terminal_tools = True
                         continue
+                    # 确保 message_dict 只包含过滤后的 tool_calls（与 _execute_tool_calls 使用的一致）
+                    message_dict["tool_calls"] = tool_calls
                     messages.append(message_dict)
                     tool_messages.append(message_dict)
 

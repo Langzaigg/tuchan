@@ -16,12 +16,8 @@ class ChatMemoryMixin:
         return self.chat_preset.chat_memory
 
     def _get_user_memory(self, userid: str) -> Dict[str, str]:
-        """获取当前有效的用户记忆（global 或按人格）。"""
-        if self._chat_data.global_memory_enabled:
-            return PersistentDataManager.instance.get_global_user_memories(userid)
-        if userid not in self.chat_preset.user_memories:
-            self.chat_preset.user_memories[userid] = {}
-        return self.chat_preset.user_memories[userid]
+        """获取当前有效的用户记忆（固定全群全人格共享）。"""
+        return PersistentDataManager.instance.get_global_user_memories(userid)
 
     def set_memory(self, mem_key: str, mem_value: str = '') -> None:
         """为当前预设设置记忆，支持智能淘汰"""

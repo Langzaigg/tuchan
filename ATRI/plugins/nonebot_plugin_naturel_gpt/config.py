@@ -141,6 +141,8 @@ class Config(BaseModel, extra=Extra.ignore):
     """分段消息发送最短间隔秒数"""
     REPLY_MAX_SEGMENTS: int
     """单次回复最多分段数，最后一段会接收剩余流式内容"""
+    THINK_LEAK_THRESHOLD: int
+    """思考泄漏兜底阈值：思考模式下模型跳过思考标签、把思考混入 content 时，content 字符数超过此值且含双换行，则取最后一个\\n\\n之后的部分作为回复，前段视为思考"""
     NG_ENABLE_AWAKE_IDENTITIES: bool
     """是否允许自动唤醒其它人格"""
 
@@ -177,6 +179,11 @@ class Config(BaseModel, extra=Extra.ignore):
     COMFYUI_ENABLED: bool
     """ComfyUI Anima 画图是否开启，启动时自动 health check 后设置"""
 
+    MANGA_IDLE_MINUTES: int
+    """漫画模式下多少分钟未画图触发自动画图"""
+    MANGA_IDLE_ROUNDS: int
+    """漫画模式下多少轮对话未画图触发自动画图"""
+
     NAS_GAME_ROOT_PATH: str
     """NAS Galgame 合集根目录路径"""
     NAS_GAME_UPLOAD_PATH: str
@@ -187,7 +194,7 @@ class Config(BaseModel, extra=Extra.ignore):
     """NAS Galgame 合集功能白名单群号"""
 
     UNLOCK_CONTENT_LIMIT: bool
-    """解锁内容限制"""
+    """解锁内容限制（全局默认值；每群可通过 rg nolimit on/off 独立覆盖，持久化存储）"""
 
     GROUP_CARD:bool
     """优先读取群名片"""
@@ -266,6 +273,7 @@ CONFIG_TEMPLATE = {
     'NG_ENABLE_MSG_SPLIT': True,   # 是否启用消息分割
     'REPLY_SEGMENT_INTERVAL': 1.0,
     'REPLY_MAX_SEGMENTS': 5,
+    'THINK_LEAK_THRESHOLD': 150,  # 思考泄漏兜底阈值（字符数），思考模式下 content 超过此值且含双换行则只取最后一段
     'NG_ENABLE_AWAKE_IDENTITIES': True, # 是否允许自动唤醒其它人格
 
     'MULTIMODAL_ENABLE': True,
@@ -290,12 +298,15 @@ CONFIG_TEMPLATE = {
     'COMFYUI_BASE_URL': 'http://127.0.0.1:8188',
     'COMFYUI_ENABLED': False,
 
+    'MANGA_IDLE_MINUTES': 5,
+    'MANGA_IDLE_ROUNDS': 5,
+
     'NAS_GAME_ROOT_PATH': '',
     'NAS_GAME_UPLOAD_PATH': '',
     'NAS_GAME_BASE_URL': '',
     'NAS_GAME_WHITELIST_GROUPS': [],  # NAS Galgame 功能白名单群号，如 ['123456789', '987654321']
 
-    'UNLOCK_CONTENT_LIMIT': False,  # 解锁内容限制
+    'UNLOCK_CONTENT_LIMIT': False,  # 解锁内容限制（全局默认值，每群可通过 rg nolimit on/off 独立覆盖）
 
     'GROUP_CARD':True,
     'NG_CHECK_USER_NAME_HYPHEN': False,  # 检查用户名中的连字符

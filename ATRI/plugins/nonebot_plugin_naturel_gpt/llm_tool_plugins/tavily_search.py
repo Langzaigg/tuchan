@@ -156,7 +156,7 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
         "query": query,
         "max_results": 20,
         "include_answer": "advanced",
-        "search_depth": "basic",
+        "search_depth": "advanced",
     }
     headers = {
         "Authorization": f"Bearer {_active_api_key}",

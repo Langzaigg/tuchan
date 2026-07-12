@@ -135,6 +135,15 @@ class Chat(ChatMemoryMixin, ChatSummaryMixin, ChatHistoryMixin, ChatPromptMixin)
         """设置当前会话的 profile"""
         self._chat_data.active_profile = profile_name
 
+    def get_unlock_content_limit(self) -> bool:
+        """获取当前会话的内容限制解锁开关（None 时回退到配置默认值）"""
+        val = self._chat_data.unlock_content_limit
+        return bool(config.UNLOCK_CONTENT_LIMIT) if val is None else val
+
+    def set_unlock_content_limit(self, value: bool) -> None:
+        """设置当前会话的内容限制解锁开关"""
+        self._chat_data.unlock_content_limit = value
+
     def apply_profile(self) -> bool:
         """如果当前会话的 profile 与 TextGenerator 不同，切换并返回 True"""
         from .openai_func import TextGenerator
