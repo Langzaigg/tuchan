@@ -66,6 +66,10 @@ class ChatMessageData(StoreSerializable):
     tool_name: str = field(default="")
     reasoning_content: str = field(default="")
     tool_call_summary: str = field(default="")
+    # 印象 system 标记：表示本条 system 消息是某用户的个人印象，注入在该用户触发的 user 消息前。
+    # 同一用户在整个上下文中最多注入一次（首次触发时），随其绑定轮次一起被摘要/裁剪删除。
+    is_impression: bool = field(default=False)
+    impression_user_id: str = field(default="")
 
     @override
     def _init_from_dict(self, self_dict: Dict[str, Any]) -> Self:
@@ -89,6 +93,12 @@ class ChatMessageData(StoreSerializable):
         self.tool_name = str(getattr(self, "tool_name", "") or "")
         self.reasoning_content = str(getattr(self, "reasoning_content", "") or "")
         self.tool_call_summary = str(getattr(self, "tool_call_summary", "") or "")
+        self.is_impression = bool(getattr(self, "is_impression", False))
+        self.impression_user_id = str(getattr(self, "impression_user_id", "") or "")
+        # 印象 system 在内存中保留以服务当次运行；持久化时由 PresetData._serializable 过滤掉（不落盘）。
+        # 重启后历史轮的印象 system 丢失，下次该用户触发时按最新印象重新注入，避免旧印象残留。
+        if self.is_impression:
+            self.role = "system"
         return self
 
 
@@ -220,7 +230,10 @@ class ChatData(StoreSerializable):
     active_preset: str = field(default="")
     active_profile: str = field(default="")  # 当前会话使用的 OpenAI profile
     draw_mode: str = field(default="auto")  # 画图模式: force/on/auto/off
-    turbo_mode: bool = field(default=True)  # turbo 模式: True=turbo 工作流, False=普通工作流
+    draw_model: str = field(default="turbo")  # 画图模型: turbo/aesthetic/turbo2/base
+    manga_mode: str = field(default="off")  # 漫画模式: on/off（开启后覆盖 draw_model，固定使用 turbo）
+    manga_style: str = field(default="")    # 漫画模式自定义画风描述
+    unlock_content_limit: Optional[bool] = field(default=None)  # 内容限制解锁开关（None=使用配置默认值）
     preset_datas: Dict[str, PresetData] = field(default_factory=dict)
     next_message_index: int = field(default=0)
     chat_image_history: List[Dict[str, Any]] = field(default_factory=list)
@@ -245,7 +258,25 @@ class ChatData(StoreSerializable):
         self.active_profile = str(getattr(self, "active_profile", "") or "")
         raw_draw_mode = str(getattr(self, "draw_mode", "auto") or "auto")
         self.draw_mode = raw_draw_mode if raw_draw_mode in ("force", "on", "auto", "off") else "auto"
-        self.turbo_mode = bool(getattr(self, "turbo_mode", True))
+        # 画图模型迁移：旧 turbo_mode(bool) → draw_model(str)
+        raw_draw_model = str(getattr(self, "draw_model", "") or "")
+        if raw_draw_model in ("turbo", "aesthetic", "turbo2", "base"):
+            self.draw_model = raw_draw_model
+        else:
+            # 旧数据兼容：turbo_mode=True → turbo, False → base
+            legacy_turbo = getattr(self, "turbo_mode", None)
+            self.draw_model = "turbo" if (legacy_turbo is None or legacy_turbo) else "base"
+        # 清理旧字段
+        if hasattr(self, "turbo_mode"):
+            try:
+                delattr(self, "turbo_mode")
+            except Exception:
+                pass
+        raw_manga = str(getattr(self, "manga_mode", "off") or "off")
+        self.manga_mode = raw_manga if raw_manga in ("on", "off") else "off"
+        self.manga_style = str(getattr(self, "manga_style", "") or "")
+        raw_unlock = getattr(self, "unlock_content_limit", None)
+        self.unlock_content_limit = bool(raw_unlock) if raw_unlock is not None else None
 
         raw_presets = getattr(self, "preset_datas", {}) or {}
         self.preset_datas = {
@@ -396,6 +427,26 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
         }
         logger.info("读取历史数据成功")
 
+    def _migrate_user_memories_to_global(self):
+        """迁移旧数据：将各人格下的用户记忆合并到全局用户记忆空间。"""
+        migrated_count = 0
+        for chat_key, chat_data in self._datas.items():
+            for preset_key, preset in chat_data.preset_datas.items():
+                if not preset.user_memories:
+                    continue
+                for uid, memories in preset.user_memories.items():
+                    if not memories:
+                        continue
+                    target = self._global_user_memories.setdefault(uid, {})
+                    for k, v in memories.items():
+                        if k not in target and v:
+                            target[k] = v
+                            migrated_count += 1
+                # 迁移后清空人格下的用户记忆
+                preset.user_memories.clear()
+        if migrated_count > 0:
+            logger.info(f"已迁移 {migrated_count} 条用户记忆到全局空间")
+
     def load_from_file(self):
         self._inited = False
         self._datas = {}
@@ -404,6 +455,7 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
                 self._load_from_file_pickle()
             else:
                 self._load_from_file_json()
+        self._migrate_user_memories_to_global()
         self._last_save_data_time = 0
         self._inited = True
 
@@ -509,7 +561,7 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
             self._custom_nicknames.pop(uid, None)
 
     def init_global_memory(self, chat_key: str) -> str:
-        """为指定会话开启 global 记忆，合并该会话所有人格的记忆到 global 空间。返回合并报告。"""
+        """为指定会话开启 global 群记忆，合并该会话所有人格的群记忆到 global 空间。返回合并报告。"""
         chat_data = self._datas.get(chat_key)
         if not chat_data:
             return "会话不存在。"
@@ -528,31 +580,12 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
                 preset.chat_memory.clear()
         chat_data.global_chat_memory = merged_group
 
-        # 合并该会话所有人格的用户记忆（不跨群）
-        user_parts = []
-        for preset_key, preset in chat_data.preset_datas.items():
-            for uid, mems in preset.user_memories.items():
-                if not mems:
-                    continue
-                target = self._global_user_memories.setdefault(uid, {})
-                added = 0
-                for k, v in mems.items():
-                    if k not in target:
-                        target[k] = v
-                        added += 1
-                if added:
-                    user_parts.append(f"{uid}@{preset_key}: +{added}")
-                preset.user_memories[uid].clear()
-
         report_parts = []
         if group_parts:
             report_parts.append(f"群记忆 <- {', '.join(group_parts)}")
         else:
             report_parts.append("群记忆: 无合并")
-        if user_parts:
-            report_parts.append(f"用户记忆 <- {', '.join(user_parts)}")
-        else:
-            report_parts.append("用户记忆: 无合并")
+        report_parts.append("用户记忆: 固定全群全人格共享")
 
         return "\n".join(report_parts)
 

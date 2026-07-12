@@ -6,10 +6,12 @@
 
 - **LLM 后端**：通过 LiteLLM 统一调用（`openai_func.py`），支持多 key 轮询、自定义 base_url、代理、流式输出。支持多组 OpenAI 配置（`OPENAI_PROFILES`），通过 `rg model` 指令运行时切换。
 - **工具调用**：使用原生 OpenAI-compatible Tool Calling 替代旧的文本协议（`/#tool&args#/`）。工具定义在 `llm_tool_plugins/` 下，由 `llm_tools.py` 聚合调度。
+- **先搜后答原则**：`chat_prompt.py` 的 `tool_text` 与 `rules` 各注入一条精简约束——对外部事实（人物/作品/日期/数据/新闻等）不确定时，先调 `tavily_search`（或 `bocha_search`）核实再答，禁止凭记忆编造。日常闲聊/情感/人格自我描述/上下文已给出信息不受此约束。
 - **流式回复**：开启 `LLM_ENABLE_STREAM` 后，模型输出按双换行 `\n\n` 分段发送，受 `REPLY_SEGMENT_INTERVAL` 和 `REPLY_MAX_SEGMENTS` 控制。
 - **多模态输入**：支持 OneBot 图片消息片段，解析为 `image_url`。用户消息中的图片以 `[图片N]` 占位符内联标记。**图片门控**：为所有含图 user 消息（触发消息 + 历史用户消息）注入图片，不限时效、不限窗口；context_only 缓冲区的图片仅当触发句包含图片关键词（图/画/上/这等）时才收集并注入触发 user 消息，否则不注入。超限策略：当含图消息数超过 `MULTIMODAL_MAX_MESSAGES_WITH_IMAGES` 时，清空所有非触发消息的图片，仅保留触发消息的图片，避免滚动清理导致缓存不命中。每个 profile 有独立的 `multimodal` 开关，关闭时请求层自动剥离 `image_url` 内容。`_is_supported_image_url` 支持 `http://`、`https://`、`data:image/`、`file:///` 协议。
 - **图片缓存**：`image_cache.py` 提供异步图片下载 + 内存 LRU 缓存，将远程 URL 转为 `data:image/xxx;base64,...` 格式提交给 LLM API，避免 API 侧无法访问 QQ 等私有 URL。单图上限 10MB，总缓存上限 50MB。每次 `get_chat_prompt_template()` 构建完毕后自动清除不在 `prompt_messages` 中的缓存条目。下载时自动附加 `User-Agent` 和 QQ 域名 `Referer` 头提升成功率，失败时回退到原始 URL。
 - **Think 标签过滤**：Grok 等模型将思考内容以 `<think>` 标签放在 `content` 中返回。流式回调中实时拦截 `<think>...</think>` 内容，提取到 `reasoning_content` 字段；兜底正则在最终响应上做二次过滤。
+- **思考泄漏兜底**：部分模型开启思考后既不返回 `reasoning_content` 字段、也不输出 `<think>` 标签，而是把思考过程直接混在 `content` 里，导致思考被当成回复分段发到群里。每个 `OPENAI_PROFILES` 条目可设 `thinking: bool`（默认 `true`）标记思考模式。思考模式下，`on_reasoning_chunk` 标记 `_saw_reasoning`；`on_text_chunk` 在收到 content 时若发现「无 reasoning_content 且无 `<think>` 标签」，置位 `_skip_think_buffer_mode`，停止流式分段提前发送，全部缓冲到 `stream_buffer`。流结束后若 `content` 长度超过 `THINK_LEAK_THRESHOLD`（默认 300）且含双换行，则 `rsplit("\n\n", 1)` 取最后一段作为实际回复，前段存入 `reasoning_content`（仅用于 debug 日志，不进历史、不发群）；失败路径同样兜底 `raw_res_for_save`，避免思考随部分回复进入历史。`thinking: false` 的 profile 走原流式分段逻辑，不受影响。
 - **非触发消息缓冲**：不需要回复的群消息不写入 `prompt_messages`，而是由 `matcher.py` 的 `_recent_context_buffers` 按 `chat_key` 存入入口层临时缓冲区。`[群聊上下文-非触发消息]` 有独立窗口，大小按 `CONTEXT_WINDOW_SIZE + int(CONTEXT_WINDOW_SIZE * CONTEXT_COMPRESS_THRESHOLD_RATIO)` 计算，不使用触发对话历史的裁剪点，也不依赖 `CONTEXT_BUFFER_SIZE`。并发场景下必须先基于本次新消息独立计算 `should_reply`，再决定是否合并旧 active input；非触发消息不能继承旧触发状态，必须走 `_push_recent_context_buffer()`。当下一条触发消息到达并通过节流检查后，入口层缓冲和兼容用的 `Chat._context_buffer` 一并 flush，内容作为 `context_only` system 消息注入到 `prompt_messages` 中（置于触发消息之前），带有 `[群聊上下文-非触发消息]` 前缀；flush 必须发生在生成 prompt 之前且在 `REPLY_THROTTLE_TIME` 之后，确保触发语句附近、节流窗口内收到的非触发消息也进入本轮 prompt。`context_only` 消息不计入对话轮数、不增加 token 消耗，每次追加前清除旧的 `context_only`。上下文中图片占位符用全局计数器区分（如 Marcel 的 `[图片1]` 和 严肃早睡中的 `[图片2]`）。`context_only` 消息使用 `role="system"`，不进入持久化存储。**截断保护**：`_trim_prompt_messages_without_summary()` 和 `_compress_prompt_messages_if_needed()` 在删除溢出消息时保留 `context_only` 消息，只删除真实 user/assistant/tool 轮次，确保非触发上下文在窗口滑动时不丢失。
 - **Reply 消息上下文注入**：当触发消息包含 reply 段时，从 `event.reply.message` 提取被回复消息的文本和图片，以 `[回复 xxx 的消息] 文本 [图片N]` 前缀拼接到触发消息前面，图片插入到 `image_urls` 前面并重新编号已有标记。
 - **自定义昵称**：用户可通过 `rg nn <昵称>` 设置在 bot 中的固定昵称，存储在 `PersistentDataManager._custom_nicknames`（全局，跨群生效），优先于 API 获取的群名片。`rg nn` 查询，`rg nn 清除` 删除。
@@ -21,6 +23,7 @@
 - **请求打断与部分回复保留**：同群新消息打断旧请求时，已接收的流式内容（剥离 `<think>` 标签后）保存到 `Chat._last_interrupted_response`，下次请求时作为 system 消息注入上下文，避免模型重复已说过的内容。`_last_interrupted_response` 为实例变量，每个 Chat 实例独立。旧请求处于工具调用阶段时不 cancel，也不得把旧 active input 与新触发输入合并或删除旧请求已记录的 user；只能把本次新触发输入原样放入 `_pending_merge_input`，待旧请求完成后作为独立下一轮处理。
 - **模型专用提示词**：每个 `OPENAI_PROFILES` 条目可设置 `extra_prompt` 字段，注入到 system1 消息末尾。用于针对特定模型的行为调优（如 kimi 的工具调用积极性、减少推理等）。
 - **人格热加载缓存**：`chat_preset` 属性带 5秒 TTL 缓存，避免每次访问都做磁盘 I/O。`_persona_cache` 和 `_persona_cache_time` 为实例变量。
+- **运行统计（stats.py）**：`StatsManager` 单例按日期分桶记录运行数据，持久化到 `data/naturel_gpt/stats.json`，每日刷新（只看当天）。采集点：(1) 触发回复次数——`matcher.py` `do_msg_response` 成功后 `stats.inc_trigger()`；(2) 各模型 token 消耗——`openai_func.py` `_stream_once`/`_complete_once` 每次实际 API 请求后 `stats.record_model_usage(model_name, usage)`，兼容 OpenAI(`prompt_tokens_details.cached_tokens`)/Anthropic(`cache_read_input_tokens`)/DeepSeek(`prompt_cache_hit_tokens`) 三种缓存字段；(3) 工具调用次数——`_execute_tool_calls` 每个工具执行前 `stats.inc_tool_call(name)`（成功失败都计）。查询指令 `rg stat`（管理员）渲染当日：触发次数、各模型 token(prompt/completion/cached/命中率/请求数)、整体缓存命中率、各工具调用次数；`rg stat reset` 清空当日。模型名取 `OPENAI_PROFILES` 配置的 `model` 字段（即实际请求的模型名）。
 
 ## 关键路径
 
@@ -35,9 +38,10 @@ ATRI/plugins/nonebot_plugin_naturel_gpt/
 ├── config.py               # 配置管理
 ├── openai_func.py          # LLM 调用
 ├── llm_tools.py            # 工具管理
-├── llm_tool_plugins/       # 工具插件目录
+├── llm_tool_plugins/       # 工具插件目录（含 tavily_extract.py）
 ├── image_cache.py          # 图片下载缓存（URL→base64 data URI）
 ├── persistent_data_manager.py  # 持久化数据管理
+├── stats.py               # 运行统计（触发次数/模型token/缓存命中/工具调用，按日分桶）
 ├── command_func.py         # 命令管理
 ├── persona_loader.py       # 人格加载
 ├── utils.py                # 工具函数
@@ -60,7 +64,7 @@ data/naturel_gpt/draw.db               # 绘图提示词数据库
 - 导入时加载配置与持久化聊天状态。
 - 初始化 `TextGenerator`，从当前激活 profile 读取 `extra_prompt` 并传入。
 - 导入 `matcher`，通过导入副作用注册事件处理器。
-- 调用 `init_tools(config)` 进行条件工具注册（`LLM_DISABLED_TOOLS` 列表中的工具在 `_discover_tools` 阶段跳过加载）。启动前先调用 `tavily_search.init(config)` 检查所有 Tavily key 的额度并选用剩余最多的 key；若配置了 `TAVILY_API_KEY` 则优先注册 `tavily_search`，`bocha_search` 仅在 Tavily 不可用时作为 fallback 注册。
+- 调用 `init_tools(config)` 进行条件工具注册（`LLM_DISABLED_TOOLS` 列表中的工具在 `_discover_tools` 阶段跳过加载）。启动前先调用 `tavily_search.init(config)` 检查所有 Tavily key 的额度并选用剩余最多的 key；若配置了 `TAVILY_API_KEY` 则优先注册 `tavily_search`，`bocha_search` 仅在 Tavily 不可用时作为 fallback 注册。`tavily_extract` 共享 Tavily key，在 `tavily_search` 可用时自动随 `_discover_tools` 注册。
 - Anima 画图：启动时无条件执行 health check，通过则自动开启（不再依赖 `COMFYUI_ENABLED` 持久化状态），并将 `COMFYUI_ENABLED = True` 写回配置。支持 Turbo 加速模式（`rg turbo on/off`），每群独立，默认开启。Turbo 模式使用 anima-turbo-lora 工作流（8步，约15秒），普通模式使用 35 步（约60秒）。支持漫画模式（`rg manga on/off/[画风描述]`），开启后 bot 会积极主动画图来增强角色扮演沉浸感，无视 turbo 选项固定使用 turbo 工作流，不需要任务编号和 ETA，不保存 prompt 到 DB。
 - 初始化绘图提示词数据库 `draw_db.init_db()`。
 - 不再检查 PresetHub 连通性，不再加载旧扩展。
@@ -124,7 +128,7 @@ data/naturel_gpt/draw.db               # 绘图提示词数据库
 - 聚合所有原生工具定义。
 - 调用 `llm_tool_plugins/` 下的各工具模块。
 - 工具输出（如图片 URL）暂存，供 matcher 在文本流结束后统一发送。
-- `get_tool_schemas()` 根据 `chat_key` 的 `turbo_mode` 动态选择注入 turbo schema 还是普通 schema，函数名统一为 `generate_anima_image`。漫画模式下强制使用 turbo schema。
+- `get_tool_schemas()` 根据 `chat_key` 的 `draw_model` 动态选择注入对应模型的 schema（base/turbo2/turbo/aesthetic），函数名统一为 `generate_anima_image`。漫画模式下强制使用 turbo schema。
 
 ## `llm_tool_plugins/`
 
@@ -133,7 +137,8 @@ data/naturel_gpt/draw.db               # 绘图提示词数据库
 - **`pixiv_search.py`**：Pixiv 图片搜索。多关键词无结果时自动取首个关键词重试；工具返回不含图片 URL，仅告知模型图片会自动发送。
 - **`fetch_url.py`**：轻量 HTTP 文本抓取。
 - **`browse_url.py`**：Playwright 渲染页面文本抓取。schema 描述中明确标注为 fallback：`ONLY use when fetch_url fails or the page requires JavaScript rendering`，引导 LLM 优先使用轻量抓取。
-- **`tavily_search.py`**：Tavily 网页搜索（主搜索工具）。启动时通过 `GET /usage` 检查所有配置的 key 额度，选用剩余最多的 key（`TAVILY_API_KEY` 支持多 key 列表）。`include_answer` 设为 `advanced`，`max_results` 固定 20。结果格式化后返回，单条 content 截断 300 字符，总长受 `WEB_FETCH_MAX_CHARS` 限制；超预算时逐条降级为 title+url，超出部分省略。调用失败（401/429/432/433 或网络异常）时在内存中标记 `_tavily_disabled` 并动态注册 `bocha_search` 作为 fallback。
+- **`tavily_search.py`**：Tavily 网页搜索（主搜索工具）。启动时通过 `GET /usage` 检查所有配置的 key 额度，选用剩余最多的 key（`TAVILY_API_KEY` 支持多 key 列表）。`include_answer` 设为 `advanced`，`search_depth` 设为 `advanced`（更深度搜索），`max_results` 固定 20。结果格式化后返回，单条 content 截断 300 字符，总长受 `WEB_FETCH_MAX_CHARS` 限制；超预算时逐条降级为 title+url，超出部分省略。调用失败（401/429/432/433 或网络异常）时在内存中标记 `_tavily_disabled` 并动态注册 `bocha_search` 作为 fallback。
+- **`tavily_extract.py`**：Tavily 网页内容爬取工具。当 `fetch_url` / `browse_url` 等浏览器端工具因反爬、JS 渲染等原因无法访问目标页面时，通过 Tavily 服务端爬取页面内容，返回干净的 Markdown 或纯文本。共享 `tavily_search` 的 API key，仅在 Tavily 可用时自动加载。支持参数：`urls`（必填，最多20个）、`query`（用于内容块重排序）、`extract_depth`（默认 `advanced`）、`format`（`markdown`/`text`）、`include_images`。
 - **`bocha_search.py`**：博查网页搜索（fallback）。仅在 Tavily 不可用（未配置 key 或运行时被标记禁用）时才通过 `should_load` 注册。当 LLM 对问题不确定、不了解或涉及实时信息时应主动搜索验证，不猜测不确定的事实。单次搜索结果数强制为 10-20 条，默认请求 20 条。
 - **`memory.py`**：记忆工具，对用户透明。支持两种 scope：
   - `group`：群记忆，所有人共享，注入到 `[群记忆]`。
@@ -147,24 +152,30 @@ data/naturel_gpt/draw.db               # 绘图提示词数据库
   - 接近上限（80%）时不阻断，仅在 system2 中注入整理提醒；整理功能随时可用，不受阈值限制。
 - **`anima_generate.py`**：ComfyUI Anima 画图工具。
   - 通过 `rg draw [force/on/auto/off]` 动态注册/卸载，默认 `auto`。
-  - 支持 Turbo 加速模式（`rg turbo on/off`），每群独立，默认开启。
-  - 支持漫画模式（`rg manga on/off/[画风描述]`），每群独立，默认关闭。漫画模式下 bot 会积极主动画图增强角色扮演沉浸感，无视 turbo 选项固定使用 turbo 工作流，不需要任务编号和 ETA，不保存 prompt 到 DB。
-  - `fetch_schema_and_knowledge_sync()` 从 ComfyUI 服务同时拉取普通和 turbo 的 schema 与 knowledge（`/anima/schema` + `/anima/knowledge` + `/anima/schema_turbo` + `/anima/knowledge_turbo`）。缓存时强制将函数名统一为 `generate_anima_image`。
-  - `get_schema(turbo=False)` / `get_knowledge(turbo=False)`：根据 turbo 参数返回对应版本。
-  - `get_turbo_mode(chat_key)` / `set_turbo_mode(chat_key, enabled)`：管理每群 turbo 状态，持久化在 `ChatData.turbo_mode`。
+  - 支持四种画图模型（`rg draw <turbo|aesthetic|turbo2|base>`，可简写 `t|a|t2|b`），每群独立，默认 `turbo`（turbo_v1）：
+    - `turbo`/`t` → turbo_v1（`/anima/generate_turbo_v1`，10步/CFG 1，约15秒，schema_turbo_v1，knowledge_new_models）
+    - `aesthetic`/`a` → aesthetic_v1（`/anima/generate_aesthetic_v1`，35步/CFG 4，约60秒，schema_aesthetic_v1，knowledge_new_models 共享）
+    - `turbo2`/`t2` → turbo0.2 原有 turbo（`/anima/generate_turbo`，8步/CFG 1，约15秒，schema_turbo，knowledge_turbo）
+    - `base`/`b` → 普通工作流（`/anima/generate`，35步/CFG 5，约60秒，schema，knowledge）
+  - `MODEL_CONFIG` 字典统一管理四种模型的端点、schema/knowledge 路径、默认 steps/cfg、预估耗时、是否需要 `tags↔nltags` 兼容交换（仅 turbo2 需要）。`MODEL_ALIASES` 处理简写。
+  - 旧指令 `rg turbo on/off` 保留为兼容别名（on→turbo，off→base），提示用户改用 `rg draw <model>`。
+  - 支持漫画模式（`rg manga on/off/[画风描述]`），每群独立，默认关闭。漫画模式下 bot 会积极主动画图增强角色扮演沉浸感，无视 draw_model 固定使用 turbo（turbo_v1）工作流，不需要任务编号和 ETA，不保存 prompt 到 DB。
+  - `fetch_schema_and_knowledge_sync()` 从 ComfyUI 服务一次性拉取全部四种模型的 schema 与 knowledge（`/anima/schema` + `/anima/schema_turbo` + `/anima/schema_turbo_v1` + `/anima/schema_aesthetic_v1` + `/anima/knowledge` + `/anima/knowledge_turbo` + `/anima/knowledge_new_models`，其中 turbo 与 aesthetic 共享 knowledge_new_models）。缓存时强制将函数名统一为 `generate_anima_image`。
+  - `get_schema(model)` / `get_knowledge(model)`：按 model 名（base/turbo2/turbo/aesthetic）返回对应版本。
+  - `get_draw_model(chat_key)` / `set_draw_model(chat_key, model)`：管理每群画图模型，持久化在 `ChatData.draw_model`。`resolve_model_alias(name)` 将指令简写解析为内部 model 名。
   - `get_manga_mode(chat_key)` / `set_manga_mode(chat_key, enabled)`：管理每群漫画状态，持久化在 `ChatData.manga_mode`。
   - `get_manga_style(chat_key)` / `set_manga_style(chat_key, style)`：管理每群自定义画风描述，持久化在 `ChatData.manga_style`。
-  - `MANGA_RULES`：漫画模式专用规则常量，开启时追加到 turbo knowledge 末尾。包含具体场景列举、频率指导和防复读规则。
+  - `MANGA_RULES`：漫画模式专用规则常量，开启时追加到 turbo（turbo_v1）knowledge 末尾。包含具体场景列举、频率指导和防复读规则。
+  - `MANGA_UNLOCK_RULES`：漫画模式解锁内容限制规则常量，当内容限制解锁时（per-group `unlock_content_limit` 为 True，或回退到 `config.UNLOCK_CONTENT_LIMIT`）在 manga 直接画图路径和 chat_prompt 漫画模式中追加。NSFW 相关画图规则始终包含在 knowledge cache 中（由 system prompt 的解锁规则控制是否激活）；自然语言 tags 描述规则也始终包含（修复了之前被错误放在解锁条件内的 bug）。
   - `mark_manga_drawn(chat_key)`：标记指定会话刚完成一次画图，更新 `_manga_last_draw_time` 时间戳和 `_manga_rounds_since_draw` 计数（重置为0）。
   - `increment_manga_round(chat_key)`：增加指定会话的漫画模式对话轮数计数。
   - `should_inject_manga_idle(chat_key)`：检查漫画模式下是否超过配置的分钟数或轮数未画图，用于决定是否触发自动画图。
   - `manga_idle_draw(chat_key, chat, config, bot)`：超过配置时间或轮数未画图时，用 mini 模型根据上下文设计场景并调用画图工具，不输出文字到聊天。可画 bot 神态、用户请求内容或互动场景，根据上下文决定。构建精简 prompt（人设+记忆+最近对话历史，去掉图片），使用 prompt 指令引导调用画图工具（不使用 tool_choice，兼容 thinking 模型）。每次调用保存 JSON 日志到 `data/naturel_gpt/logs/{chat_key}.manga_draw.json`。prompt 顺序：漫画技能 → 画图指令 → 群记忆 → 当前时间 → 最近对话。
-  - `run()` 根据 `turbo_mode` 决定调用 `/anima/generate_turbo`（turbo）还是 `/anima/generate`（普通）。turbo 模式下做 `tags ↔ nltags` 字段映射以保持数据库兼容性。漫画模式下强制使用 turbo 端点（无视 `turbo_mode` 开关），返回简化内容（无任务编号/ETA），不保存 prompt 到 DB。
-  - Turbo 模式特点：使用 anima-turbo-lora 工作流，8步/CFG 1.0，约15秒完成；tags 使用英文自然语言描述，精简为6个核心字段。
+  - `run()` 根据 `draw_model` 决定调用哪个端点（由 `MODEL_CONFIG[model]["endpoint"]` 指定）。turbo2 模式下做 `tags ↔ nltags` 字段映射以保持数据库兼容性（`needs_tag_swap` 控制）；其余模型直接透传 args。漫画模式下强制使用 turbo（turbo_v1）端点（无视 `draw_model`），返回简化内容（无任务编号/ETA），不保存 prompt 到 DB。`_do_generate` 接收 `model` 参数选择端点。
   - 工具调用后即时返回第一人称作画描述文本，并告知用户预计时间，后台 `asyncio.create_task` 提交生成任务。漫画模式下直接返回「图片正在生成中，会自动发送」。
   - 生成结果进入 `_pending_results` 队列，由 matcher 在文本回复发送完毕后消费并发送图片。
   - `_bg_tasks: set` 保留 Task 引用防止 gc 取消；httpx timeout 300s。
-  - schema 与 knowledge 均经过压缩处理：schema description 精简为一句话引导；knowledge 按文件类型分别压缩（`anima_expert.md` 去掉默认参数/长宽比段落、`artist_list.md` 只保留 @artist 列表、`prompt_examples.md` 裁剪到 3 个代表性场景），硬编码核心规则压缩为 5 条 bullet。
+  - schema 与 knowledge 处理：schema description 精简为一句话引导；base 模式 knowledge 按文件类型分别压缩（`anima_expert.md` 去掉默认参数/长宽比段落、`artist_list.md` 只保留 @artist 列表、`prompt_examples.md` 裁剪到 3 个代表性场景）+ 硬编码核心规则；turbo2/turbo/aesthetic 模式 knowledge 直接使用完整内容 + 对应调用规则。turbo 与 aesthetic 共享同一份 knowledge_new_models 内容。
   - **画图任务编号**：调用成功后返回随机 6 位字母数字任务编号（格式 `draw-XXXXXX`）和预计生成时间（精确到秒）。schema 和 knowledge 中明确禁止模型编造虚假任务编号，只有工具返回的编号才算成功调用。漫画模式下不返回任务编号。
   - **队列限制**：当 ComfyUI 队列长度大于 5 时拒绝生成并提示用户稍后重试。预计生成时间公式为：`当前图片预计生成时间 + 队列中图片数 * 90秒 - 30秒`。
   - **发图拼接**：图片生成后通过 OneBot 发图时，将任务编号拼接在图片消息前一起发送。漫画模式下不拼接任务编号。
@@ -334,10 +345,12 @@ data/naturel_gpt/draw.db               # 绘图提示词数据库
   - `auto`：仅在用户消息含画图关键词时注入工具到请求中（默认）
   - `off`：关闭
   - 模式持久化存储在 `ChatData.draw_mode` 中，重启后保持
-- `rg draw <json字符串>`：根据 JSON 创建绘图任务，解析 JSON 到绘图提示词模板，允许空值，自动检查队列状态和生成时间预估。提示词保存到 `draw.db` 数据库。
+- `rg draw <turbo|aesthetic|turbo2|base>`（可简写 `t|a|t2|b`）：切换画图模型。`turbo`=turbo_v1 新加速模型，`aesthetic`=aesthetic_v1 新高质量模型，`turbo2`=turbo0.2 原 turbo 加速，`base`=普通工作流。无参数时显示当前模式与模型。模型持久化在 `ChatData.draw_model`，每群独立，默认 `turbo`（turbo_v1，兼容旧 `turbo_mode=True`）。切换时按需拉取对应 schema/knowledge。
+- `rg draw <json字符串>`：根据 JSON 创建绘图任务，解析 JSON 到绘图提示词模板，允许空值，自动检查队列状态和生成时间预估。提示词保存到 `draw.db` 数据库。按当前 `draw_model` 选择端点和默认 steps/cfg；turbo2 模式做 tags↔nltags 兼容映射。
 - `rg draw-XXXXXX`：查询绘图编号对应的提示词，以 JSON 格式输出。设置 `no_img` 标记强制以纯文本发送。
-- `rg turbo [on|off]`：切换 Turbo 加速画图模式。无参数时显示当前状态；`on` 开启 turbo（8步，约15秒）；`off` 使用普通模式（35步，约60秒）。状态每群独立，默认开启，持久化在 `ChatData.turbo_mode`。开启时 LLM 注入 turbo 版本的 schema 和 knowledge，调用 `/anima/generate_turbo` 端点。
-- `rg manga [on|off|画风描述]`：切换漫画模式。无参数时显示当前状态和画风；`on` 开启漫画模式；`off` 关闭；其他参数作为自定义画风描述开启漫画模式。`rg manga clr` 清除自定义画风。漫画模式下 bot 会积极主动画图来增强角色扮演沉浸感，无视 turbo 选项固定使用 turbo 工作流，不需要任务编号和 ETA，不保存 prompt 到 DB。开启时覆盖原有的 `rg draw` 模式。状态每群独立，默认关闭，持久化在 `ChatData.manga_mode` 和 `ChatData.manga_style`。
+- `rg turbo [on|off]`：**已废弃兼容别名**。`on` → 切换到 turbo（turbo_v1）模型，`off` → 切换到 base 模型。提示用户改用 `rg draw <model>`。
+- `rg manga [on|off|画风描述]`：切换漫画模式。无参数时显示当前状态和画风；`on` 开启漫画模式；`off` 关闭；其他参数作为自定义画风描述开启漫画模式。`rg manga clr` 清除自定义画风。漫画模式下 bot 会积极主动画图来增强角色扮演沉浸感，无视 draw_model 固定使用 turbo（turbo_v1）工作流，不需要任务编号和 ETA，不保存 prompt 到 DB。开启时覆盖原有的 `rg draw` 模式。状态每群独立，默认关闭，持久化在 `ChatData.manga_mode` 和 `ChatData.manga_style`。
+- `rg nolimit [on|off]`：内容限制解锁开关。无参数时显示当前群解锁状态与全局默认值；`on` 解锁内容限制（LLM 配合处理 NSFW 内容请求）；`off` 锁定。状态每群独立，持久化在 `ChatData.unlock_content_limit`（`None` 时回退到配置文件 `UNLOCK_CONTENT_LIMIT` 默认值）。
 - `rg model [profile_name]`：列出或切换 OpenAI 配置。无参数时列出所有 profile 及当前激活状态；有参数时切换到指定 profile 并持久化。切换为按群生效，每个群有独立的模型配置。
 - `rg nn [昵称]`：设置/查看/清除自定义昵称。无参数时显示当前昵称；`rg nn 清除` 删除自定义昵称；否则设置为指定昵称（最长30字符）。昵称全局生效，优先于 API 获取的群名片。持久化在 `PersistentDataManager._custom_nicknames`。
 - `rg mem`：查看当前人格的群记忆和用户记忆。
@@ -354,9 +367,10 @@ data/naturel_gpt/draw.db               # 绘图提示词数据库
 - `PresetData` 包含 `chat_memory`（群记忆）、`user_memories`（用户个人记忆）和 `chat_impressions`（用户印象字典），记忆与人格关联。
 - `ChatData` 包含 `active_profile` 字段，存储每个群/私聊的 OpenAI profile 名，支持每群独立模型配置。
 - `ChatData` 包含 `draw_mode` 字段，存储每个群的 Anima 画图模式（`force`/`on`/`auto`/`off`），默认 `auto`。
-- `ChatData` 包含 `turbo_mode` 字段，存储每个群的 Turbo 加速模式（`True`/`False`），默认 `True`。
-- `ChatData` 包含 `manga_mode` 字段，存储每个群的漫画模式（`on`/`off`），默认 `off`。开启后覆盖 draw_mode，固定使用 turbo 工作流。
+- `ChatData` 包含 `draw_model` 字段，存储每个群的画图模型（`turbo`/`aesthetic`/`turbo2`/`base`），默认 `turbo`（turbo_v1）。旧 `turbo_mode: bool` 字段在 `_init_from_dict` 时自动迁移：`True`→`turbo`、`False`→`base`，并删除旧字段。
+- `ChatData` 包含 `manga_mode` 字段，存储每个群的漫画模式（`on`/`off`），默认 `off`。开启后覆盖 draw_model，固定使用 turbo（turbo_v1）工作流。
 - `ChatData` 包含 `manga_style` 字段，存储每个群的漫画自定义画风描述，默认空。
+- `ChatData` 包含 `unlock_content_limit` 字段（`Optional[bool]`），存储每个群的内容限制解锁开关。`None`（默认）时回退到配置文件 `UNLOCK_CONTENT_LIMIT` 全局默认值；`True` 解锁，`False` 锁定。通过 `rg nolimit on/off` 设置，通过 `chat.get_unlock_content_limit()` 读取。
 - `PersistentDataManager` 包含 `_custom_nicknames` 全局字典（`{user_id: nickname}`），提供 `get_custom_nickname()`/`set_custom_nickname()` 方法，随 `save_to_file()` 持久化。
 - 默认读写 `data/naturel_gpt/naturel_gpt.json`，可配置为 pickle。
 - `save_to_file()` 对普通保存做节流；仅在必要时使用 `must_save=True`。
@@ -447,6 +461,7 @@ data/naturel_gpt/draw.db               # 绘图提示词数据库
 - `WEB_FETCH_MAX_CHARS`
 - `PLAYWRIGHT_TIMEOUT`
 - `LLM_TOOL_LOLICON_CONFIG`
+- `UNLOCK_CONTENT_LIMIT`：内容限制解锁全局默认值（`True`/`False`），默认 `False`。新群未通过 `rg nolimit` 设置过时使用此值；每群可通过 `rg nolimit on/off` 独立覆盖，持久化在 `ChatData.unlock_content_limit`。
 
 ## 人格
 
