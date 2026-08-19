@@ -233,31 +233,68 @@ MULTIMODAL_MAX_MESSAGES_WITH_IMAGES: 2
 ```yaml
 LLM_ENABLE_TOOLS: true
 LLM_MAX_TOOL_ROUNDS: 3
+LLM_DISABLED_TOOLS: []  # 按模块名禁用指定工具，如 fetch_url
 ```
 
 插件使用原生工具调用，不再支持旧版 `/#tool&args#/` 文本协议，也不再加载旧扩展系统。
 
-内置工具：
+内置工具（`llm_tool_plugins/` 目录，每个工具一个文件）：
 
-```text
-pixiv_search
-fetch_url
-browse_url
-bocha_search
-bangumi_search
-```
-
-工具文件：
-
-```text
-llm_tool_plugins/pixiv_search.py
-llm_tool_plugins/fetch_url.py
-llm_tool_plugins/browse_url.py
-llm_tool_plugins/bocha_search.py
-llm_tool_plugins/bangumi_search.py
-```
+| 工具 | 用途 |
+|------|------|
+| `tavily_search` | Tavily 联网搜索（主搜索工具） |
+| `tavily_extract` | Tavily 服务端网页正文提取（反爬 / JS 页面兜底） |
+| `bocha_search` | 博查搜索（Tavily 不可用时自动回落） |
+| `browse_url` | 网页抓取（短链还原 → SSR → Playwright 渲染 → trafilatura 兜底） |
+| `pixiv_search` | Lolicon API 搜索 Pixiv 图片 |
+| `danbooru_search` | Danbooru 标签检索（画图提示词辅助） |
+| `bangumi_search` | Bangumi 番组 / 角色搜索 |
+| `anime_trace` | AnimeTrace 以图识角色 |
+| `generate_anima_image` | ComfyUI Anima AI 画图（`anima_generate.py`） |
+| `memory` | 长期记忆（群 / 用户 scope，模型自主维护） |
+| `nas_game_list` | NAS 游戏目录查询（白名单群限定） |
+| `vision` | 视觉理解：纯文本模型借助独立视觉模型看图 |
+| `fetch_url` | 轻量 HTTP 抓取（功能已被 `browse_url` 覆盖，建议禁用） |
 
 新增工具时，建议新增独立 Python 文件，并在 `llm_tools.py` 的注册表中挂载。
+
+#### tavily_search
+
+用途：调用 Tavily API 联网搜索，主搜索工具。
+
+```yaml
+TAVILY_API_KEY: []  # 支持多 key，启动时自动选用剩余额度最多的 key
+```
+
+配置 key 后自动注册；Tavily 不可用时自动回落 `bocha_search`。
+
+#### tavily_extract
+
+用途：Tavily 服务端爬取网页正文（Markdown / 纯文本），适合反爬或需 JS 渲染的页面。共享 Tavily key，随 Tavily 可用自动注册。
+
+#### bocha_search
+
+用途：调用博查搜索 API 联网搜索，作为 Tavily 的 fallback。
+
+```yaml
+BOCHA_API_KEY: ''
+BOCHA_API_BASE: https://api.bochaai.com/v1/web-search
+BOCHA_SEARCH_COUNT: 20
+```
+
+单次搜索结果数强制为 10-20 条。
+
+#### browse_url
+
+用途：多策略网页抓取：短链还原 → 已知社交平台 SSR → Playwright 渲染 → trafilatura 正文提取兜底。
+
+```yaml
+WEB_FETCH_TIMEOUT: 20
+WEB_FETCH_MAX_CHARS: 6000
+PLAYWRIGHT_TIMEOUT: 20
+```
+
+使用 Playwright 策略前需安装 Chromium（`playwright install chromium`）；trafilatura 为软依赖，未安装自动跳过。
 
 #### pixiv_search
 
@@ -271,39 +308,13 @@ LLM_TOOL_LOLICON_CONFIG:
   exclude_ai: true
 ```
 
-#### fetch_url
+#### danbooru_search
 
-用途：使用普通 HTTP 客户端抓取网页文本。
-
-```yaml
-WEB_FETCH_TIMEOUT: 20
-WEB_FETCH_MAX_CHARS: 6000
-```
-
-适合静态网页、API 文本和简单 HTML 页面。
-
-#### browse_url
-
-用途：使用 Playwright 打开网页，等待浏览器渲染后读取页面可见文本。
+用途：把角色名 / 视觉概念落实成准确的 Danbooru 标签，供画图任务使用。优先国内直连魔搭创空间，失败回落 HuggingFace Space（走 `TOOL_PROXY`）。
 
 ```yaml
-PLAYWRIGHT_TIMEOUT: 20
-WEB_FETCH_MAX_CHARS: 6000
+TOOL_PROXY: ''
 ```
-
-适合需要 JS 渲染的网页。使用前需要确保 Chromium 已安装。
-
-#### bocha_search
-
-用途：调用博查搜索 API 联网搜索。
-
-```yaml
-BOCHA_API_KEY: ''
-BOCHA_API_BASE: https://api.bochaai.com/v1/web-search
-BOCHA_SEARCH_COUNT: 20
-```
-
-如果 `BOCHA_API_KEY` 为空，工具会返回未配置提示。单次搜索结果数强制为 10-20 条。
 
 #### bangumi_search
 
@@ -314,6 +325,49 @@ BANGUMI_ACCESS_TOKEN: ''
 ```
 
 如果 `BANGUMI_ACCESS_TOKEN` 为空，工具不会加载。
+
+#### anime_trace
+
+用途：调用 AnimeTrace 开放 API 以图识角色，`image_index` 引用当前对话中的图片。依赖 `MULTIMODAL_ENABLE: true`，无需额外配置。
+
+#### generate_anima_image（anima_generate.py）
+
+用途：调用 ComfyUI Anima 服务生成图片。可选工作流在启动时从服务端动态发现；`rg draw` 按群控制开关与模型，`rg manga` 控制漫画模式。
+
+```yaml
+COMFYUI_BASE_URL: http://127.0.0.1:8188
+COMFYUI_ENABLED: false
+MANGA_IDLE_MINUTES: 5
+MANGA_IDLE_ROUNDS: 5
+```
+
+#### memory
+
+用途：长期事实记忆。按群（`group` scope）或用户（`user` scope）保存 / 删除 / 批量整理重要事实，与人格关联隔离。无需额外配置。
+
+#### nas_game_list
+
+用途：查询 NAS 上的游戏合集目录并生成下载链接，仅在白名单群暴露。
+
+```yaml
+NAS_GAME_ROOT_PATH: ''
+NAS_GAME_UPLOAD_PATH: ''
+NAS_GAME_BASE_URL: ''
+NAS_GAME_WHITELIST_GROUPS: []
+NAS_GAME_SYNC_RECORDS_PATH: ''  # 同步服务记录文件，为空则不读取
+```
+
+#### vision
+
+用途：主模型为纯文本模型（profile `multimodal: false`）时，注入 `vision` 工具，让主模型调用独立视觉模型理解对话中的图片。
+
+```yaml
+# 在 OPENAI_PROFILES 的对应 profile 中配置：
+model_vision: mimo            # 视觉模型名
+model_vision_base_url: ''     # 可选，默认复用 profile 的 base_url
+model_vision_api_keys: []     # 可选，默认复用 profile 的 api_keys
+model_vision_max_tokens: 0    # 可选
+```
 
 ### 🎭 人格加载
 
@@ -405,11 +459,22 @@ resource/speech_patterns.md
 常用指令：
 
 ```text
-rg
-rg list
-rg set <人格名>
-rg query <人格名>
-rg reload_config
+rg                      # 人格列表与状态
+rg list                 # 列出可用人格
+rg set <人格名>          # 切换人格
+rg query <人格名>        # 查看人格详情
+rg reload_config        # 重载配置
+rg reset                # 清空当前会话上下文（保留记忆/印象/昵称）
+rg model [profile]      # 查看/切换本群 OpenAI profile
+rg nn [昵称]            # 自定义昵称（查询/设置/清除）
+rg mem                  # 查看记忆；rg mem clear <group|user|all> 清除
+rg draw [force|on|auto|off]  # AI 画图开关
+rg draw <模型名>         # 切换画图工作流
+rg draw-XXXXXX          # 查询画图任务提示词
+rg manga [on|off|画风]   # 漫画模式
+rg nolimit [on|off]     # 内容限制解锁（每群独立）
+rg stat                 # 当日运行统计；rg stat reset 清空（管理员）
+rg help                 # 帮助
 ```
 
 `rg` 和 `rg list` 会展示当前可用人格列表。新增或修改人格文件后，通常不需要重启 Bot，直接执行 `rg` 或 `rg set <人格名>` 即可触发动态加载。
