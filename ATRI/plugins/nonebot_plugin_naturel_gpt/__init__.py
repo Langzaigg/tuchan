@@ -103,14 +103,20 @@ elif "bocha_search" in TOOL_REGISTRY:
 else:
     logger.info("[搜索工具] 未配置任何搜索工具（TAVILY_API_KEY / BOCHA_API_KEY 均为空）")
 
-# Anima 画图：启动时自动 health check，成功则默认开启
+# Anima 画图：启动时自动 health check，成功则默认开启。
+# fetch_schema_and_knowledge_sync 内部先拉 GET /anima/workflows 动态确定可选工作流全集
+# （过滤 deprecated），再逐工作流拉 schema/knowledge；工作流列表不可达时降级内置最小默认值，
+# 服务整体离线时仅关闭画图功能，不影响插件启动。
 from .llm_tool_plugins import anima_generate, enable_anima_tool
 ok, err = anima_generate.health_check_sync()
 if ok:
     ok2, err2 = anima_generate.fetch_schema_and_knowledge_sync()
     if ok2:
         if enable_anima_tool():
-            logger.info("Anima 画图工具已自动开启（health check 通过）")
+            logger.info(
+                f"Anima 画图工具已自动开启（health check 通过），"
+                f"可选工作流: {', '.join(anima_generate.MODEL_CONFIG.keys())}，默认: {anima_generate.get_default_model()}"
+            )
             config.COMFYUI_ENABLED = True
             save_config()
         else:

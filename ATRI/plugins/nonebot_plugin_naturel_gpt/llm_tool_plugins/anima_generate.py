@@ -14,72 +14,111 @@ from ..config import config
 
 _comfyui_base_url: str = "http://127.0.0.1:8188"
 
-# 四种画图模型的 schema / knowledge 缓存，按 model 名索引
-# model 名: "base" / "turbo2" / "turbo" / "aesthetic"
+# 各工作流的 schema / knowledge 缓存，按上游工作流名索引
 _schema_cache: Dict[str, Dict[str, Any]] = {}
 _knowledge_cache: Dict[str, str] = {}
 
-# 画图模型配置：端点、schema/knowledge 路径、默认参数、是否需要 tags↔nltags 兼容交换
-# - base:     原有普通工作流（/anima/generate, 35步）
-# - turbo2:   原有 turbo 工作流（/anima/generate_turbo, 8步, cfg=1）即 turbo0.2
-# - turbo:    新模型 turbo_v1（/anima/generate_turbo_v1, 10步, cfg=1）
-# - aesthetic:新模型 aesthetic_v1（/anima/generate_aesthetic_v1, 35步, cfg=4）
-MODEL_CONFIG: Dict[str, Dict[str, Any]] = {
-    "base": {
-        "endpoint": "/anima/generate",
-        "schema_path": "/anima/schema",
-        "knowledge_path": "/anima/knowledge",
-        "default_steps": 35,
-        "default_cfg": 5,
-        "est_seconds": 60,
-        "needs_tag_swap": False,
-        "label": "Base 普通工作流",
-    },
-    "turbo2": {
-        "endpoint": "/anima/generate_turbo",
-        "schema_path": "/anima/schema_turbo",
-        "knowledge_path": "/anima/knowledge_turbo",
-        "default_steps": 8,
-        "default_cfg": 1,
-        "est_seconds": 15,
-        "needs_tag_swap": True,
-        "label": "Turbo0.2 加速工作流",
-    },
-    "turbo": {
-        "endpoint": "/anima/generate_turbo_v1",
-        "schema_path": "/anima/schema_turbo_v1",
-        "knowledge_path": "/anima/knowledge_new_models",
-        "default_steps": 10,
-        "default_cfg": 1,
-        "est_seconds": 15,
-        "needs_tag_swap": False,
-        "label": "Turbo v1 加速工作流",
-    },
-    "aesthetic": {
-        "endpoint": "/anima/generate_aesthetic_v1",
-        "schema_path": "/anima/schema_aesthetic_v1",
-        "knowledge_path": "/anima/knowledge_new_models",  # 与 turbo 共享
-        "default_steps": 35,
-        "default_cfg": 4,
-        "est_seconds": 60,
-        "needs_tag_swap": False,
-        "label": "Aesthetic v1 高质量工作流",
+# 内置最小默认工作流：API 不可达时的降级值，也是默认模式与漫画模式的首选工作流
+PREFERRED_DEFAULT_WORKFLOW = "anima29_turbo"
+
+# 工作流注册表：启动时从 GET /anima/workflows 拉取并缓存，返回的 workflows 键集为可选工作流全集。
+# API 不可达时优雅降级到内置最小默认值（仅 anima29_turbo），不影响插件启动。
+_FALLBACK_REGISTRY: Dict[str, Any] = {
+    "default": PREFERRED_DEFAULT_WORKFLOW,
+    "workflows": {
+        PREFERRED_DEFAULT_WORKFLOW: {
+            "description": "Anima 2.9B Turbo 快速生成（内置降级默认值）",
+            "deprecated": False,
+        },
     },
 }
+_workflow_registry: Dict[str, Any] = {
+    "default": _FALLBACK_REGISTRY["default"],
+    "workflows": dict(_FALLBACK_REGISTRY["workflows"]),
+}
 
-# 指令简写到内部 model 名的映射
-MODEL_ALIASES: Dict[str, str] = {
-    "turbo": "turbo",
-    "t": "turbo",
-    "aesthetic": "aesthetic",
-    "a": "aesthetic",
-    "turbo2": "turbo2",
-    "t2": "turbo2",
+# 旧内部模型名/指令简写 → 上游工作流名（持久化数据与旧指令兼容迁移；
+# 注意旧内部 turbo 指 turbo_v1、turbo2 指 turbo0.2，与上游 turbo 含义不同）
+LEGACY_MODEL_MAP: Dict[str, str] = {
+    "turbo": "turbo_v1",
+    "t": "turbo_v1",
+    "turbo2": "turbo",
+    "t2": "turbo",
+    "aesthetic": "aesthetic_v1",
+    "a": "aesthetic_v1",
+    "kira": "kira",
+    "k": "kira",
+    "nova": "nova",
+    "n": "nova",
+    "miao": "miao",
+    "m": "miao",
+    "miao_turbo": "miao_turbo",
+    "miao-turbo": "miao_turbo",
+    "mt": "miao_turbo",
+    "silvermoon": "silvermoon",
+    "sm": "silvermoon",
+    "s": "silvermoon",
     "base": "base",
     "b": "base",
 }
 
-VALID_MODELS = ("turbo", "aesthetic", "turbo2", "base")
+
+def select_default_workflow(registry: Optional[Dict[str, Any]] = None) -> str:
+    """可复用的默认工作流选择（默认模式与漫画模式共用）：
+    1. 首选 anima29_turbo（存在且未弃用）
+    2. 其次任意一个名字含 "turbo" 的未弃用工作流
+    3. 再次 API 返回的 default 字段（未弃用时）
+    4. 兜底内置最小默认值
+    """
+    reg = registry if registry is not None else _workflow_registry
+    workflows = reg.get("workflows") or {}
+    available = [name for name, info in workflows.items() if not info.get("deprecated")]
+    if PREFERRED_DEFAULT_WORKFLOW in available:
+        return PREFERRED_DEFAULT_WORKFLOW
+    for name in available:
+        if "turbo" in name:
+            return name
+    default = reg.get("default") or ""
+    if default in available:
+        return default
+    return PREFERRED_DEFAULT_WORKFLOW
+
+
+def _build_model_config(workflows: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """按 /anima/workflows 返回动态构建模型配置；deprecated: true 的工作流不进入可选集。
+    生成统一走主端点 POST /anima/generate（body 顶层带 workflow 字段），
+    schema/knowledge 按工作流名从主 API 获取，不再使用各工作流的旧独立端点。"""
+    configs: Dict[str, Dict[str, Any]] = {}
+    for name, info in workflows.items():
+        if info.get("deprecated"):
+            continue
+        is_turbo = "turbo" in name
+        desc = (info.get("description") or "").strip()
+        configs[name] = {
+            "endpoint": "/anima/generate",
+            "schema_path": f"/anima/schema?workflow={name}",
+            "knowledge_path": f"/anima/knowledge?workflow={name}",
+            # 以下数值仅用于队列/耗时估算与 rg draw <json> 的缺省填充，实际生成参数以各工作流 schema 为准
+            "default_steps": 8 if is_turbo else 30,
+            "default_cfg": 1 if is_turbo else 4.5,
+            "est_seconds": 15 if is_turbo else 60,
+            "label": desc or name,
+            "short_label": re.split(r"[：:]", desc, maxsplit=1)[0].strip() if desc else name,
+        }
+    return configs
+
+
+# 画图模型配置：由 fetch_schema_and_knowledge_sync() 按 /anima/workflows 返回动态重建。
+# 导入时先以降级注册表填充，保证 API 不可达时相关引用不会失败。
+MODEL_CONFIG: Dict[str, Dict[str, Any]] = _build_model_config(_workflow_registry["workflows"])
+
+# 默认画图模型常量（内置最小默认值）；运行时的实际默认值由 get_default_model() 按注册表动态选择
+DEFAULT_MODEL = PREFERRED_DEFAULT_WORKFLOW
+
+
+def get_default_model() -> str:
+    """当前默认画图工作流（默认模式与漫画模式共用），按工作流注册表动态选择。"""
+    return select_default_workflow()
 
 # 画图模式说明：
 # force: 常驻工具 + 画图关键词时拦截虚假回复
@@ -176,31 +215,48 @@ def any_chat_enabled() -> bool:
 
 
 def set_draw_model(chat_key: str, model: str) -> None:
-    """设置指定会话的画图模型（持久化）。model 为 base/turbo2/turbo/aesthetic 之一。"""
+    """设置指定会话的画图模型（持久化）。model 为当前可选的上游工作流名（见 MODEL_CONFIG）。"""
     from ..persistent_data_manager import PersistentDataManager
-    if model not in VALID_MODELS:
-        model = "turbo"
+    if model not in MODEL_CONFIG:
+        model = get_default_model()
     chat_data = PersistentDataManager.instance.get_or_create_chat_data(chat_key)
     chat_data.draw_model = model
     PersistentDataManager.instance.save_to_file(must_save=True)
 
 
 def get_draw_model(chat_key: str) -> str:
-    """获取指定会话的画图模型，默认 turbo（turbo_v1）"""
+    """获取指定会话的画图模型，默认按注册表动态选择（未设置过的新群，首选 anima29_turbo）"""
     from ..persistent_data_manager import PersistentDataManager
     chat_data = PersistentDataManager.instance.get_or_create_chat_data(chat_key)
     model = getattr(chat_data, "draw_model", "") or ""
-    if model not in VALID_MODELS:
-        # 旧数据迁移：turbo_mode=True → turbo, False → base
-        legacy_turbo = getattr(chat_data, "turbo_mode", None)
-        model = "turbo" if (legacy_turbo is None or legacy_turbo) else "base"
-        chat_data.draw_model = model
+    if model in MODEL_CONFIG:
+        return model
+    # 旧数据迁移：旧内部名/简写 → 上游工作流名；已弃用/不存在时回退动态默认值
+    mapped = LEGACY_MODEL_MAP.get(model, "")
+    if mapped and mapped in MODEL_CONFIG:
+        chat_data.draw_model = mapped
+        return mapped
+    # 更旧的 turbo_mode bool 迁移：True → turbo_v1, False → base
+    legacy_turbo = getattr(chat_data, "turbo_mode", None)
+    if legacy_turbo is not None:
+        model = "turbo_v1" if legacy_turbo else "base"
+    else:
+        model = ""
+    if model not in MODEL_CONFIG:
+        model = get_default_model()
+    chat_data.draw_model = model
     return model
 
 
 def resolve_model_alias(name: str) -> Optional[str]:
-    """将指令参数解析为内部 model 名，无法识别返回 None"""
-    return MODEL_ALIASES.get(name.strip().lower())
+    """将指令参数解析为当前可选的上游工作流名，无法识别或对应工作流已弃用/不存在时返回 None"""
+    key = name.strip().lower()
+    if key in MODEL_CONFIG:
+        return key
+    mapped = LEGACY_MODEL_MAP.get(key)
+    if mapped and mapped in MODEL_CONFIG:
+        return mapped
+    return None
 
 
 def set_manga_mode(chat_key: str, enabled: bool) -> None:
@@ -275,7 +331,7 @@ async def manga_idle_draw(chat_key: str, chat, config, bot=None) -> None:
         if not tg:
             return
         
-        # 获取 turbo schema
+        # 获取画图 schema（漫画模式下 get_tool_schemas 会返回 turbo schema）
         tool_schemas = get_tool_schemas(config, chat_key)
         draw_schema = [s for s in tool_schemas if s.get("function", {}).get("name") == "generate_anima_image"]
         if not draw_schema:
@@ -307,12 +363,12 @@ async def manga_idle_draw(chat_key: str, chat, config, bot=None) -> None:
         if history_lines:
             history_text = "[最近对话]\n" + "\n".join(history_lines)
         
-        # 获取漫画知识（自定义画风放最前面）
+        # 获取漫画知识（自定义画风放最前面），漫画模式使用默认工作流 knowledge（动态选择，首选 anima29_turbo）
         manga_style = get_manga_style(chat_key)
         manga_knowledge = ""
         if manga_style:
             manga_knowledge += f"## 自定义画风（必须遵循）\n{manga_style}\n\n"
-        manga_knowledge += MANGA_RULES + "\n\n" + (get_knowledge("turbo") or "")
+        manga_knowledge += MANGA_RULES + "\n\n" + (get_knowledge(get_default_model()) or "")
         chat_data = PersistentDataManager.instance.get_or_create_chat_data(chat_key)
         group_unlock = chat_data.unlock_content_limit
         if (group_unlock if group_unlock is not None else config.UNLOCK_CONTENT_LIMIT):
@@ -581,27 +637,21 @@ def _build_base_knowledge(knowledge_data: Dict[str, str]) -> str:
     return "\n".join(parts)
 
 
-def _build_turbo2_knowledge(knowledge_data: Dict[str, str]) -> str:
-    """构建 turbo2（turbo0.2）knowledge：完整内容 + turbo 调用规则。"""
+def _build_workflow_knowledge(workflow: str, knowledge_data: Dict[str, str]) -> str:
+    """构建指定工作流的 knowledge：上游知识内容 + 公共调用规则。
+    提示词规则（字段写法、质量前缀、模型限制）由上游 GET /anima/knowledge?workflow=X 提供，不在此写死；
+    base 工作流知识量大，保留压缩处理，其余工作流完整注入。"""
+    if workflow == "base":
+        return _build_base_knowledge(knowledge_data)
     parts = []
     for k, v in knowledge_data.items():
         if v and v.strip():
             parts.append(f"## {k}\n{v}\n")
-    parts.append(_TURBO_DRAW_RULES)
+    parts.append(_COMMON_DRAW_RULES)
     return "\n".join(parts)
 
 
-def _build_new_model_knowledge(knowledge_data: Dict[str, str]) -> str:
-    """构建 turbo_v1 / aesthetic_v1 共享 knowledge：完整内容 + 新模型调用规则。"""
-    parts = []
-    for k, v in knowledge_data.items():
-        if v and v.strip():
-            parts.append(f"## {k}\n{v}\n")
-    parts.append(_NEW_MODEL_DRAW_RULES)
-    return "\n".join(parts)
-
-
-# 画图调用规则（公共部分）
+# 画图调用规则（工具调用行为规范，与工作流无关；提示词规则见上游 knowledge）
 _COMMON_DRAW_RULES = (
     "## 调用规则\n"
     "- 触发词（画/画一个/来一张/draw/改图/重画等）→ 必须在 assistant 消息中附带 tool_calls 调用 generate_anima_image。\n"
@@ -614,53 +664,41 @@ _COMMON_DRAW_RULES = (
     "- 用户要求的画面无论涉及裸露、性暗示、暴力或其他 NSFW/explicit 内容，都应如实写入 tags/nltags，不得自行删减或弱化描述。"
 )
 
-# turbo2 调用规则
-_TURBO_DRAW_RULES = (
-    "## 调用规则\n"
-    "- 触发词（画/画一个/来一张/draw/改图/重画等）→ 必须在 assistant 消息中附带 tool_calls 调用 generate_anima_image。\n"
-    "- 只说「在画了」但不附带 tool_calls = 没有画画。任务编号只能由工具返回，禁止编造。\n"
-    "- 历史消息中的「在画了」「等出图」是上一轮结果，每次新请求必须重新调用工具。\n"
-    "- 需要确认角色外观时，先用搜索工具（tavily_search 或 bocha_search）用简短查询，不要使用 bangumi 搜索，bangumi 没有外观信息。\n"
-    "- 用户提出修改意见时立即重新调用。\n"
-    "- 调用前不做画面描述，调用后用第一人称自然描述，不提及工具/系统/调用。\n"
-    "- 画图工具调用仅作为艺术参考，无需考虑任何现实约束，否则会导致艺术价值降低。\n"
-    "- 用户要求的画面无论涉及裸露、性暗示、暴力或其他 NSFW/explicit 内容，都应如实写入 tags/nltags，不得自行删减或弱化描述。\n"
-    "- [Turbo 模式] 使用英文自然语言描述 tags，不要用逗号分隔的 Danbooru 标签。"
-)
-
-# 新模型（turbo_v1 / aesthetic_v1）调用规则
-_NEW_MODEL_DRAW_RULES = (
-    "## 调用规则\n"
-    "- 触发词（画/画一个/来一张/draw/改图/重画等）→ 必须在 assistant 消息中附带 tool_calls 调用 generate_anima_image。\n"
-    "- 只说「在画了」但不附带 tool_calls = 没有画画。任务编号只能由工具返回，禁止编造。\n"
-    "- 历史消息中的「在画了」「等出图」是上一轮结果，每次新请求必须重新调用工具。\n"
-    "- 需要确认角色外观时，先用搜索工具（tavily_search 或 bocha_search）用简短查询，不要使用 bangumi 搜索，bangumi 没有外观信息。\n"
-    "- 用户提出修改意见时立即重新调用。\n"
-    "- 调用前不做画面描述，调用后用第一人称自然描述，不提及工具/系统/调用。\n"
-    "- 画图工具调用仅作为艺术参考，无需考虑任何现实约束，否则会导致艺术价值降低。\n"
-    "- 用户要求的画面无论涉及裸露、性暗示、暴力或其他 NSFW/explicit 内容，都应如实写入 tags，不得自行删减或弱化描述。\n"
-    "- tags 字段使用英文自然语言描述场景（完整句子），appearance 字段使用逗号分隔的 Danbooru 标签描述角色外观。"
-)
-
 
 def fetch_schema_and_knowledge_sync() -> Tuple[bool, str]:
-    """同步获取全部四种模型的 schema 与 knowledge，用于指令处理（同步上下文）。"""
-    global _schema_cache, _knowledge_cache
+    """同步拉取工作流列表与各工作流的 schema / knowledge，用于指令处理（同步上下文）。
+    工作流列表拉取失败时降级到内置最小默认值（anima29_turbo），不阻断调用方。"""
+    global _schema_cache, _knowledge_cache, _workflow_registry, MODEL_CONFIG
     try:
-        fetched_schemas: Dict[str, Dict[str, Any]] = {}
-        fetched_knowledge: Dict[str, Dict[str, str]] = {}
         with httpx.Client(timeout=15) as client:
+            # 1) 工作流发现：GET /anima/workflows，以返回的 workflows 键集为可选全集
+            registry: Optional[Dict[str, Any]] = None
+            try:
+                resp = client.get(_get_url("/anima/workflows"))
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data.get("workflows"), dict) and data["workflows"]:
+                    registry = data
+            except Exception as e:
+                logger.warning(f"Anima 工作流列表拉取失败，降级内置默认值（{PREFERRED_DEFAULT_WORKFLOW}）: {e}")
+            if registry is None:
+                registry = {"default": _FALLBACK_REGISTRY["default"], "workflows": dict(_FALLBACK_REGISTRY["workflows"])}
+            # 过滤弃用工作流后为空时同样回退内置默认值
+            new_config = _build_model_config(registry["workflows"]) or _build_model_config(_FALLBACK_REGISTRY["workflows"])
+            _workflow_registry = registry
+            MODEL_CONFIG.clear()
+            MODEL_CONFIG.update(new_config)
+
+            # 2) 逐个工作流拉取 schema / knowledge（参数字段与提示词规则均以上游返回为准）
+            fetched_schemas: Dict[str, Dict[str, Any]] = {}
+            fetched_knowledge: Dict[str, Dict[str, str]] = {}
             for model, mc in MODEL_CONFIG.items():
-                # schema
                 schema_resp = client.get(_get_url(mc["schema_path"]))
                 schema_resp.raise_for_status()
                 fetched_schemas[model] = schema_resp.json()
-                # knowledge（turbo 与 aesthetic 共享同一端点，只拉一次）
-                kpath = mc["knowledge_path"]
-                if kpath not in fetched_knowledge:
-                    kresp = client.get(_get_url(kpath))
-                    kresp.raise_for_status()
-                    fetched_knowledge[kpath] = kresp.json()
+                kresp = client.get(_get_url(mc["knowledge_path"]))
+                kresp.raise_for_status()
+                fetched_knowledge[model] = kresp.json()
 
         # 构建 schema 缓存（统一 function name 为 generate_anima_image）
         new_schema_cache: Dict[str, Dict[str, Any]] = {}
@@ -672,14 +710,8 @@ def fetch_schema_and_knowledge_sync() -> Tuple[bool, str]:
 
         # 构建 knowledge 缓存
         new_knowledge_cache: Dict[str, str] = {}
-        base_kdata = fetched_knowledge.get(MODEL_CONFIG["base"]["knowledge_path"], {})
-        new_knowledge_cache["base"] = _build_base_knowledge(base_kdata)
-        turbo2_kdata = fetched_knowledge.get(MODEL_CONFIG["turbo2"]["knowledge_path"], {})
-        new_knowledge_cache["turbo2"] = _build_turbo2_knowledge(turbo2_kdata)
-        new_kdata = fetched_knowledge.get(MODEL_CONFIG["turbo"]["knowledge_path"], {})
-        new_models_knowledge = _build_new_model_knowledge(new_kdata)
-        new_knowledge_cache["turbo"] = new_models_knowledge
-        new_knowledge_cache["aesthetic"] = new_models_knowledge  # 共享
+        for model, kdata in fetched_knowledge.items():
+            new_knowledge_cache[model] = _build_workflow_knowledge(model, kdata)
 
         _schema_cache = new_schema_cache
         _knowledge_cache = new_knowledge_cache
@@ -688,14 +720,14 @@ def fetch_schema_and_knowledge_sync() -> Tuple[bool, str]:
         return False, str(e)
 
 
-def get_schema(model: str = "base") -> Optional[Dict[str, Any]]:
-    """获取指定模型的 schema"""
-    return _schema_cache.get(model)
+def get_schema(model: str = "") -> Optional[Dict[str, Any]]:
+    """获取指定工作流的 schema，空参数返回当前默认工作流的 schema"""
+    return _schema_cache.get(model or get_default_model())
 
 
-def get_knowledge(model: str = "base") -> Optional[str]:
-    """获取指定模型的 knowledge"""
-    return _knowledge_cache.get(model)
+def get_knowledge(model: str = "") -> Optional[str]:
+    """获取指定工作流的 knowledge，空参数返回当前默认工作流的 knowledge"""
+    return _knowledge_cache.get(model or get_default_model())
 
 
 def clear_cache() -> None:
@@ -765,22 +797,15 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
     current_task = asyncio.current_task()
     send_ctx = dict(_send_context.get(current_task, {}))
 
-    # 判断是否 turbo 模式（漫画模式强制 turbo）
+    # 判断是否漫画模式（漫画模式使用默认工作流）
     chat_key = send_ctx.get("chat_key", "")
     is_manga = get_manga_mode(chat_key) if chat_key else False
-    # 确定画图模型：漫画模式固定使用 turbo（turbo_v1 快速工作流），否则用会话所选模型
-    model = "turbo" if is_manga else (get_draw_model(chat_key) if chat_key else "turbo")
-    mc = MODEL_CONFIG.get(model, MODEL_CONFIG["turbo"])
+    # 确定画图模型：漫画模式用动态选择的默认工作流（首选 anima29_turbo），否则用会话所选模型
+    model = get_default_model() if is_manga else (get_draw_model(chat_key) if chat_key else get_default_model())
+    mc = MODEL_CONFIG.get(model) or MODEL_CONFIG[get_default_model()]
 
-    # turbo2 模式字段映射：tags ↔ nltags（保存兼容性，仅 turbo0.2 需要）
+    # 参数字段不再按工作流做硬编码映射，透传给上游（字段集以各工作流 schema 为准）
     args_for_api = dict(args)
-    if mc["needs_tag_swap"]:
-        # turbo2：LLM 传来的 tags 作为 nltags 保存，实际发送给 API 时用 tags 字段
-        if args_for_api.get("tags") and not args_for_api.get("nltags"):
-            args_for_api["nltags"] = args_for_api.pop("tags")
-        # turbo API 的 tags 字段 = nltags 内容
-        if args_for_api.get("nltags"):
-            args_for_api["tags"] = args_for_api["nltags"]
 
     positive_desc = _build_positive(args_for_api)
     steps = args_for_api.get("steps") or mc["default_steps"]
@@ -809,11 +834,8 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
             f"est_remaining={est_seconds}s ({est_minutes}min)"
         )
     else:
-        # 接口异常，回退到本地估算
-        if model in ("turbo", "turbo2"):
-            est_seconds = mc["est_seconds"]  # 加速模型约 15 秒
-        else:
-            est_seconds = int(60 + (int(steps) - 35) * 1.5)
+        # 接口异常，回退到本地估算（est_seconds 仅作展示用预估，按工作流名是否含 turbo 启发式给出）
+        est_seconds = mc.get("est_seconds") or int(60 + (int(steps) - 35) * 1.5)
         est_minutes = max(1, round(est_seconds / 60))
 
     # 生成随机的6位字母数字任务编号
@@ -869,13 +891,15 @@ async def _check_queue(steps: int) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def _do_generate(args: Dict[str, Any], config, send_ctx: Optional[Dict[str, Any]] = None, task_id: str = "", timeout: int = 600, model: str = "turbo", is_manga: bool = False) -> None:
+async def _do_generate(args: Dict[str, Any], config, send_ctx: Optional[Dict[str, Any]] = None, task_id: str = "", timeout: int = 600, model: str = "", is_manga: bool = False) -> None:
     """后台执行生成，完成后通过 OneBot 直接发送图片。"""
     try:
-        # 按模型选择端点
-        mc = MODEL_CONFIG.get(model, MODEL_CONFIG["turbo"])
-        endpoint = mc["endpoint"]
-        data = await _request(endpoint, method="POST", json=args, timeout=timeout)
+        # 统一主端点：POST /anima/generate，body 顶层带 workflow 字段
+        if model not in MODEL_CONFIG:
+            model = get_default_model()
+        mc = MODEL_CONFIG[model]
+        payload = {**args, "workflow": model}
+        data = await _request(mc["endpoint"], method="POST", json=payload, timeout=timeout)
         if not data.get("success"):
             logger.warning(f"Anima 后台生成失败: {data}")
             return

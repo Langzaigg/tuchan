@@ -18,9 +18,16 @@ MAX_TOTAL_TOOL_CALLS = 15  # 单轮总工具调用次数限制，实际值从 LL
 MAX_SEARCH_TOOL_CALLS = 3  # 单轮搜索工具调用次数限制
 TERMINAL_TOOLS = {"generate_anima_image", "remember"}  # 终端工具：超限后仍允许最后一次调用
 SEARCH_TOOL_NAMES = {"bocha_search", "tavily_search"}  # 搜索工具名称
+# 仅在画图场景下暴露的工具：画图工具本体 + 为它确定作画标签的 danbooru_search
+_DRAW_ONLY_TOOLS = {"generate_anima_image", "danbooru_search"}
 
 _CURRENT_CHAT_KEY: ContextVar[str] = ContextVar("naturel_gpt_current_chat_key", default="")
 _CURRENT_TRIGGER_USERID: ContextVar[str] = ContextVar("naturel_gpt_current_trigger_userid", default="")
+# 视觉工具专用快照：触发消息的原始图片 URL 列表（供 vision 工具把 [图片N] 映射回真实 URL）
+# 用 default=None + getter 兜底，避免 list/dict 可变默认值跨上下文共享
+_CURRENT_TRIGGER_IMAGES: ContextVar[Optional[List[str]]] = ContextVar("naturel_gpt_current_trigger_images", default=None)
+# 视觉工具专用快照：视觉模型配置 {model, base_url, api_key, max_tokens, proxy, use_socket_proxy, timeout}
+_CURRENT_VISION_CONFIG: ContextVar[Optional[Dict[str, Any]]] = ContextVar("naturel_gpt_current_vision_config", default=None)
 
 _TOTAL_TOOL_LIMIT_TEXT = f"工具调用次数已达上限（{MAX_TOTAL_TOOL_CALLS}次）。停止继续调用工具，基于已有工具结果直接回答当前用户。"
 _SEARCH_TOOL_LIMIT_TEXT = f"搜索工具调用次数已达上限（{MAX_SEARCH_TOOL_CALLS}次），请基于已有搜索结果回复，不要再调用搜索工具。"
@@ -237,6 +244,24 @@ class TextGenerator(Singleton["TextGenerator"]):
     def _current_trigger_userid(self, value: str) -> None:
         _CURRENT_TRIGGER_USERID.set(str(value or ""))
 
+    @property
+    def _current_trigger_images(self) -> List[str]:
+        """当前触发消息的图片 URL 列表快照（供 vision 工具读取，ContextVar 天然并发安全）。"""
+        return list(_CURRENT_TRIGGER_IMAGES.get() or [])
+
+    @_current_trigger_images.setter
+    def _current_trigger_images(self, value: List[str]) -> None:
+        _CURRENT_TRIGGER_IMAGES.set(list(value or []))
+
+    @property
+    def _current_vision_config(self) -> Dict[str, Any]:
+        """视觉模型配置快照 {model, base_url, api_key, max_tokens, ...}，由 stream_response 按 profile 写入。"""
+        return dict(_CURRENT_VISION_CONFIG.get() or {})
+
+    @_current_vision_config.setter
+    def _current_vision_config(self, value: Dict[str, Any]) -> None:
+        _CURRENT_VISION_CONFIG.set(dict(value or {}))
+
     def is_tool_calling(self, chat_key: Optional[str] = None) -> bool:
         if not hasattr(self, "_tool_calling_chat_keys"):
             self._tool_calling_chat_keys = set()
@@ -286,6 +311,7 @@ class TextGenerator(Singleton["TextGenerator"]):
             "max_summary_tokens": profile.get("max_summary_tokens", 800),
             "timeout": profile.get("timeout", 60),
             "enable_stream": self.config.get("enable_stream", True),
+            "reasoning_effort": profile.get("reasoning_effort"),
         }
         proxy_info = f"socks:{self.proxy}" if self.use_socket_proxy and self.proxy else ("直连" if not self.proxy else self.proxy)
         return f"模型: {self.config['model']} | mini: {self.config['model_mini']} | base_url: {self.base_url or '默认'} | 代理: {proxy_info}"
@@ -310,6 +336,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                 "max_summary_tokens": profile.get("max_summary_tokens", 800),
                 "timeout": profile.get("timeout", 60),
                 "enable_stream": profile.get("enable_stream", self.config.get("enable_stream", True)),
+                "reasoning_effort": profile.get("reasoning_effort"),
             }
             return {
                 "api_key": api_keys[0],
@@ -326,6 +353,30 @@ class TextGenerator(Singleton["TextGenerator"]):
             "proxy": self.proxy,
             "use_socket_proxy": getattr(self, "use_socket_proxy", False),
             "multimodal": getattr(self, "multimodal", True),
+        }
+
+    def _build_vision_config(self, request_profile: Optional[Dict[str, Any]], request_state: Dict[str, Any]) -> Dict[str, Any]:
+        """根据本轮 profile 构造视觉模型配置快照。
+        仅当主模型 multimodal=false 且配置了 model_vision 时返回非空配置，供 vision 工具读取。
+        缺省复用本 profile 的 base_url / api_keys；可选覆盖 model_vision_base_url / model_vision_api_keys / model_vision_max_tokens。
+        """
+        if not request_profile:
+            return {}
+        # 原生多模态 profile 不走视觉工具
+        if request_profile.get("multimodal", request_state.get("multimodal", True)):
+            return {}
+        vision_model = request_profile.get("model_vision")
+        if not vision_model:
+            return {}
+        api_keys = request_profile.get("model_vision_api_keys") or request_profile.get("api_keys") or [""]
+        return {
+            "model": vision_model,
+            "base_url": request_profile.get("model_vision_base_url") or request_profile.get("base_url", "") or "",
+            "api_key": (api_keys[0] if api_keys else "") or "",
+            "max_tokens": request_profile.get("model_vision_max_tokens", 1024),
+            "timeout": request_profile.get("timeout", 60),
+            "proxy": request_profile.get("proxy"),
+            "use_socket_proxy": request_profile.get("use_socket_proxy", False),
         }
 
     def _completion_kwargs(
@@ -389,6 +440,11 @@ class TextGenerator(Singleton["TextGenerator"]):
             value = request_config.get(optional_key)
             if value is not None:
                 kwargs[optional_key] = value
+        # reasoning_effort（如 "low"/"medium"/"high"）：仅主对话请求透传，摘要/印象走 model_mini 不传
+        if type not in {"summarize", "impression"}:
+            reasoning_effort = request_config.get("reasoning_effort")
+            if reasoning_effort is not None:
+                kwargs["reasoning_effort"] = reasoning_effort
         if state.get("base_url"):
             kwargs["base_url"] = state["base_url"]
         # 代理：use_socket_proxy=True 时将 proxy 作为 socks 代理地址
@@ -484,7 +540,7 @@ class TextGenerator(Singleton["TextGenerator"]):
             body["temperature"] = kwargs["temperature"]
         if "max_tokens" in kwargs:
             body["max_tokens"] = kwargs["max_tokens"]
-        for optional_key in ("top_p", "frequency_penalty", "presence_penalty"):
+        for optional_key in ("top_p", "frequency_penalty", "presence_penalty", "reasoning_effort"):
             if optional_key in kwargs:
                 body[optional_key] = kwargs[optional_key]
         if tools:
@@ -541,7 +597,7 @@ class TextGenerator(Singleton["TextGenerator"]):
             body["temperature"] = kwargs["temperature"]
         if "max_tokens" in kwargs:
             body["max_tokens"] = kwargs["max_tokens"]
-        for optional_key in ("top_p", "frequency_penalty", "presence_penalty"):
+        for optional_key in ("top_p", "frequency_penalty", "presence_penalty", "reasoning_effort"):
             if optional_key in kwargs:
                 body[optional_key] = kwargs[optional_key]
         if tools:
@@ -595,12 +651,14 @@ class TextGenerator(Singleton["TextGenerator"]):
         on_text: Optional[ChunkCallback],
         on_reasoning: Optional[ChunkCallback],
         request_state: Optional[Dict[str, Any]] = None,
+        on_tool_call: Optional[Callable] = None,
     ) -> Tuple[str, List[Dict[str, Any]], str]:
         kwargs = self._completion_kwargs(messages, type, True, tools, request_state)
         content_parts: List[str] = []
         reasoning_parts: List[str] = []
         tool_call_chunks: Dict[int, Dict[str, Any]] = {}
         last_usage: Optional[Dict[str, Any]] = None
+        tool_call_notified = False  # 本轮是否已通知过工具调用（每个流式轮只通知一次）
 
         async for chunk in self._stream_iter_openai(kwargs):
             choices = _get(chunk, "choices", [])
@@ -631,6 +689,9 @@ class TextGenerator(Singleton["TextGenerator"]):
                     idx,
                     {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
                 )
+                if on_tool_call and not tool_call_notified:
+                    tool_call_notified = True
+                    await on_tool_call(tool_call)
                 call_id = _get(tool_call, "id", "")
                 if call_id:
                     state["id"] = str(call_id)
@@ -669,6 +730,7 @@ class TextGenerator(Singleton["TextGenerator"]):
         type: str,
         tools: Optional[List[Dict[str, Any]]],
         request_state: Optional[Dict[str, Any]] = None,
+        on_tool_call: Optional[Callable] = None,
     ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
         kwargs = self._completion_kwargs(messages, type, False, tools, request_state)
         response = await self._acompletion(**kwargs)
@@ -676,6 +738,8 @@ class TextGenerator(Singleton["TextGenerator"]):
         message_dict = _message_to_dict(message)
         content = str(message_dict.get("content") or "")
         tool_calls = message_dict.get("tool_calls") or []
+        if tool_calls and on_tool_call:
+            await on_tool_call(tool_calls)
         # 统计非流式请求的 token 消耗
         usage = _get(response, "usage")
         self._last_stream_usage = usage
@@ -731,12 +795,17 @@ class TextGenerator(Singleton["TextGenerator"]):
         request_profile: Optional[Dict[str, Any]] = None,
         on_text: Optional[ChunkCallback] = None,
         on_reasoning: Optional[ChunkCallback] = None,
+        on_tool_call: Optional[Callable] = None,
     ) -> Tuple[str, bool, List[Dict[str, Any]], str]:
         custom = custom or {}
         messages = copy.deepcopy(self._normalize_prompt(prompt, custom))
         request_chat_key = self._current_chat_key
         request_trigger_userid = self._current_trigger_userid
         request_state = self._request_state(request_profile)
+        # 视觉工具快照：触发图片 URL 列表 + 视觉模型配置，按本轮 profile 钉死，避免多群并发串数据。
+        # trigger_images 由 matcher 在调用 stream_response 前写入；这里重新置位以绑定到本次请求的上下文。
+        self._current_trigger_images = list(self._current_trigger_images or [])
+        self._current_vision_config = self._build_vision_config(request_profile, request_state)
         self.last_tool_outputs = []
         if request_chat_key:
             self._last_tool_outputs_by_chat[request_chat_key] = []
@@ -775,7 +844,8 @@ class TextGenerator(Singleton["TextGenerator"]):
             _enable_intercept = False
         elif _draw_mode == "off" or (_draw_mode == "auto" and not _has_draw_request):
             # off 模式或 auto 无画图关键词：过滤掉画图工具
-            tool_schemas = [s for s in tool_schemas if s.get("function", {}).get("name") != "generate_anima_image"]
+            # danbooru_search 只服务于画图时的作画标签确定，随画图工具一起进出，避免闲聊轮白占工具位
+            tool_schemas = [s for s in tool_schemas if s.get("function", {}).get("name") not in _DRAW_ONLY_TOOLS]
             _enable_intercept = False
         else:
             # force 模式：画图关键词时启用拦截；其他模式不拦截
@@ -869,11 +939,11 @@ class TextGenerator(Singleton["TextGenerator"]):
                         async def _draw_on_text(chunk: str):
                             _draw_buf.append(chunk)
                         content, tool_calls, reasoning_content = await self._stream_once(
-                            messages, type, current_tools, _draw_on_text, round_on_reasoning, request_state
+                            messages, type, current_tools, _draw_on_text, round_on_reasoning, request_state, on_tool_call
                         )
                     else:
                         content, tool_calls, reasoning_content = await self._stream_once(
-                            messages, type, current_tools, effective_on_text, round_on_reasoning, request_state
+                            messages, type, current_tools, effective_on_text, round_on_reasoning, request_state, on_tool_call
                         )
                     # 过滤参数 JSON 不完整的 tool_calls（流式截断导致），让模型重试
                     if tool_calls:
@@ -994,7 +1064,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                     messages.append(assistant_msg)
                     tool_messages.append(assistant_msg)
                 else:
-                    content, tool_calls, message_dict = await self._complete_once(messages, type, current_tools, request_state)
+                    content, tool_calls, message_dict = await self._complete_once(messages, type, current_tools, request_state, on_tool_call)
                     # 过滤参数 JSON 不完整的 tool_calls
                     if tool_calls:
                         _valid_tool_calls = []
@@ -1139,13 +1209,13 @@ class TextGenerator(Singleton["TextGenerator"]):
                     continue
                 
                 # 检查联网搜索工具调用次数限制
+                # 注意：超限提示不能在执行工具前插入 messages —— assistant(tool_calls) 消息之后
+                # 必须紧跟对应的 tool 响应消息，中间插入 system 会破坏协议配对，导致上游 400
+                # （"assistant message with 'tool_calls' must be followed by tool messages"）。
+                _search_limit_hit = False
                 if search_tool_calls + current_search_count > MAX_SEARCH_TOOL_CALLS:
                     logger.warning(f"单轮联网搜索工具调用次数超过限制: {search_tool_calls + current_search_count} > {MAX_SEARCH_TOOL_CALLS}")
-                    # 添加临时提示词，提醒大模型不要继续调用搜索工具
-                    messages.append({
-                        "role": "system",
-                        "content": _SEARCH_TOOL_LIMIT_TEXT
-                    })
+                    _search_limit_hit = True
                     internal_control_injected = True
                 
                 # 更新计数器
@@ -1165,6 +1235,14 @@ class TextGenerator(Singleton["TextGenerator"]):
                 finally:
                     self._set_tool_calling(request_chat_key, False)
                     self._notify_tool_done(request_chat_key)
+
+                # 搜索超限提示在工具响应全部追加完成后才插入，
+                # 避免隔断 assistant(tool_calls) → tool 响应的连续配对。
+                if _search_limit_hit:
+                    messages.append({
+                        "role": "system",
+                        "content": _SEARCH_TOOL_LIMIT_TEXT
+                    })
 
                 # 工具上下文超预算时，允许终端工具（画图/记忆）作为最后一轮，然后停止
                 if plugin_config and round_idx < max_rounds:

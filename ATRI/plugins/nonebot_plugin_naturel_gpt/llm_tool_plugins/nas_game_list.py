@@ -38,8 +38,11 @@ _BRAND_SCAN_MAX_DEPTH = 5
 
 
 def _build_index(config) -> Dict:
-    root = Path(getattr(config, "NAS_GAME_ROOT_PATH", r"REDACTED_LOCAL_PATH"))
+    root_str = getattr(config, "NAS_GAME_ROOT_PATH", "")
     brands: List[Dict] = []
+    if not root_str:
+        return {"brands": brands, "index_time": time.time(), "total_games": 0, "root_missing": True}
+    root = Path(root_str)
     if not root.exists():
         logger.warning(f"[NAS Game] 根目录不存在: {root}")
         return {"brands": brands, "index_time": time.time(), "total_games": 0, "root_missing": True}
@@ -154,13 +157,15 @@ init = init_index
 
 
 _FILENAME_RE = re.compile(r"^\[([^\]]+)\]\[([^\]]+)\](.*)")
-_SYNC_RECORDS_PATH = r"C:\Users\momiji\AppData\Roaming\gdown_archiver\sync_records.json"
 
 
-def _read_sync_records() -> List[Dict[str, Any]]:
+def _read_sync_records(config) -> List[Dict[str, Any]]:
     """读取同步记录，返回最近一批（同一天）的记录。"""
+    records_path = getattr(config, "NAS_GAME_SYNC_RECORDS_PATH", "")
+    if not records_path:
+        return []
     try:
-        with open(_SYNC_RECORDS_PATH, "r", encoding="utf-8") as f:
+        with open(records_path, "r", encoding="utf-8") as f:
             records = json.load(f)
     except Exception:
         return []
@@ -222,8 +227,12 @@ def _archive_games(config) -> Tuple[List[str], List[str], List[str]]:
     扫描上传目录，将符合格式的游戏归档到合集对应会社文件夹。
     返回 (成功列表, 重复列表, 无匹配列表)。
     """
-    upload_dir = Path(getattr(config, "NAS_GAME_UPLOAD_PATH", r"REDACTED_LOCAL_PATH"))
-    root = Path(getattr(config, "NAS_GAME_ROOT_PATH", r"REDACTED_LOCAL_PATH"))
+    upload_str = getattr(config, "NAS_GAME_UPLOAD_PATH", "")
+    root_str = getattr(config, "NAS_GAME_ROOT_PATH", "")
+    if not upload_str or not root_str:
+        return [], [], []
+    upload_dir = Path(upload_str)
+    root = Path(root_str)
 
     if not upload_dir.exists():
         return [], [], []
@@ -448,7 +457,7 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
         parts = archive_lines + [summary, recent]
 
         # 读取同步服务最近记录
-        sync_records = _read_sync_records()
+        sync_records = _read_sync_records(config)
         sync_text = _format_sync_records(sync_records)
         if sync_text:
             parts.append(sync_text)

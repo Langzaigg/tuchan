@@ -230,8 +230,8 @@ class ChatData(StoreSerializable):
     active_preset: str = field(default="")
     active_profile: str = field(default="")  # 当前会话使用的 OpenAI profile
     draw_mode: str = field(default="auto")  # 画图模式: force/on/auto/off
-    draw_model: str = field(default="turbo")  # 画图模型: turbo/aesthetic/turbo2/base
-    manga_mode: str = field(default="off")  # 漫画模式: on/off（开启后覆盖 draw_model，固定使用 turbo）
+    draw_model: str = field(default="")  # 画图模型：上游工作流名（可选集由 /anima/workflows 动态决定），空 = 动态默认（首选 anima29_turbo）
+    manga_mode: str = field(default="off")  # 漫画模式: on/off（开启后覆盖 draw_model，使用动态默认工作流）
     manga_style: str = field(default="")    # 漫画模式自定义画风描述
     unlock_content_limit: Optional[bool] = field(default=None)  # 内容限制解锁开关（None=使用配置默认值）
     preset_datas: Dict[str, PresetData] = field(default_factory=dict)
@@ -259,13 +259,18 @@ class ChatData(StoreSerializable):
         raw_draw_mode = str(getattr(self, "draw_mode", "auto") or "auto")
         self.draw_mode = raw_draw_mode if raw_draw_mode in ("force", "on", "auto", "off") else "auto"
         # 画图模型迁移：旧 turbo_mode(bool) → draw_model(str)
+        # 合法取值由上游 /anima/workflows 动态决定，此处不做名单校验；
+        # 旧内部名映射与默认值回退由读取侧的 anima_generate.get_draw_model() 完成
         raw_draw_model = str(getattr(self, "draw_model", "") or "")
-        if raw_draw_model in ("turbo", "aesthetic", "turbo2", "base"):
+        if raw_draw_model:
             self.draw_model = raw_draw_model
         else:
-            # 旧数据兼容：turbo_mode=True → turbo, False → base
+            # 旧数据兼容：turbo_mode=True → turbo, False → base；从未设置过 → 留空（读取时动态选默认）
             legacy_turbo = getattr(self, "turbo_mode", None)
-            self.draw_model = "turbo" if (legacy_turbo is None or legacy_turbo) else "base"
+            if legacy_turbo is None:
+                self.draw_model = ""
+            else:
+                self.draw_model = "turbo" if legacy_turbo else "base"
         # 清理旧字段
         if hasattr(self, "turbo_mode"):
             try:

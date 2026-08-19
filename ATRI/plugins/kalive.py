@@ -34,7 +34,7 @@ from nonebot.adapters.onebot.v11 import Adapter
 # 设置文件路径和读取间隔
 file_path = KaLiveConfig.config['log_path']
 json_path = './data/kalive/kalive.json'
-jrlp_path = 'Z:/upload/图片/今日老婆'
+jrlp_path = KaLiveConfig.config.get('jrlp_path', '')
 interval = KaLiveConfig.config['interval']  # 间隔5秒
 ddns_url = KaLiveConfig.config['ddns_url']
 

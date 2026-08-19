@@ -1,142 +1,69 @@
-![](https://socialify.git.ci/Kyomotoi/ATRI/image?description=1&descriptionEditable=A%20project%20for%20ATRI%2C%20Usage%20go-CQHTTP%20%2B%20NoneBot2.&forks=1&issues=1&language=1&logo=https%3A%2F%2Fi.loli.net%2F2020%2F11%2F12%2FYcINCkyp8vK2inD.png&owner=1&pattern=Circuit%20Board&stargazers=1&theme=Light)
+# 兔酱
 
-# ATRI——一个厨力项目
-アトリは、高性能ですから！
+基于 NoneBot2 + OneBot v11 的 QQ 群聊机器人。
 
-[![time tracker](https://wakatime.com/badge/github/Kyomotoi/ATRI.svg)](https://wakatime.com/badge/github/Kyomotoi/ATRI)
+核心功能由 `nonebot_plugin_naturel_gpt` 插件提供：以 LLM 驱动的人格化群聊 + 一整套原生 Tool Calling 工具集。
 
-[![](https://img.shields.io/github/license/Kyomotoi/ATRI?style=for-the-badge)](https://www.gnu.org/licenses/gpl-3.0.html)
-[![](https://img.shields.io/badge/QQgroup-567297659-blue?style=for-the-badge)](https://jq.qq.com/?_wv=1027&k=a89kfKQE)
+> 本项目早期基于 [Kyomotoi/ATRI](https://github.com/Kyomotoi/ATRI) 二次开发，遵循 GPLv3 协议开源。
 
-- 文档:
-    - [传送门 1](https://atri.kyomotoi.moe)
-    - [传送门 2](https://project-atri-docs.vercel.app)
+## 核心：Naturel GPT 插件
 
-- [更新日志](changelog.md)
+- **人格化群聊**：人格从 `config/personas/` 热加载（`.md` 单文件 / skill 文件夹两种格式），运行中可按群切换；像真实群友一样自然分段回复
+- **原生工具调用**（OpenAI-compatible Tool Calling）：
+  - 联网搜索：Tavily（主）/ 博查（fallback）、Tavily Extract 网页正文提取
+  - 网页抓取：短链还原、SSR、Playwright 渲染多策略链
+  - 搜图识图：Pixiv、Danbooru、Bangumi 番组、AnimeTrace 以图识角色
+  - AI 画图：ComfyUI Anima 工作流（动态发现、按群开关、漫画模式）
+  - 长期记忆：群记忆 / 用户记忆，由模型自主维护
+  - NAS 游戏目录查询（白名单群限定）
+  - 视觉理解：纯文本模型可借助独立视觉模型"看"图
+- **多模态输入**：群图片自动解析进上下文，内置异步图片缓存与门控策略
+- **长期陪伴**：per-turn 用户印象、非触发消息缓冲、上下文压缩摘要，长对话不断片
+- **多模型配置**：`OPENAI_PROFILES` 多组配置，按群运行时切换；流式分段回复
 
-## 关于（About）
+详细文档见 [ATRI/plugins/nonebot_plugin_naturel_gpt/README.md](ATRI/plugins/nonebot_plugin_naturel_gpt/README.md)。
 
-本项目名称、灵感均来自 [ANIPLEX](https://aniplex-exe.com/) 发行的 [ATRI-My Dear Moments-](https://atri-mdm.com/)
+## 其他内置插件
 
-本项目中所使用的任何有关 ATRI 的图标、LOGO，解释权、著作权均归 [ANIPLEX](https://aniplex-exe.com/)。你可以[在此](https://aniplex-exe.com/guidelines/)查看相关内容
+| 插件 | 功能 |
+|------|------|
+| `nonebot_plugin_repeater` | 复读 + 撤回还原提示 |
+| `nonebot_plugin_fortune` | 每日运势 |
+| `nonebot_plugin_analysis_bilibili` | B 站链接 / 小程序解析 |
+| `nonebot_plugin_bilibilibot` | B 站动态、直播订阅推送 |
+| `kalive` | 私有直播服务集成（开播通知、今日老婆、服务器状态）；地址、群号等敏感项全部走 `config.yml`，不入库 |
+| `applet` / `essential` / `help` / `manage` / `status` / `util` / `broadcast` / `repo` | 小程序处理、基础部件、帮助、管理、状态、小工具等 |
 
-为QQ群中复现一个优秀的功能性机器人是本项目的目标
+## 运行
 
-## 声明（Attaction）
+环境：Python 3.10+，以及一个 OneBot v11 协议端（go-cqhttp / NapCat / Lagrange 等）。
 
-**一切开发旨在学习，请勿用于非法用途**
+```bash
+pip install -r requirements.txt
+python main.py
+```
 
-## 实现（Work）
+首次运行前需要准备本地配置（均被 .gitignore 排除，不会提交）：
 
-本项目可以在**任何平台**下运行，只要你具备基本的 `Python >= 3.8` 环境和一根接入互联网的网线
+- `config.yml`：机器人基础配置（账号、超级用户、KaLive 等）
+- `config/naturel_gpt_config.yml`：LLM 插件配置（API key、模型、工具开关等），缺失项会自动补默认值
+- `config/personas/`：人格文件目录
 
-实现方式为 `go-cqhttp 或其它遵守Onebot标准的协议` + `NoneBot2`
+## 目录结构
 
-因项目的特殊性，会不定时进行更新。更新日志：请关注commit
+```text
+ATRI/                   # 机器人框架与插件
+└── plugins/
+    └── nonebot_plugin_naturel_gpt/   # 核心 LLM 插件（含 llm_tool_plugins/ 工具集）
+config/                 # 本地配置与人格（不提交）
+data/                   # 运行数据（不提交）
+main.py                 # 入口
+```
 
-再一个：由于学业原因，在 `2022年6月` 前不会有太大的更新，当然，欢迎提交 `Pull Request`
+## 声明
 
-## 功能概览（Preview）
+一切开发旨在学习，请勿用于非法用途。运行期间因行为违反当地法律法规而被处理的，本项目概不承担任何责任。
 
-> 此页面只展示主要功能，详细请在示例群内 **@机器人** 并发送`菜单`以获取帮助
+## 协议
 
-> 如碰到示例机器人未响应，大概率是寄了
-
-- 涩批:
-    - 文爱
-    - 涩图
-    - 涩图嗅探
-    - 涩批翻译机
-
-- 实用:
-    - 在线运行代码
-    - 伪造转发内容
-    - 以图搜图
-    - 以图搜番
-    - ATRI语（加密、解密，改自[`rcnb`](https://github.com/rcnbapp/RCNB.js)）
-    - 简单骰子
-
-- 娱乐:
-    - 看不懂的笑话
-    - 今天吃什么
-    - 老婆！
-
-- 其他:
-    - B站小程序解析
-    - 状态查看
-
-**TODO**:
-
-  - [ ] 网页控制台
-  - [ ] RSS订阅
-  - [ ] B站动态订阅
-  - [ ] 冷重启
-  - [ ] 进裙验证（问题可自定义）
-  - [ ] 好感度系统（目前优先在[`go-ATRI`](https://github.com/Kyomotoi/go-ATRI)上实现）
-  - [ ] 模拟韭菜
-
-## 特别感谢（Thanks）
-
-[Bot Universe](https://github.com/botuniverse): [Onebot标准](https://onebot.dev/)
-
-[Mrs4s](https://github.com/Mrs4s): [go-cqhttp](https://github.com/Mrs4s/go-cqhttp)
-
-[NoneBot](https://github.com/nonebot): [NoneBot2](https://github.com/nonebot/nonebot2)
-
-[Richard Chien](https://github.com/richardchien), [Mnixry](https://github.com/mnixry) and GoCQHTTP Dev Group
-
-[JetBrains](https://www.jetbrains.com/?from=ATRI): 为本项目提供 [PyCharm](https://www.jetbrains.com/pycharm/?from=ATRI) 等 IDE 的授权<br>
-[<img src="https://cdn.jsdelivr.net/gh/Kyomotoi/CDN@master/noting/jetbrains-variant-3.png" width="200"/>](https://www.jetbrains.com/?from=ATRI)
-
-以及以下朋友们：
-<details markdown='1'><summary>*/ω＼*(</summary>
-    *排名不分现后*<br>
-    · 50861735 11.00 CNY<br>
-    · 1072324725 17.00 CNY<br>
-    · AfdianUser_quGy 5.00 CNY<br>
-    · 1752179928 56.14 CNY<br>
-    · Mikasa 66.00 CNY<br>
-    · SkipM4 32.00 CNY<br>
-    · Chunk7 33.00 CNY<br>
-    · Wwwwwwalnut 10.00 CNY<br>
-    · 演变 5.00 CNY<br>
-    · 梓哟P 23.33 CNY<br>
-    · Ohdmire 20.00 CNY<br>
-    · TerRALi 23.45 CNY<br>
-    · 虾仁 10.00 CNY<br>
-    · Tianli 11.00 CNY
-</details>
-
-## 支持（Support）
-
-本项目已启用爱发电，你的支持就是对开发者的最大鼓励！
-
-并会将你的ID写在项目**特别感谢**一栏。
-
--> https://afdian.net/@Kyomotoi
-
-## 贡献（Contribute）
-
-如果你在运行本项目中发现任何问题，你可以：
-
-- [提交 Issue](https://github.com/Kyomotoi/ATRI/issues)
-- [提交 Pull request](https://github.com/Kyomotoi/ATRI/pulls)
-- [在反馈群内进行反馈](https://jq.qq.com/?_wv=1027&k=WoAAYXbJ)
-
-
-- 提交 `Pull request` 时，请注意：
-
-    - 所提交的代码尽量与原仓库代码风格保持一致
-    - 遵守 [`PEP-8`](https://www.python.org/dev/peps/pep-0008/) 标准
-    - 变量名清晰明了
-    - 包含单元测试（对插件的修改/添加）
-    
-    如果你是初次提交 `Pull request`，请先阅读[这篇文章](https://atri.kyomotoi.moe/developer/overview/)
-
-## 协议（License）
-
-本项目使用 [GPLv3](https://www.gnu.org/licenses/gpl-3.0.html) 协议
-
-意味着你可以运行本项目，并向你的用户提供服务，但出现对本项目源码进行修改，则需要将你修改后的版本对你的用户`开源`
-
-在运行本项目期间，行为违反当地法律法规的而被处理的，本项目概不承担任何责任
+[GPLv3](https://www.gnu.org/licenses/gpl-3.0.html)

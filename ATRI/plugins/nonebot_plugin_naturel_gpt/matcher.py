@@ -546,6 +546,38 @@ def _normalize_reply_segment(text: str) -> str:
     return text.strip().strip("*';；").rstrip("。").strip()
 
 
+# 各种括号配对（含全半角），用于识别"整条被一对括号包围"的噪音分段
+_BRACKET_PAIRS = (
+    ("（", "）"),
+    ("(", ")"),
+    ("【", "】"),
+    ("[", "]"),
+    ("「", "」"),
+    ("『", "』"),
+    ("{", "}"),
+    ("＜", "＞"),
+    ("<", ">"),
+    ("〖", "〗"),
+)
+_BRACKET_CHARS = "".join("".join(p) for p in _BRACKET_PAIRS)
+
+
+def _is_bracket_wrapped(text: str) -> bool:
+    """判断文本是否整条被一对括号包围（如（图片已发送）、（无需发送）、【思考】等）。
+
+    仅匹配单层括号包裹、内层不再含任何括号字符的内容，避免误伤
+    （a）b（c）这类括号仅出现在首尾的普通文本。
+    """
+    if not text:
+        return False
+    for opener, closer in _BRACKET_PAIRS:
+        if text.startswith(opener) and text.endswith(closer):
+            inner = text[len(opener):-len(closer)]
+            if not any(c in inner for c in _BRACKET_CHARS):
+                return True
+    return False
+
+
 def _is_bad_request_error(text: Optional[str]) -> bool:
     if not text:
         return False
@@ -986,6 +1018,11 @@ async def do_msg_response(
     tg = TextGenerator.instance
     tg._current_chat_key = chat_key  # 设置当前会话key供工具使用
     tg._current_trigger_userid = trigger_userid  # 设置当前用户id供工具使用
+    # 触发消息图片URL快照，供 vision 工具把 [图片N] 映射回真实URL。
+    # 视觉 profile 下 get_chat_prompt_template 已把整个上下文图片全局重编号写入 chat._vision_context_images，
+    # 优先用它（覆盖历史/context_only 图片）；否则回退触发消息本身的 image_urls。
+    _vision_imgs = getattr(chat, "_vision_context_images", None)
+    tg._current_trigger_images = list(_vision_imgs) if _vision_imgs else list(image_urls or [])
     request_profile = _snapshot_request_profile(chat)
     text_tokens, prompt_image_count = _count_prompt_text_and_images(prompt_template, tg)
     logger.info(
@@ -1023,6 +1060,11 @@ async def do_msg_response(
     _thinking_mode = bool(request_profile.get("thinking", True))  # 该 profile 是否为思考模式（默认开启）
     _saw_reasoning = False      # 本次是否收到过 reasoning_content（模型走了正常思考通道）
     _skip_think_buffer_mode = False  # 模型跳过思考标签、content 可能混入思考时，收完再发避免泄漏
+    _tool_called = False        # 本次请求是否发生过工具调用（用于过滤"整条被括号包围"的噪音分段）
+
+    async def _on_tool_call(tool_calls: List[Dict[str, Any]]) -> None:
+        nonlocal _tool_called
+        _tool_called = True
 
     async def send_segment(segment: str) -> None:
         nonlocal sent_segments, last_send_time
@@ -1035,6 +1077,12 @@ async def do_msg_response(
         if not reply_text:
             return
         if re.match(r'^[^\u4e00-\u9fa5\w]{1}$', reply_text):
+            return
+        # 工具调用场景下，过滤"整条被括号包围"的分段（如（图片已发送）、（无需发送）、【思考】等），
+        # 这类是模型对工具执行过程的元描述/思考，与聊天无关，不发送到群里。
+        if _tool_called and _is_bracket_wrapped(reply_text):
+            if config.DEBUG_LEVEL > 0:
+                logger.info(f"[工具调用噪音] 忽略整条被括号包围的分段: {reply_text!r}")
             return
         now = time.time()
         wait_time = max(0.0, float(config.REPLY_SEGMENT_INTERVAL) - (now - last_send_time))
@@ -1116,6 +1164,7 @@ async def do_msg_response(
                 request_profile=request_profile,
                 on_text=on_text_chunk,
                 on_reasoning=on_reasoning_chunk,
+                on_tool_call=_on_tool_call,
             )
 
             # 每次失败都保存完整的未脱敏 error log（即使后续会重试）

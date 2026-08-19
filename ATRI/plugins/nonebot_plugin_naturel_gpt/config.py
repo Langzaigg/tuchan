@@ -67,6 +67,10 @@ class Config(BaseModel, extra=Extra.ignore):
     """是否启用上下文摘要压缩，启用后超窗口的历史会被压缩为摘要"""
     CONTEXT_COMPRESS_THRESHOLD_RATIO: float
     """压缩触发阈值乘数，溢出超过窗口*此比例才触发摘要生成，默认0.5"""
+    CONTEXT_SUMMARY_TARGET_CHARS: int = 800
+    """上下文摘要目标字数（提示词软限制，硬截断为2倍）；profile 的 max_summary_tokens 可覆盖"""
+    IMPRESSION_TARGET_CHARS: int = 200
+    """用户印象目标字数（提示词软限制，硬截断为2倍）"""
     TOOL_CONTEXT_TOKEN_BUDGET: int
     """工具消息token预算，超出时全部抛弃"""
     TOOL_CONTEXT_MODE: int
@@ -192,6 +196,8 @@ class Config(BaseModel, extra=Extra.ignore):
     """NAS Galgame 合集下载基础 URL"""
     NAS_GAME_WHITELIST_GROUPS: List[str]
     """NAS Galgame 合集功能白名单群号"""
+    NAS_GAME_SYNC_RECORDS_PATH: str
+    """NAS 游戏同步服务记录文件路径（sync_records.json）"""
 
     UNLOCK_CONTENT_LIMIT: bool
     """解锁内容限制（全局默认值；每群可通过 rg nolimit on/off 独立覆盖，持久化存储）"""
@@ -232,6 +238,8 @@ CONFIG_TEMPLATE = {
     'CONTEXT_WINDOW_SIZE': 16,  # 上下文窗口大小（对话轮数），每轮=1条用户消息+1条回复
     'CONTEXT_SUMMARY_ENABLED': False,  # 是否启用上下文摘要压缩
     'CONTEXT_COMPRESS_THRESHOLD_RATIO': 0.5,  # 压缩触发阈值乘数，溢出超过窗口*此比例才触发摘要生成
+    'CONTEXT_SUMMARY_TARGET_CHARS': 800,  # 上下文摘要目标字数（提示词软限制，硬截断为2倍）；profile 的 max_summary_tokens 可覆盖
+    'IMPRESSION_TARGET_CHARS': 200,  # 用户印象目标字数（提示词软限制，硬截断为2倍）
     'TOOL_CONTEXT_TOKEN_BUDGET': 16384,  # 工具消息token预算（含思考），超出时从旧到新逐组去除
     'TOOL_CONTEXT_MODE': 3,  # 工具上下文模式: 1=完整工具+思考, 2=仅思考, 3=仅工具调用摘要
 
@@ -305,6 +313,7 @@ CONFIG_TEMPLATE = {
     'NAS_GAME_UPLOAD_PATH': '',
     'NAS_GAME_BASE_URL': '',
     'NAS_GAME_WHITELIST_GROUPS': [],  # NAS Galgame 功能白名单群号，如 ['123456789', '987654321']
+    'NAS_GAME_SYNC_RECORDS_PATH': '',  # NAS 游戏同步服务记录文件路径（sync_records.json），为空则不读取同步记录
 
     'UNLOCK_CONTENT_LIMIT': False,  # 解锁内容限制（全局默认值，每群可通过 rg nolimit on/off 独立覆盖）
 
@@ -429,6 +438,8 @@ def _load_config_obj_from_file()->Config:
                         "frequency_penalty": config_obj_from_file.get("CHAT_FREQUENCY_PENALTY"),
                         "presence_penalty": config_obj_from_file.get("CHAT_PRESENCE_PENALTY"),
                         "extra_prompt": "",
+                        # 视觉工具：纯文本主模型可委托视觉模型理解图片（仅文档化默认值，读取处用 .get 兜底）
+                        "model_vision": "mimo",
                     },
                     "kimi": {
                         "api_keys": config_obj_from_file.get("OPENAI_API_KEYS", []),

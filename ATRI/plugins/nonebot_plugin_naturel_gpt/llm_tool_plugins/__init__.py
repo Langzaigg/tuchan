@@ -91,11 +91,11 @@ def init_tools(config) -> None:
 
 def enable_anima_tool() -> bool:
     """注册 Anima 画图工具到 TOOL_REGISTRY，返回是否成功。
-    同时加载全部四种模型（base/turbo2/turbo/aesthetic）的 schema，运行时根据 draw_model 选择。"""
-    # 加载所有模型 schema（base 作为默认注册，运行时按 draw_model 动态替换）
-    base_schema = anima_generate.get_schema("base")
-    if base_schema and "generate_anima_image" not in TOOL_REGISTRY:
-        TOOL_REGISTRY["generate_anima_image"] = (base_schema, anima_generate.run)
+    可选工作流与 schema 在启动时从 GET /anima/workflows 及各工作流的 schema 端点动态拉取，
+    运行时根据 draw_model 选择；此处以当前默认工作流的 schema 作为注册占位。"""
+    default_schema = anima_generate.get_schema(anima_generate.get_default_model())
+    if default_schema and "generate_anima_image" not in TOOL_REGISTRY:
+        TOOL_REGISTRY["generate_anima_image"] = (default_schema, anima_generate.run)
         return True
     return False
 

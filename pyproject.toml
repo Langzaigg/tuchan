@@ -1,13 +1,9 @@
 [tool.poetry]
-name = "ATRI"
+name = "tujiang"
 version = "0.0.1"
-description = "仅用于自动格式化代码"
-authors = ["Kyomotoi <kyomotoiowo@gmail.com>"]
+description = "兔酱 - 基于 NoneBot2 + OneBot v11 的 QQ 机器人"
 license = "GPLv3"
 readme = "README.md"
-homepage = "https://github.com/Kyomotoi/ATRI"
-repository = "https://github.com/Kyomotoi/ATRI"
-documentation = "https://github.com/Kyomotoi/ATRI/wiki"
 
 [tool.poetry.dependencies]
 python = "^3.8"

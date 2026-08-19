@@ -78,6 +78,16 @@ class ChatPromptMixin:
             "当用户说\"记住/记下/别忘了/保存\"或\"忘记/忘掉/删除记忆\"时，必须立即调用 remember 工具执行对应的记忆操作，不要只在口头上答应。多个记忆同时操作时优先使用 consolidate 一次性批量完成。\n"
         ) if config.LLM_ENABLE_TOOLS else ""
 
+        # 视觉工具提示：主模型为纯文本（multimodal=false）且配置了 model_vision 时，
+        # 提示模型用 vision 工具理解 [图片N] 占位符（全局编号，覆盖整个对话上下文），禁止凭空猜测图片内容。
+        if self._is_vision_profile_active():
+            tool_text += (
+                "\n对话上下文中出现的 [图片N] 占位符代表用户发送的图片，编号在整个上下文中全局唯一（1..N），你无法直接看到图片内容。"
+                "需要识别、描述或理解任何一张图（包括历史消息和非触发上下文里的图）时，调用 vision 工具，"
+                "传入 image_index（对应 [图片N] 的 N）和你想问的问题；工具会返回图片的文字描述，你基于描述回答用户。"
+                "禁止凭空猜测图片内容，也不要告诉用户你看不到图。\n"
+            )
+
         tg = TextGenerator.instance
 
         rules = [   # 规则提示
@@ -155,8 +165,8 @@ class ChatPromptMixin:
         conditional_parts = []
         if config.LLM_ENABLE_TOOLS and _should_inject_anima:
             if _is_manga:
-                # 漫画模式：固定使用 turbo knowledge + 漫画规则
-                anima_knowledge = anima_generate.get_knowledge("turbo")
+                # 漫画模式：默认工作流 knowledge（动态选择，首选 anima29_turbo）+ 漫画规则
+                anima_knowledge = anima_generate.get_knowledge(anima_generate.get_default_model())
                 if anima_knowledge:
                     manga_style = anima_generate.get_manga_style(self.chat_key)
                     # 自定义画风放在最前面，确保 LLM 优先看到
@@ -172,14 +182,10 @@ class ChatPromptMixin:
                 draw_model = anima_generate.get_draw_model(self.chat_key)
                 anima_knowledge = anima_generate.get_knowledge(draw_model)
                 if anima_knowledge:
-                    _MODEL_LABELS = {
-                        "turbo": "Turbo v1 绘画技能",
-                        "aesthetic": "Aesthetic v1 绘画技能",
-                        "turbo2": "Turbo 绘画技能",
-                        "base": "绘画技能",
-                    }
-                    mode_label = _MODEL_LABELS.get(draw_model, "绘画技能")
-                    conditional_parts.append(f"[你的{mode_label}]\n{anima_knowledge}")
+                    # 技能标签取工作流 description 的首段（由上游返回动态生成）
+                    _mc = anima_generate.MODEL_CONFIG.get(draw_model) or {}
+                    mode_label = _mc.get("short_label") or draw_model
+                    conditional_parts.append(f"[你的{mode_label} 绘画技能]\n{anima_knowledge}")
         if extra_prompt:
             conditional_parts.append(extra_prompt)
         if conditional_parts:
@@ -372,6 +378,73 @@ class ChatPromptMixin:
                     msg["content"] = [item for item in content if not (isinstance(item, dict) and item.get("type") == "image_url")]
                     if not msg["content"]:
                         msg["content"] = "[图片已省略]"
+
+    def _is_vision_profile_active(self) -> bool:
+        """当前会话 profile 是否为视觉模式（纯文本主模型 multimodal=false + 配置了 model_vision）。
+        视觉模式下跳过多模态图片注入门控，改走全局收集+重编号，让 vision 工具覆盖整个对话上下文。"""
+        if not config.LLM_ENABLE_TOOLS:
+            return False
+        _prof_name = self.get_active_profile()
+        _profile = config.OPENAI_PROFILES.get(_prof_name, {}) or {}
+        return (not _profile.get("multimodal", True)) and bool(_profile.get("model_vision"))
+
+    async def _apply_vision_image_context(
+        self,
+        normal_messages: List[Dict[str, Any]],
+        normal_items: List[ChatMessageData],
+        item_to_msg_idx: Dict[int, int],
+    ) -> List[str]:
+        """视觉模式：全局收集整个对话上下文的图片 URL，并把各消息文本里的 [图片N] 重编号为全局唯一 1..N。
+        返回全局图片 URL 列表（顺序与 [图片N] 的 N 一一对应），供 vision 工具按 image_index 索引。
+        纯文本主模型收不到 image_url（被 _completion_kwargs 剥离），所以这里不注入 image_url 块，
+        只重排文本占位符；图片由 vision 工具按需经 image_cache.resolve_urls 现下载（缓存命中即加速）。"""
+        import re as _re
+        _PLACEHOLDER_RE = _re.compile(r"\[图片(\d+)\]")
+        global_urls: List[str] = []
+        g = 0  # 全局计数器（已分配的最大编号）
+        for item in normal_items:
+            if not isinstance(item, ChatMessageData):
+                continue
+            imgs = [u for u in (item.images or []) if self._is_supported_image_url(u)]
+            if not imgs:
+                continue
+            msg_idx = item_to_msg_idx.get(id(item))
+            if msg_idx is None or msg_idx >= len(normal_messages):
+                continue
+            msg = normal_messages[msg_idx]
+            content = msg.get("content")
+            if not isinstance(content, str):
+                # 视觉模式下 content 应为纯文本（未注入 image_url）；非 string 则跳过，避免破坏结构
+                continue
+            # 按出现顺序重编号现有 [图片N] 占位符，映射到全局号；同时收集对应 URL
+            # item.images 顺序与 _extract_message_text_and_images 的 [图片N] 顺序一致
+            out: List[str] = []
+            last = 0
+            ph_count = 0
+            for m in _PLACEHOLDER_RE.finditer(content):
+                out.append(content[last:m.start()])
+                if ph_count < len(imgs):
+                    g += 1
+                    global_urls.append(imgs[ph_count])
+                    out.append(f"[图片{g}]")
+                else:
+                    # 文本里的 [图片N] 比 item.images 多（异常数据），仍全局重编号保持唯一
+                    g += 1
+                    out.append(f"[图片{g}]")
+                ph_count += 1
+                last = m.end()
+            out.append(content[last:])
+            new_content = "".join(out)
+            # item.images 比占位符多（无占位符的图，如 context_only 文本未提取占位符）：追加 [图片N] 标记
+            if len(imgs) > ph_count:
+                extras: List[str] = []
+                for url in imgs[ph_count:]:
+                    g += 1
+                    global_urls.append(url)
+                    extras.append(f"[图片{g}]")
+                new_content = (new_content + " " + " ".join(extras)) if new_content else " ".join(extras)
+            msg["content"] = new_content
+        return global_urls
 
     @staticmethod
     def _is_tool_summary_system_message(msg: Dict[str, Any]) -> bool:
@@ -616,7 +689,19 @@ class ChatPromptMixin:
 
         # === 图片门控 ===
         if include_images and config.MULTIMODAL_ENABLE:
-            await self._apply_image_gating(normal_messages, normal_items, item_to_msg_idx)
+            if self._is_vision_profile_active():
+                # 视觉模式（纯文本主模型 + model_vision）：跳过多模态注入门控，
+                # 改为全局收集整个上下文图片 + 全局重编号 [图片N]，供 vision 工具按 image_index 访问。
+                # 图片对纯文本主模型本就被 _completion_kwargs 剥离，注入 image_url 无意义；
+                # 且门控的 context_only→触发消息注入会产生无占位符的孤儿图，故整条跳过。
+                self._vision_context_images = await self._apply_vision_image_context(
+                    normal_messages, normal_items, item_to_msg_idx
+                )
+            else:
+                self._vision_context_images = []
+                await self._apply_image_gating(normal_messages, normal_items, item_to_msg_idx)
+        else:
+            self._vision_context_images = []
 
         # 普通消息token预算检查
         trigger_idx = -1

@@ -430,39 +430,49 @@ class ChatSummaryMixin:
             new_summary = None
             summary_prompt = ""
             summary_response = ""
-            # 从配置读取摘要字数限制（中文约 1 token ≈ 1 字）
-            max_summary_chars = max(200, tg.config.get('max_summary_tokens', 800))
-            hard_summary_limit = max(1000, max_summary_chars * 2)  # 安全兜底：最大 1000 字或 2 倍软限制
+            # 字数软目标（中文约 1 token ≈ 1 字）：profile 显式设置的 max_summary_tokens 优先，
+            # 否则回退到全局 CONTEXT_SUMMARY_TARGET_CHARS；硬截断固定为软目标的 2 倍
+            max_summary_chars = max(100, int(request_profile.get('max_summary_tokens') or config.CONTEXT_SUMMARY_TARGET_CHARS))
+            hard_summary_limit = max_summary_chars * 2
             # 读取最新的 previous_summary（可能已被前一个任务更新）
             latest_previous = preset.context_summary.strip()
+            # 已长期保存的群记忆：交给摘要模型，避免摘要重复记录
+            memory_block = ""
+            if config.MEMORY_ACTIVE:
+                memory_lines = [
+                    f"{k}: {str(v)[:60]}"
+                    for k, v in (self._get_chat_memory() or {}).items()
+                    if v
+                ]
+                if memory_lines:
+                    memory_block = "[已保存的长期记忆，无需在摘要中重复]\n" + "\n".join(memory_lines) + "\n\n"
             for attempt in range(max_retries):
                 current_date = time.strftime('%Y-%m-%d')
                 summary_prompt_text = (
-                    f"[已有压缩摘要]\n{latest_previous or '无'}\n\n"
-                    f"[本次需要合并的旧对话]\n{overflow_text}\n\n"
-                    "请把旧对话中的关键信息合并进已有摘要，按上述格式输出新的上下文摘要。"
+                    f"{memory_block}"
+                    f"[已有摘要]\n{latest_previous or '无'}\n\n"
+                    f"[待合并的旧对话]\n{overflow_text}\n\n"
+                    "把旧对话合并进已有摘要，按格式输出新的摘要。"
                 )
                 prompt = [
                     {"role": "system", "content": (
-                        "你是上下文摘要助手。请将提供的对话历史合并进已有摘要，生成一份持续可用的上下文速查。\n\n"
+                        "你是上下文摘要助手。把旧对话合并进已有摘要，产出供后续对话使用的会话速查。\n\n"
+                        "本摘要只负责会话/群层面的内容：\n"
+                        "- 当前话题：正在讨论什么、进展到哪一步、各方观点和未解决的问题；保持话题间的连贯，能看出话题如何演变。\n"
+                        "- 群历史：按日期（到天）记录对后续仍有价值的群事件、共同约定和关键决策，只留高信号条目。\n\n"
+                        "不要记录：\n"
+                        "- 用户的性格、爱好、说话风格等个人特质（由用户印象单独维护）。\n"
+                        "- 已保存的长期记忆内容（称呼、生日等事实由 remember 记忆工具负责）。\n"
+                        "- 功能调用过程本身（画图/搜索指令等）；但从中反映出的群体氛围或共同偏好可简记。\n\n"
                         "要求：\n"
-                        "1. 与用户个人印象互补。个人印象里已经记录的性格、兴趣、说话风格等不要在本摘要中重复；"
-                        "本摘要只保留会话/群层面的事实、事件、共识、待办和需要后续记住的信息。\n"
-                        "2. 按固定格式输出，不要添加格式以外的内容。\n"
-                        "3. 功能调用性质的聊天记录（画图指令、搜索指令、工具调用请求等）不作为事实依据或共识纳入摘要；"
-                        "但从中反映出的用户的偏好倾向（如画风偏好、常用搜索主题等）可以适度记录。\n\n"
+                        "- 合并而非堆叠：新信息覆盖旧摘要中重复或过时的部分。\n"
+                        "- 不编造，只保留对后续对话有价值的内容。\n"
+                        f"- 总长控制在 {max_summary_chars} 字以内；超限时优先压缩 [群历史] 中的低价值旧条目。\n\n"
                         "输出格式：\n\n"
-                        "[上下文摘要]\n"
-                        "概括当前会话状态、关键事实、共识、未完成的讨论和需要后续记住的信息。"
-                        "只保留对后续对话有价值的内容。\n\n"
-                        "[时间线]\n"
-                        f"按日期（到天）列出对后续对话仍有价值的事件、话题转折、共同约定、关键决策。当前日期为 {current_date}。"
-                        "只保留高信号事件，不要记录每一句闲聊。\n\n"
-                        "注意：\n"
-                        "- 新信息应覆盖旧摘要中重复或过时的部分，避免同一件事反复累积。\n"
-                        "- 不编造不存在的信息。\n"
-                        "- 如果总长度可能超过限制，优先删除[时间线]中价值较低的条目，核心[上下文摘要]最后保留。\n"
-                        f"- 总长度控制在 {max_summary_chars} 字以内。"
+                        "[当前话题]\n"
+                        "当前讨论焦点、进展和未决问题。\n\n"
+                        "[群历史]\n"
+                        f"按日期（到天）列出事件、约定和决策。当前日期为 {current_date}。"
                     )},
                     {"role": "user", "content": summary_prompt_text},
                 ]
@@ -552,23 +562,40 @@ class ChatSummaryMixin:
                 if not user_lines:
                     continue
                 nickname_info = f"（群昵称: {imp.nickname}）" if imp.nickname else ""
+                # 字数软目标：全局 IMPRESSION_TARGET_CHARS；硬截断固定为软目标的 2 倍
+                imp_target_chars = max(100, int(config.IMPRESSION_TARGET_CHARS))
+                imp_hard_limit = imp_target_chars * 2
+                # 已保存的用户记忆会与印象并列注入上下文，提示印象避免重复记录
+                user_mem_block = ""
+                if config.MEMORY_ACTIVE:
+                    user_mem_lines = [
+                        f"{k}: {str(v)[:60]}"
+                        for k, v in (self._get_user_memory(uid) or {}).items()
+                        if v
+                    ]
+                    if user_mem_lines:
+                        user_mem_block = "[已保存的用户记忆，无需在印象中重复]\n" + "\n".join(user_mem_lines) + "\n\n"
                 imp_prompt = [
                     {"role": "system", "content": (
-                        f"你是{preset_key}。根据用户的对话历史，简洁地更新对用户的印象。"
-                        "包括性格特点、兴趣爱好、说话风格等关键信息。\n\n"
-                        "重要规则：\n"
-                        "- 功能调用性质的语句（如画图指令\"帮我画一张XX\"、搜索指令\"搜索一下XX\"、工具调用请求等）"
-                        "不作为该用户的性格或事实依据，不应纳入印象描述。\n"
-                        "- 但从功能调用中反映出的偏好倾向可以适度总结："
-                        "如画风偏好（常用画师风格）、常用搜索主题、喜欢的功能类型等。\n"
-                        "- 用户在画图后发表的对结果的评价（\"好看\"\"不对\"\"太暗了\"等）属于用户反馈，可以反映审美偏好。\n\n"
-                        "直接输出印象文本，不要添加前缀或标签。"
+                        f"你是{preset_key}。根据近期对话更新对某用户的印象，供后续对话参考。\n\n"
+                        "印象只负责用户个人层面的内容：\n"
+                        "- 性格与说话风格、爱好与兴趣、习惯与偏好倾向、与你的关系和互动模式。\n\n"
+                        "不要记录：\n"
+                        "- 群话题、事件、约定（由上下文摘要负责）。\n"
+                        "- 已保存的用户记忆内容（称呼、生日等事实会与印象并列注入，无需重复）。\n"
+                        "- 功能调用过程本身（如画图/搜索指令）；但指令反映出的偏好倾向可以记，"
+                        "用户对画图结果的评价（\"好看\"\"太暗了\"等）可反映审美偏好。\n\n"
+                        "要求：\n"
+                        "- 更新而非追加：新观察覆盖或修正旧印象，删掉不再适用的描述。\n"
+                        "- 只写有依据的内容，不编造。\n"
+                        f"- {imp_target_chars} 字以内，直接输出印象文本，不要前缀或标签。"
                     )},
                     {"role": "user", "content": (
                         f"[用户{nickname_info}]\n"
+                        f"{user_mem_block}"
                         f"[已有印象]\n{imp.chat_impression or '无'}\n\n"
                         f"[近期对话]\n{chr(10).join(user_lines)}\n\n"
-                        f"请以{preset_key}的视角简要更新对该用户的印象，包括该用户的性格特点、兴趣爱好、说话风格等关键信息，300字内，只输出印象文本。"
+                        f"请以{preset_key}的视角更新对该用户的印象，{imp_target_chars} 字以内，只输出印象文本。"
                     )},
                 ]
                 imp_response = ""
@@ -577,9 +604,9 @@ class ChatSummaryMixin:
                     imp_response = imp_res or ""
                     if imp_success and imp_res and imp_res.strip():
                         imp_text = imp_res.strip()
-                        # 硬截断：超出软限制2倍时才截断
-                        if len(imp_text) > 600:
-                            imp_text = imp_text[:600]
+                        # 硬截断：超出软目标 2 倍时才截断
+                        if len(imp_text) > imp_hard_limit:
+                            imp_text = imp_text[:imp_hard_limit]
                         imp.chat_impression = imp_text
                         impression_results[uid] = imp.chat_impression
                 except Exception as e:

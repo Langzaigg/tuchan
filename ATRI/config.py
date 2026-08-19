@@ -56,6 +56,17 @@ class Setu:
     reverse_proxy_domain: str = config.get("reverse_proxy_domain", str())
 
 
+class Repeater:
+    config: dict = config.get("Repeater", {})
+
+    # 复读生效群（"all" 表示全部群）
+    group: list = config.get("group", [])
+    # 复读触发概率生效群
+    whitelist: list = config.get("whitelist", [])
+    # 撤回还原功能生效群白名单，默认空，需在 config.yml 配置
+    recall_whitelist: list = config.get("recall_whitelist", [])
+
+
 RUNTIME_CONFIG = {
     "host": BotSelfConfig.host,
     "port": BotSelfConfig.port,
@@ -68,4 +79,7 @@ RUNTIME_CONFIG = {
     "gocq_accounts": InlineGoCQHTTP.accounts,
     "gocq_download_domain": InlineGoCQHTTP.download_domain,
     "gocq_version": InlineGoCQHTTP.download_version,
+    "repeater_group": Repeater.group,
+    "repeater_whitelist": Repeater.whitelist,
+    "repeater_recall_whitelist": Repeater.recall_whitelist,
 }

@@ -19,8 +19,8 @@ def init():
     nonebot.init(**RUNTIME_CONFIG)
     driver().register_adapter(Adapter)
     nonebot.load_plugins("ATRI/plugins")
-    nonebot.load_plugin("nonebot_plugin_anime_trace")
-    nonebot.load_plugin("nonebot_plugin_imagesearch")
+    # nonebot.load_plugin("nonebot_plugin_anime_trace")
+    # nonebot.load_plugin("nonebot_plugin_imagesearch")
     nonebot.load_plugin('hikari_bot')
     if InlineGoCQHTTP.enabled:
         nonebot.load_plugin("nonebot_plugin_gocqhttp")

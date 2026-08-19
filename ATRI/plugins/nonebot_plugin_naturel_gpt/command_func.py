@@ -534,19 +534,23 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
     mode = param_dict.get('mode', '').strip()
     valid_modes = ('force', 'on', 'auto', 'off')
 
-    # 无参数：显示当前模式 + 模型
+    # 无参数：显示当前模式 + 模型（可用模型列表来自上游 /anima/workflows，弃用工作流不列出）
     if not mode:
         current = anima_generate.get_chat_mode(chat.chat_key)
         model = anima_generate.get_draw_model(chat.chat_key)
+        models_desc = " ".join(
+            f"{name}({mc.get('short_label') or name}{',默认' if name == anima_generate.get_default_model() else ''})"
+            for name, mc in anima_generate.MODEL_CONFIG.items()
+        )
         return {'msg': (
             f"当前画图模式: {current}\n"
             f"当前画图模型: {model}\n"
             f"用法:\n"
             f"  rg draw <force|on|auto|off>  切换画图模式\n"
-            f"  rg draw <turbo|aesthetic|turbo2|base>  切换画图模型（可简写 t|a|t2|b）\n"
+            f"  rg draw <模型名>  切换画图模型\n"
             f"  rg draw <json字符串>  根据 JSON 创建绘图任务\n"
             f"  rg draw-XXXXXX  查询绘图提示词\n"
-            f"模型说明: turbo=turbo_v1(新加速) aesthetic=aesthetic_v1(新高质量) turbo2=turbo0.2(原turbo) base=普通"
+            f"可用模型: {models_desc}"
         )}
 
     # 检查是否是 JSON 字符串（以 { 开头）
@@ -556,7 +560,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
     # 模式切换 / 模型切换
     mode_lower = mode.lower()
 
-    # 画图模型切换：turbo/aesthetic/turbo2/base（或简写 t/a/t2/b）
+    # 画图模型切换：可选模型由上游 /anima/workflows 动态决定（含旧名/简写兼容）
     resolved_model = anima_generate.resolve_model_alias(mode_lower)
     if resolved_model:
         current_draw_mode = anima_generate.get_chat_mode(chat.chat_key)
@@ -569,10 +573,10 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
                 return {'msg': f"加载画图规范失败: {err}"}
         anima_generate.set_draw_model(chat.chat_key, resolved_model)
         mc = anima_generate.MODEL_CONFIG[resolved_model]
-        return {'msg': f"画图模型已切换为 {resolved_model}（{mc['label']}）(￣▽￣)-ok!"}
+        return {'msg': f"画图模型已切换为 {resolved_model}（{mc.get('short_label') or mc['label']}）(￣▽￣)-ok!"}
 
     if mode_lower not in valid_modes:
-        return {'msg': f"无效参数: {mode}\n用法: rg draw <force|on|auto|off|turbo|aesthetic|turbo2|base>"}
+        return {'msg': f"无效参数: {mode}\n用法: rg draw <force|on|auto|off|模型名>，可用模型: {', '.join(anima_generate.MODEL_CONFIG.keys())}"}
 
     mode = mode_lower
     if mode == 'off':
@@ -617,7 +621,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
     # 兼容旧指令 rg turbo on/off，已废弃，请改用 rg draw <model>
     mode = param_dict.get('mode', '').strip().lower()
     model = anima_generate.get_draw_model(chat.chat_key)
-    hint = "（此指令已废弃，请改用 rg draw <turbo|aesthetic|turbo2|base>，可简写 t|a|t2|b）"
+    hint = f"（此指令已废弃，请改用 rg draw <模型名>，可用: {', '.join(anima_generate.MODEL_CONFIG.keys())}）"
 
     # 无参数：显示当前模型
     if not mode:
@@ -626,8 +630,11 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
     if mode not in ('on', 'off'):
         return {'msg': f"无效参数: {mode}\n{hint}"}
 
-    # 兼容映射：on → turbo（turbo_v1），off → base（普通）
-    target = "turbo" if mode == "on" else "base"
+    # 兼容映射：on → 动态默认加速工作流（首选 anima29_turbo），off → base（不可用时回退默认）
+    if mode == "on":
+        target = anima_generate.get_default_model()
+    else:
+        target = anima_generate.resolve_model_alias("base") or anima_generate.get_default_model()
     current_draw_mode = anima_generate.get_chat_mode(chat.chat_key)
     if current_draw_mode == 'off':
         return {'msg': "画图功能当前已关闭，请先使用 rg draw <on|auto> 开启画图。" + hint}
@@ -649,7 +656,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
         style = anima_generate.get_manga_style(chat.chat_key)
         status = "开启" if current else "关闭"
         style_info = f"\n当前画风: {style}" if style else ""
-        return {'msg': f"当前漫画模式: {status}{style_info}\n用法:\n  rg manga on/off  开启/关闭漫画模式\n  rg manga <画风描述>  开启漫画模式并设置自定义画风\n  rg manga clr  清除自定义画风\n漫画模式下 bot 会主动画图来增强角色扮演沉浸感，无视 draw_model 选项，固定使用 turbo 工作流。"}
+        return {'msg': f"当前漫画模式: {status}{style_info}\n用法:\n  rg manga on/off  开启/关闭漫画模式\n  rg manga <画风描述>  开启漫画模式并设置自定义画风\n  rg manga clr  清除自定义画风\n漫画模式下 bot 会主动画图来增强角色扮演沉浸感，无视 draw_model 选项，使用动态选择的默认工作流（首选 anima29_turbo）。"}
 
     # 清除画风
     if mode.lower() == 'clr':
@@ -752,15 +759,9 @@ def _create_draw_task_from_json(json_str: str, chat: Chat) -> dict:
     # 构建绘图参数（填充默认值）
     draw_args = dict(prompt_data)
     draw_model = anima_generate.get_draw_model(chat.chat_key)
-    mc = anima_generate.MODEL_CONFIG.get(draw_model, anima_generate.MODEL_CONFIG["turbo"])
+    mc = anima_generate.MODEL_CONFIG.get(draw_model) or anima_generate.MODEL_CONFIG[anima_generate.get_default_model()]
 
-    # turbo2 模式字段映射：tags ↔ nltags（保存兼容性，仅 turbo0.2 需要）
-    if mc["needs_tag_swap"]:
-        if draw_args.get('tags') and not draw_args.get('nltags'):
-            draw_args['nltags'] = draw_args['tags']
-            draw_args['tags'] = ''
-        if draw_args.get('nltags'):
-            draw_args['tags'] = draw_args['nltags']
+    # 参数字段不再按工作流做硬编码映射，透传给上游（字段集以各工作流 schema 为准）
 
     if not draw_args.get('steps'):
         draw_args['steps'] = str(mc["default_steps"])
@@ -796,10 +797,8 @@ def _create_draw_task_from_json(json_str: str, chat: Chat) -> dict:
         est_seconds = est_seconds + queue_length * 90 - 30
         est_minutes = max(1, round(est_seconds / 60))
     else:
-        if draw_model in ("turbo", "turbo2"):
-            est_seconds = mc["est_seconds"]
-        else:
-            est_seconds = int(60 + (int(draw_args.get('steps', 35)) - 35) * 1.5)
+        # est_seconds 仅作展示用预估，按工作流配置给出
+        est_seconds = mc.get("est_seconds") or int(60 + (int(draw_args.get('steps', 35)) - 35) * 1.5)
         est_minutes = max(1, round(est_seconds / 60))
 
     # 提交后台生成任务
@@ -846,7 +845,11 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
         lines = ["可用配置:"]
         for name, p in profiles.items():
             marker = " ← 当前" if name == chat_profile else ""
-            lines.append(f"  {name}: {p.get('model', '?')} / {p.get('model_mini', '?')}{marker}")
+            # 纯文本模型 + model_vision 配置时展示视觉模式
+            vision_tag = ""
+            if not p.get("multimodal", True) and p.get("model_vision"):
+                vision_tag = f" / 视觉:{p.get('model_vision')}"
+            lines.append(f"  {name}: {p.get('model', '?')} / {p.get('model_mini', '?')}{vision_tag}{marker}")
         lines.append(f"\n用法: rg model <配置名>")
         return {'msg': '\n'.join(lines)}
 
@@ -934,7 +937,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
 【画图相关】
   rg draw              查看画图模式和模型
   rg draw <mode>       切换画图模式 (force/on/auto/off)
-  rg draw <model>      切换画图模型 (turbo/aesthetic/turbo2/base，可简写 t/a/t2/b)
+  rg draw <model>      切换画图模型（可用: {', '.join(anima_generate.MODEL_CONFIG.keys())}）
   rg draw <json>       根据JSON创建绘图任务
   rg draw-XXXXXX       查询绘图提示词
   rg manga [on|off|画风] 漫画模式（主动画图增强沉浸感）
