@@ -539,8 +539,8 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
         current = anima_generate.get_chat_mode(chat.chat_key)
         model = anima_generate.get_draw_model(chat.chat_key)
         models_desc = " ".join(
-            f"{name}({mc.get('short_label') or name}{',默认' if name == anima_generate.get_default_model() else ''})"
-            for name, mc in anima_generate.MODEL_CONFIG.items()
+            f"{name}{'(默认)' if name == anima_generate.get_default_model() else ''}"
+            for name in anima_generate.MODEL_CONFIG.keys()
         )
         return {'msg': (
             f"当前画图模式: {current}\n"
@@ -612,7 +612,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
         config.COMFYUI_ENABLED = True
         save_config()
 
-    mode_desc = {'force': '常驻+拦截', 'on': '常驻', 'auto': '按需注入'}
+    mode_desc = {'force': '常驻+强制调用', 'on': '常驻', 'auto': '常驻（由工具描述约束调用时机）'}
     return {'msg': f"Anima 画图已设为 {mode} 模式（{mode_desc[mode]}）(￣▽￣)-ok!"}
 
 
@@ -630,7 +630,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
     if mode not in ('on', 'off'):
         return {'msg': f"无效参数: {mode}\n{hint}"}
 
-    # 兼容映射：on → 动态默认加速工作流（首选 anima29_turbo），off → base（不可用时回退默认）
+    # 兼容映射：on → 动态默认加速工作流（首选 fuse），off → base（不可用时回退默认）
     if mode == "on":
         target = anima_generate.get_default_model()
     else:
@@ -656,7 +656,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
         style = anima_generate.get_manga_style(chat.chat_key)
         status = "开启" if current else "关闭"
         style_info = f"\n当前画风: {style}" if style else ""
-        return {'msg': f"当前漫画模式: {status}{style_info}\n用法:\n  rg manga on/off  开启/关闭漫画模式\n  rg manga <画风描述>  开启漫画模式并设置自定义画风\n  rg manga clr  清除自定义画风\n漫画模式下 bot 会主动画图来增强角色扮演沉浸感，无视 draw_model 选项，使用动态选择的默认工作流（首选 anima29_turbo）。"}
+        return {'msg': f"当前漫画模式: {status}{style_info}\n用法:\n  rg manga on/off  开启/关闭漫画模式\n  rg manga <画风描述>  开启漫画模式并设置自定义画风\n  rg manga clr  清除自定义画风\n漫画模式下 bot 会主动画图来增强角色扮演沉浸感，无视 draw_model 选项，使用动态选择的默认工作流（首选 fuse）。"}
 
     # 清除画风
     if mode.lower() == 'clr':

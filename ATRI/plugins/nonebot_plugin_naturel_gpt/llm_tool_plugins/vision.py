@@ -59,9 +59,10 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
         return "视觉模型未配置（model_vision 为空），无法理解图片。", []
 
     # 3) URL → data URI（复用 image_cache，含 LRU 缓存 / QQ UA+Referer / 坏 URL 记忆）
+    # 强制 base64：视觉模型调用链没有 400 回退重试，直传失败无法兜底
     from .. import image_cache
     try:
-        resolved = await image_cache.resolve_urls([url])
+        resolved = await image_cache.resolve_urls([url], force_base64=True)
     except Exception as e:
         logger.warning(f"[vision] 图片下载异常: {e!r} | {str(url)[:80]}")
         return "图片下载失败，请让用户重新发送。", []

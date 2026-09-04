@@ -106,7 +106,7 @@ schema = {
     "type": "function",
     "function": {
         "name": "browse_url",
-        "description": "Open a web page and return readable text with links. Resolves short links to their real URLs first, then extracts content via structured parsing for known social platforms or a real headless browser for JS-rendered pages (lightweight generic fallback when the browser is unavailable).",
+        "description": "Open a web page and return readable text with links. Resolves short links to their real URLs first, then extracts content via structured parsing for known social platforms or a real headless browser for JS-rendered pages, with lightweight generic cleanup and server-side extraction as fallbacks when the browser is unavailable or blocked.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -310,6 +310,32 @@ async def _fetch_with_trafilatura(url: str, config) -> Optional[str]:
     return text or None
 
 
+async def _fetch_with_tavily_extract(url: str, config) -> Optional[str]:
+    """Tavily Extract 服务端爬取（最终兜底）：客户端抓取全部失败时，
+    用 Tavily 服务器端代抓页面（反爬/JS 渲染失败场景），返回 Markdown。无 key 或失败返回 None。"""
+    from .tavily_search import _active_api_key
+    if not _active_api_key:
+        return None
+    payload = {"urls": [url], "extract_depth": "advanced", "format": "markdown"}
+    headers = {"Authorization": f"Bearer {_active_api_key}", "Content-Type": "application/json"}
+    try:
+        timeout = getattr(config, "WEB_FETCH_TIMEOUT", 60)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post("https://api.tavily.com/extract", json=payload, headers=headers)
+        if resp.status_code != 200:
+            from ..logger import logger
+            logger.warning(f"[browse_url] tavily extract 兜底返回 {resp.status_code}")
+            return None
+        data = resp.json()
+    except Exception:
+        return None
+    results = data.get("results", []) or []
+    if not results:
+        return None
+    content = (results[0].get("raw_content") or "").strip()
+    return content or None
+
+
 def _truncate_for_output(text: str, max_chars: int, offset: int) -> Tuple[str, bool, int]:
     """对纯文本按 max_chars/offset 截断，返回 (片段, 是否还有更多, 总长度)。"""
     total = len(text)
@@ -504,6 +530,18 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
     # ---- 4. trafilatura 通用清洗兜底（playwright 不可用 / 失败 / 内容空时） ----
     try:
         md = await _fetch_with_trafilatura(resolved_url, config)
+        if md:
+            text, has_more, total_len = _truncate_for_output(md, max_chars, offset)
+            if has_more:
+                nxt = offset + len(text)
+                return f"{short_banner}{text}\n\n[内容已截断，总长度 {total_len} 字符。使用 offset={nxt} 继续读取]", []
+            return f"{short_banner}{text}", []
+    except Exception:
+        pass
+
+    # ---- 5. tavily extract 服务端代抓（客户端策略全部失败后的最终兜底，反爬/JS 渲染场景） ----
+    try:
+        md = await _fetch_with_tavily_extract(resolved_url, config)
         if md:
             text, has_more, total_len = _truncate_for_output(md, max_chars, offset)
             if has_more:

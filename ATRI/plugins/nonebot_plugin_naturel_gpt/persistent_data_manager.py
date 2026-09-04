@@ -1,6 +1,8 @@
+import asyncio
 import json
 import os
 import pickle
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -15,6 +17,9 @@ from .store import StoreEncoder, StoreSerializable
 
 
 driver = get_driver()
+
+# 序列化+写盘在执行器线程中跑时用这把锁串行化，避免并发写同一个 .tmp 文件
+_SAVE_LOCK = threading.Lock()
 
 
 def _is_model_request_error_text(content: str) -> bool:
@@ -230,7 +235,7 @@ class ChatData(StoreSerializable):
     active_preset: str = field(default="")
     active_profile: str = field(default="")  # 当前会话使用的 OpenAI profile
     draw_mode: str = field(default="auto")  # 画图模式: force/on/auto/off
-    draw_model: str = field(default="")  # 画图模型：上游工作流名（可选集由 /anima/workflows 动态决定），空 = 动态默认（首选 anima29_turbo）
+    draw_model: str = field(default="")  # 画图模型：上游工作流名（可选集由 /anima/workflows 动态决定），空 = 动态默认（首选 fuse）
     manga_mode: str = field(default="off")  # 漫画模式: on/off（开启后覆盖 draw_model，使用动态默认工作流）
     manga_style: str = field(default="")    # 漫画模式自定义画风描述
     unlock_content_limit: Optional[bool] = field(default=None)  # 内容限制解锁开关（None=使用配置默认值）
@@ -510,17 +515,39 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
             except OSError:
                 pass
 
+    def _dump_to_file(self):
+        """实际的序列化+写盘（可在工作线程执行）。失败仅告警，由下一次保存兜底；
+        原子写（.tmp + os.replace）保证失败不会损坏已有数据文件。"""
+        with _SAVE_LOCK:
+            try:
+                if config.NG_DATA_PICKLE:
+                    self._save_to_file_pickle()
+                else:
+                    self._save_to_file_json()
+            except Exception as e:
+                # 序列化期间数据被并发修改（如 remember 写入记忆字典）会导致失败，
+                # 属可恢复场景：文件未被破坏，下次保存重写即可
+                logger.warning(f"数据保存失败（下次保存自动重试）: {e!r}")
+                return
+        logger.info("数据保存成功")
+
     def save_to_file(self, must_save: bool = False):
+        """节流持久化。事件循环运行中时把序列化+写盘卸载到执行器线程，避免大 JSON
+        dump 阻塞 bot 响应；无运行中循环（启动迁移等场景）退化为同步写。"""
         if not must_save and time.time() - self._last_save_data_time < 60:
             return
-
-        if config.NG_DATA_PICKLE:
-            self._save_to_file_pickle()
-        else:
-            self._save_to_file_json()
-
         self._last_save_data_time = time.time()
-        logger.info("数据保存成功")
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._dump_to_file()
+        else:
+            loop.run_in_executor(None, self._dump_to_file)
+
+    def save_to_file_blocking(self):
+        """同步保存并等待完成，仅 shutdown 钩子使用，保证进程退出前落盘。"""
+        self._last_save_data_time = time.time()
+        self._dump_to_file()
 
     def get_all_chat_keys(self) -> List[str]:
         return list(self._datas.keys())
@@ -598,5 +625,5 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
 @driver.on_shutdown
 async def _():
     logger.info("正在保存数据，完成前请勿强制结束")
-    PersistentDataManager.instance.save_to_file(must_save=True)
+    PersistentDataManager.instance.save_to_file_blocking()
     logger.info("保存完成")

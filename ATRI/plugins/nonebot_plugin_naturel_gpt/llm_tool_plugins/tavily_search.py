@@ -9,12 +9,18 @@ _active_api_key: str = ""
 
 
 def should_load(config) -> bool:
-    return bool(_active_api_key) and not _tavily_disabled
+    """tavily key 可用时注册；仅配置 bocha key 时也注册（run 内部直通 bocha fallback，
+    保证对模型始终只暴露 tavily_search 一个搜索工具）。"""
+    if _active_api_key and not _tavily_disabled:
+        return True
+    return bool(getattr(config, "BOCHA_API_KEY", None))
 
 
 def init(config) -> None:
-    """启动时检查所有 key 的额度，选用剩余最多的那个。"""
+    """启动时检查所有 key 的额度，选用剩余最多的那个。幂等：已选出 key 时不重复查询（__init__.py 预初始化后 _discover_tools 会再调一次）。"""
     global _active_api_key
+    if _active_api_key:
+        return
     keys = getattr(config, "TAVILY_API_KEY", []) or []
     if not keys:
         return
@@ -68,7 +74,7 @@ def _build_schema():
             "description": (
                 "网页搜索工具。当你对用户的问题不确定、不了解、或涉及实时信息（新闻、天气、股价等）时，应主动使用此工具搜索以给出准确回答。"
                 "不要猜测不确定的事实，优先搜索验证。人物、角色、作品资料搜索必须先用短查询定位可靠页面，只保留核心名称和少量来源/类型限定；"
-                "先搜索页面，再用 fetch_url 抓取页面文本核对细节。"
+                "先搜索页面，再用 browse_url 抓取页面文本核对细节。"
             ),
             "parameters": {
                 "type": "object",
@@ -121,31 +127,29 @@ def _format_results(data: dict, max_chars: int = 6000) -> str:
 
 
 async def _fallback_to_bocha(args: Dict[str, Any], config) -> str:
+    """Tavily 失败时的服务端内部 fallback：直接调用 bocha_search（不注册独立 schema，
+    对模型只暴露 tavily_search 一个搜索工具）。"""
     global _tavily_disabled
     _tavily_disabled = True
 
-    from . import TOOL_REGISTRY
-    if "bocha_search" not in TOOL_REGISTRY:
+    if getattr(config, "BOCHA_API_KEY", None):
         try:
             from . import bocha_search
-            if getattr(config, "BOCHA_API_KEY", None):
-                TOOL_REGISTRY["bocha_search"] = (bocha_search.schema, bocha_search.run)
-                logger.info("[tavily_search] 已动态注册 bocha_search 作为 fallback")
+            logger.warning("[tavily_search] Tavily 调用失败，切换到内部 bocha fallback")
+            result, _ = await bocha_search.run(args, config)
+            return result
         except Exception as e:
-            logger.error(f"[tavily_search] 动态注册 bocha_search 失败: {e}")
+            logger.error(f"[tavily_search] bocha fallback 调用失败: {e}")
 
-    if "bocha_search" in TOOL_REGISTRY:
-        logger.warning("[tavily_search] Tavily 调用失败，切换到 bocha_search")
-        _, bocha_run = TOOL_REGISTRY["bocha_search"]
-        result, _ = await bocha_run(args, config)
-        return result
-
-    logger.error("[tavily_search] Tavily 调用失败，且 bocha_search 不可用")
+    logger.error("[tavily_search] Tavily 调用失败，且 bocha fallback 不可用")
     return "搜索服务暂时不可用，请稍后再试。"
 
 
 async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
     if not _active_api_key:
+        # 未配置 tavily key：仅配置 bocha key 的部署直通 bocha fallback
+        if getattr(config, "BOCHA_API_KEY", None):
+            return await _fallback_to_bocha(args, config), []
         return "Tavily 搜索未配置 TAVILY_API_KEY。", []
 
     query = str(args.get("query") or "").strip()

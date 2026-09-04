@@ -174,6 +174,8 @@ OPENAI_PROFILES:
 - `OPENAI_ACTIVE_PROFILE`：默认激活的 profile。
 - 每个会话可独立设置 active_profile，运行时自动切换。
 - `extra_prompt`：模型专用追加提示词，会注入到 System 2 末尾，用于特定模型调优。
+- `no_think`：`true` 时在响应规则中注入 `/no_think` 指令，用于显式关闭模型思考（默认 `false`）。
+- `keep_reasoning`：`true` 时跨轮持久化历史中的 `reasoning_content` 随请求发送（默认 `false`，provider 400 拒绝时自动剥离重试一次）；同一轮工具循环内的思考链始终保留。
 - 旧版扁平键（如 `OPENAI_API_KEYS`、`CHAT_MODEL`）会自动迁移为 `default` profile。
 
 ### ⚡ 流式响应
@@ -233,7 +235,8 @@ MULTIMODAL_MAX_MESSAGES_WITH_IMAGES: 2
 ```yaml
 LLM_ENABLE_TOOLS: true
 LLM_MAX_TOOL_ROUNDS: 3
-LLM_DISABLED_TOOLS: []  # 按模块名禁用指定工具，如 fetch_url
+LLM_TOOL_LOOP_MAX_SECONDS: 180  # 工具调用循环总耗时上限（秒），超时进入终端收尾轮
+LLM_DISABLED_TOOLS: []  # 按模块名禁用指定工具，如 pixiv_search
 ```
 
 插件使用原生工具调用，不再支持旧版 `/#tool&args#/` 文本协议，也不再加载旧扩展系统。
@@ -242,19 +245,16 @@ LLM_DISABLED_TOOLS: []  # 按模块名禁用指定工具，如 fetch_url
 
 | 工具 | 用途 |
 |------|------|
-| `tavily_search` | Tavily 联网搜索（主搜索工具） |
-| `tavily_extract` | Tavily 服务端网页正文提取（反爬 / JS 页面兜底） |
-| `bocha_search` | 博查搜索（Tavily 不可用时自动回落） |
-| `browse_url` | 网页抓取（短链还原 → SSR → Playwright 渲染 → trafilatura 兜底） |
+| `tavily_search` | Tavily 联网搜索（唯一暴露的搜索工具；Tavily 失败时内部回落博查） |
+| `browse_url` | 网页抓取（短链还原 → SSR → Playwright 渲染 → trafilatura → Tavily 服务端代抓兜底） |
 | `pixiv_search` | Lolicon API 搜索 Pixiv 图片 |
 | `danbooru_search` | Danbooru 标签检索（画图提示词辅助） |
-| `bangumi_search` | Bangumi 番组 / 角色搜索 |
+| `bangumi` | Bangumi 番组数据库（单工具 action 分发：search_subject / get_subject / search_character / search_person / calendar） |
 | `anime_trace` | AnimeTrace 以图识角色 |
 | `generate_anima_image` | ComfyUI Anima AI 画图（`anima_generate.py`） |
 | `memory` | 长期记忆（群 / 用户 scope，模型自主维护） |
 | `nas_game_list` | NAS 游戏目录查询（白名单群限定） |
 | `vision` | 视觉理解：纯文本模型借助独立视觉模型看图 |
-| `fetch_url` | 轻量 HTTP 抓取（功能已被 `browse_url` 覆盖，建议禁用） |
 
 新增工具时，建议新增独立 Python 文件，并在 `llm_tools.py` 的注册表中挂载。
 
@@ -266,15 +266,11 @@ LLM_DISABLED_TOOLS: []  # 按模块名禁用指定工具，如 fetch_url
 TAVILY_API_KEY: []  # 支持多 key，启动时自动选用剩余额度最多的 key
 ```
 
-配置 key 后自动注册；Tavily 不可用时自动回落 `bocha_search`。
+配置 key 后自动注册；Tavily 调用失败时自动经内部 fallback 调用博查搜索（不注册独立工具）；仅配置 `BOCHA_API_KEY` 时也会注册本工具并直通博查。
 
-#### tavily_extract
+#### bocha_search（内部 fallback）
 
-用途：Tavily 服务端爬取网页正文（Markdown / 纯文本），适合反爬或需 JS 渲染的页面。共享 Tavily key，随 Tavily 可用自动注册。
-
-#### bocha_search
-
-用途：调用博查搜索 API 联网搜索，作为 Tavily 的 fallback。
+用途：博查搜索 API，作为 Tavily 的服务端内部 fallback，不注册独立工具 schema。
 
 ```yaml
 BOCHA_API_KEY: ''
@@ -286,7 +282,7 @@ BOCHA_SEARCH_COUNT: 20
 
 #### browse_url
 
-用途：多策略网页抓取：短链还原 → 已知社交平台 SSR → Playwright 渲染 → trafilatura 正文提取兜底。
+用途：多策略网页抓取：短链还原 → 已知社交平台 SSR → Playwright 渲染 → trafilatura 正文提取 → Tavily Extract 服务端代抓（最终兜底，反爬 / JS 渲染失败场景，需配置 Tavily key）。
 
 ```yaml
 WEB_FETCH_TIMEOUT: 20
@@ -485,27 +481,29 @@ rg help                 # 帮助
 
 #### 四层系统消息结构
 
-最终发送给模型的对话上下文由 4 条系统消息 + 结构化历史消息组成：
+最终发送给模型的对话上下文由 4 条头部系统消息 + 结构化历史消息 + 尾部记忆提醒（可选）组成：
 
 1. **System 1 — 角色与响应规则**  
-   人格设定、基础响应规则、工具基础规则。这条消息最稳定，用于最大化 prompt 缓存命中。
+   人格设定、基础响应规则、工具基础规则、画图行为短规则。这条消息最稳定，用于最大化 prompt 缓存命中。
 
-2. **System 2 — 条件知识**  
-   根据当前状态注入：Anima 绘画技能（`force`/`on`/`auto` 或漫画模式）、模型专用追加提示词（`extra_prompt`）。只在需要时追加，不影响 System 1 的稳定性。
+2. **System 2 — 模型专用追加提示词**  
+   仅当前 profile 配置了 `extra_prompt` 时注入；画图知识常驻 `generate_anima_image` 的 schema description，不再占用系统消息。
 
-3. **System 3 — 记忆与日期**  
-   群记忆、用户记忆、记忆提醒、当前日期。
-
-4. **System 4 — 压缩上下文摘要**  
+3. **System 3 — 压缩上下文摘要**  
    会话级变化的摘要，侧重话题连贯性与群历史，格式固定为：
    - `[当前话题]`：当前讨论焦点、进展和未决问题，体现话题如何演变。
    - `[群历史]`：按日期（到天）记录的高信号群事件、共同约定和关键决策。
 
+4. **System 4 — 当前状态**  
+   `[当前状态]`：群记忆 + 当前日期。低频变化内容放头部：平时整段历史都能命中前缀缓存，仅记忆变更或跨天时失效一次。
+
+尾部 **记忆提醒**（`[记忆提醒]`，仅群记忆接近上限时出现）单独注入在触发消息之前（本轮 flush 的 context_only 之后）：其出现与否取决于记忆条数阈值，放头部会让阈值两侧各打穿一次前缀缓存，故放尾部；且行动指令离触发消息更近，模型更容易照做。
+
 #### 记忆链路三层分工
 
-- **上下文摘要**（System 4）：会话/群层面。侧重当前话题的连贯性与群历史（事件、约定、决策）。
+- **上下文摘要**（System 3）：会话/群层面。侧重当前话题的连贯性与群历史（事件、约定、决策）。
 - **用户印象**（per-turn system）：用户个人层面。侧重性格、爱好、习惯、偏好倾向与互动模式，随触发轮注入。
-- **remember 记忆工具**（System 3 `[群记忆]` / 印象内 `[你的记忆]`）：长期事实层面。只记重要且长期有效的客观事实（称呼、生日、规则约定）和用户主动要求记住的内容。
+- **remember 记忆工具**（头部 System 4 `[群记忆]` / 印象内 `[你的记忆]`）：长期事实层面。只记重要且长期有效的客观事实（称呼、生日、规则约定）和用户主动要求记住的内容。
 
 三层的生成/使用提示词各自声明了职责边界，并且摘要与印象生成时会把已保存的记忆内容一并交给模型参考，尽量避免同一信息在多层重复记录。
 
@@ -523,12 +521,12 @@ rg help                 # 帮助
 - **用户印象只注入触发者**：固定只注入触发该轮对话的用户的印象，不额外注入被提到的其他用户。
 - **同一用户印象只注入一次**：同一 `user_id` 的印象在整个当前上下文中只注入一次，绑定到该用户首次触发的轮次，避免重复和缓存抖动。
 - **印象与轮次同步**：印象 system 消息跟随其所属 user 轮次一起进入上下文，并在该轮次被裁剪时一起移除；触发者下一次触发时，会按 `chat_impressions` 中的最新印象重新注入，避免旧印象残留。
-- **非触发消息缓冲**：不需要回复的群消息不写入 `prompt_messages`，而是先进入 `_recent_context_buffers` 临时缓冲区；当下一条触发消息到达时，以 `context_only` system 消息 flush 到触发句之前。
+- **非触发消息缓冲**：不需要回复的群消息不写入 `prompt_messages`，而是先进入 `_recent_context_buffers` 临时缓冲区；当下一条触发消息到达时，以 `context_only` system 消息 flush 到触发句之前。`context_only` 为 append-only：每轮 flush 追加一条、不清旧，随所在区间被裁剪/摘要一并淘汰。
 
 #### 上下文压缩与摘要
 
 - 当真实对话轮数超过 `CONTEXT_WINDOW_SIZE + CONTEXT_WINDOW_SIZE * CONTEXT_COMPRESS_THRESHOLD_RATIO` 时，触发异步摘要。
-- 摘要只针对**溢出的完整轮次**生成；生成成功后删除这些完整轮次（`context_only` 消息保留）。
+- 摘要只针对**溢出的完整轮次**生成；生成成功后删除这些完整轮次（`context_only` 消息不豁免，随溢出区间一并删除）。
 - 摘要 prompt 按职责分层，与其它记忆层互不重复：
   - 摘要只记会话/群层面内容：当前话题进展与演变、群事件、约定和决策。
   - 性格、兴趣、说话风格等个人特质属于 `[用户印象]` 的职责，不重复记录。
@@ -547,7 +545,7 @@ rg help                 # 帮助
 #### 裁剪与孤立清理
 
 - 所有上下文裁剪都按**完整轮次**进行：从最旧的非触发 user 开始，连同其 assistant、tool 消息、工具摘要 system 一起删除；遇到下一轮 user 的前导印象则停止收集，确保印象 system 跟随其所属轮次。
-- `context_only` 消息不参与轮数统计，裁剪时保留，确保非触发上下文在窗口滑动时不丢失。
+- `context_only` 消息不参与轮数统计；append-only 追加，裁剪/摘要时不豁免、随所在区间一并删除（当轮新 flush 的 context_only 位于最新触发轮之前，随该轮存续）。
 - 清理孤立 assistant/tool 消息，避免历史中出现没有真实 user 承接的 assistant 或没有对应 assistant 调用的 tool 结果。
 
 ---

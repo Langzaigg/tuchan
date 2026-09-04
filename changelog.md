@@ -2,6 +2,12 @@
 
 此处仅记录重大更新，细节请关注 commit 记录。
 
+## Sep 2, 2026
+
+- 运行环境升级：nonebot2 2.3.3 → 2.5.0、nonebot-adapter-onebot 2.4.3 → 2.4.6、websockets 11.0.3 → 16.1.1（pydantic 保持 v1，hikari-bot 钉版所限）
+- 清理 conda bot 环境无关包约 60 个（openai/tavily SDK、未加载插件及其依赖等），删除残留重复 dist-info
+- `GlobalConfig` 的 `extra` 改为 `allow`（适配 nonebot2 ≥2.4 的 BaseSettings 写入 `_env_file`）
+
 ## Aug 19, 2026
 
 - 项目更名「兔酱」，README 重写

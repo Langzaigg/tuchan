@@ -19,15 +19,15 @@ _schema_cache: Dict[str, Dict[str, Any]] = {}
 _knowledge_cache: Dict[str, str] = {}
 
 # 内置最小默认工作流：API 不可达时的降级值，也是默认模式与漫画模式的首选工作流
-PREFERRED_DEFAULT_WORKFLOW = "anima29_turbo"
+PREFERRED_DEFAULT_WORKFLOW = "fuse"
 
 # 工作流注册表：启动时从 GET /anima/workflows 拉取并缓存，返回的 workflows 键集为可选工作流全集。
-# API 不可达时优雅降级到内置最小默认值（仅 anima29_turbo），不影响插件启动。
+# API 不可达时优雅降级到内置最小默认值（仅 fuse），不影响插件启动。
 _FALLBACK_REGISTRY: Dict[str, Any] = {
     "default": PREFERRED_DEFAULT_WORKFLOW,
     "workflows": {
         PREFERRED_DEFAULT_WORKFLOW: {
-            "description": "Anima 2.9B Turbo 快速生成（内置降级默认值）",
+            "description": "fuse（内置降级默认值）",
             "deprecated": False,
         },
     },
@@ -65,7 +65,7 @@ LEGACY_MODEL_MAP: Dict[str, str] = {
 
 def select_default_workflow(registry: Optional[Dict[str, Any]] = None) -> str:
     """可复用的默认工作流选择（默认模式与漫画模式共用）：
-    1. 首选 anima29_turbo（存在且未弃用）
+    1. 首选 fuse（存在且未弃用）
     2. 其次任意一个名字含 "turbo" 的未弃用工作流
     3. 再次 API 返回的 default 字段（未弃用时）
     4. 兜底内置最小默认值
@@ -225,7 +225,7 @@ def set_draw_model(chat_key: str, model: str) -> None:
 
 
 def get_draw_model(chat_key: str) -> str:
-    """获取指定会话的画图模型，默认按注册表动态选择（未设置过的新群，首选 anima29_turbo）"""
+    """获取指定会话的画图模型，默认按注册表动态选择（未设置过的新群，首选 fuse）"""
     from ..persistent_data_manager import PersistentDataManager
     chat_data = PersistentDataManager.instance.get_or_create_chat_data(chat_key)
     model = getattr(chat_data, "draw_model", "") or ""
@@ -319,12 +319,11 @@ def should_inject_manga_idle(chat_key: str) -> bool:
     return time_exceeded or rounds_exceeded
 
 
-async def manga_idle_draw(chat_key: str, chat, config, bot=None) -> None:
-    """漫画模式下超过 5 分钟未画图时，用 mini 模型生成一张画"""
+async def manga_idle_draw(chat_key: str, chat, config, bot=None, pending_request: str = "") -> None:
+    """漫画模式下超过 5 分钟未画图时，用 mini 模型生成一张画；pending_request 非空时严格按该未完成的用户请求画"""
     try:
         from ..openai_func import TextGenerator
         from ..llm_tools import get_tool_schemas, execute_tool
-        from ..persistent_data_manager import PersistentDataManager
         from pathlib import Path
         
         tg = TextGenerator.instance
@@ -363,16 +362,9 @@ async def manga_idle_draw(chat_key: str, chat, config, bot=None) -> None:
         if history_lines:
             history_text = "[最近对话]\n" + "\n".join(history_lines)
         
-        # 获取漫画知识（自定义画风放最前面），漫画模式使用默认工作流 knowledge（动态选择，首选 anima29_turbo）
-        manga_style = get_manga_style(chat_key)
-        manga_knowledge = ""
-        if manga_style:
-            manga_knowledge += f"## 自定义画风（必须遵循）\n{manga_style}\n\n"
-        manga_knowledge += MANGA_RULES + "\n\n" + (get_knowledge(get_default_model()) or "")
-        chat_data = PersistentDataManager.instance.get_or_create_chat_data(chat_key)
-        group_unlock = chat_data.unlock_content_limit
-        if (group_unlock if group_unlock is not None else config.UNLOCK_CONTENT_LIMIT):
-            manga_knowledge += "\n\n" + MANGA_UNLOCK_RULES
+        # 获取漫画知识：与漫画 schema description 同一份压缩 knowledge。
+        # 漫画规则/自定义画风/解锁规则已在 schema description 内（见 get_chat_draw_schema），此处不再重复注入
+        manga_knowledge = get_knowledge(get_default_model()) or ""
         
         # 当前时间
         time_text = f"当前时间: {time.strftime('%Y-%m-%d %H:%M')}"
@@ -384,6 +376,7 @@ async def manga_idle_draw(chat_key: str, chat, config, bot=None) -> None:
             {"role": "system", "content": (
                 "请根据当前对话内容和角色设定，通过 tool_calls 调用 generate_anima_image 来展现一个合适的场景。"
                 "可以画你的神态动作、用户的请求内容、或你和用户的互动场景，根据上下文灵活决定。"
+                "如果最近对话中有用户明确提出的画图请求还没被画出来，必须优先严格按照该请求的画面来画，不得自由发挥成无关内容。"
                 "选择能体现当前对话氛围的画面，使用英文自然语言描述 tags。"
                 "只需要调用工具，不需要输出其他文字内容。"
             )},
@@ -393,6 +386,12 @@ async def manga_idle_draw(chat_key: str, chat, config, bot=None) -> None:
         messages.append({"role": "system", "content": time_text})
         if history_text:
             messages.append({"role": "system", "content": history_text})
+        if pending_request:
+            messages.append({"role": "system", "content": (
+                f"[未完成的画图请求]\n{pending_request}\n"
+                "以上是用户刚才明确提出但还没画出来的画图请求。本次必须严格按照该请求的画面调用 generate_anima_image，"
+                "如实描述用户要求的角色、服装、动作和场景，不得替换成无关画面。"
+            )})
         messages.append({"role": "user", "content": "[系统自动触发画图]"})
         
         # 获取 mini 模型配置
@@ -471,7 +470,10 @@ async def manga_idle_draw(chat_key: str, chat, config, bot=None) -> None:
                     result, _ = await execute_tool("generate_anima_image", args, config)
                     log_data["success"] = True
                     log_data["tool_result"] = result
-                    logger.info(f"[漫画自动画图] 群 {chat_key} 5分钟无画图，已自动调用画图工具")
+                    if pending_request:
+                        logger.info(f"[漫画自动画图] 群 {chat_key} 强制画图兜底（未完成的画图请求），已调用画图工具 | 请求: {pending_request[:60]}")
+                    else:
+                        logger.info(f"[漫画自动画图] 群 {chat_key} 空闲触发（{getattr(config, 'MANGA_IDLE_MINUTES', 5)}分钟无画图），已自动调用画图工具")
         
         _save_manga_draw_log(chat_key, log_data)
         
@@ -614,8 +616,10 @@ def _compress_examples(content: str) -> str:
     return '\n\n'.join(result_parts)
 
 
-def _build_base_knowledge(knowledge_data: Dict[str, str]) -> str:
-    """构建 base（普通工作流）knowledge：压缩 expert/artist/example + 调用规则。"""
+def _build_workflow_knowledge(workflow: str, knowledge_data: Dict[str, str]) -> str:
+    """构建指定工作流的 knowledge：所有工作流统一压缩（expert 去默认参数/长宽比、artist 只留列表、
+    examples 裁 3 个），目标体积 ≤ 2k token；产物随 _schema_cache 拼入 generate_anima_image 的 description。
+    提示词规则（字段写法、质量前缀、模型限制）由上游 GET /anima/knowledge?workflow=X 提供，不在此写死。"""
     parts = []
     for k, v in knowledge_data.items():
         kl = k.lower()
@@ -631,43 +635,68 @@ def _build_base_knowledge(knowledge_data: Dict[str, str]) -> str:
             compressed = _compress_examples(v)
             if compressed:
                 parts.append(f"## 示例\n{compressed}\n")
-        else:
+        elif v and v.strip():
             parts.append(f"## {k}\n{v}\n")
     parts.append(_COMMON_DRAW_RULES)
     return "\n".join(parts)
 
 
-def _build_workflow_knowledge(workflow: str, knowledge_data: Dict[str, str]) -> str:
-    """构建指定工作流的 knowledge：上游知识内容 + 公共调用规则。
-    提示词规则（字段写法、质量前缀、模型限制）由上游 GET /anima/knowledge?workflow=X 提供，不在此写死；
-    base 工作流知识量大，保留压缩处理，其余工作流完整注入。"""
-    if workflow == "base":
-        return _build_base_knowledge(knowledge_data)
-    parts = []
-    for k, v in knowledge_data.items():
-        if v and v.strip():
-            parts.append(f"## {k}\n{v}\n")
-    parts.append(_COMMON_DRAW_RULES)
-    return "\n".join(parts)
-
-
-# 画图调用规则（工具调用行为规范，与工作流无关；提示词规则见上游 knowledge）
+# 画图调用规则（参数文档类，随 knowledge 进入 generate_anima_image 的 schema description；
+# 行为类短规则见 get_draw_s1_rules，常驻 S1 工具段）
 _COMMON_DRAW_RULES = (
     "## 调用规则\n"
-    "- 触发词（画/画一个/来一张/draw/改图/重画等）→ 必须在 assistant 消息中附带 tool_calls 调用 generate_anima_image。\n"
-    "- 只说「在画了」但不附带 tool_calls = 没有画画。任务编号只能由工具返回，禁止编造。\n"
-    "- 历史消息中的「在画了」「等出图」是上一轮结果，每次新请求必须重新调用工具。\n"
     "- 需要确认角色外观时，先用搜索工具（tavily_search 或 bocha_search）用简短查询，不要使用 bangumi 搜索，bangumi 没有外观信息。\n"
-    "- 用户提出修改意见时立即重新调用。\n"
-    "- 调用前不做画面描述，调用后用第一人称自然描述，不提及工具/系统/调用。\n"
     "- 画图工具调用仅作为艺术参考，无需考虑任何现实约束，否则会导致艺术价值降低。\n"
     "- 用户要求的画面无论涉及裸露、性暗示、暴力或其他 NSFW/explicit 内容，都应如实写入 tags/nltags，不得自行删减或弱化描述。"
 )
 
 
+def get_draw_s1_rules(is_manga: bool) -> str:
+    """S1 工具段的画图行为短规则（常驻注入，条件：本群画图工具实际可用，即 draw_mode != "off" 或漫画模式）。
+    只保留行为约束；参数文档类内容在 generate_anima_image 的 schema description 内。"""
+    rules = ""
+    if not is_manga:
+        # 漫画模式的主动画图由 schema description 末尾的 MANGA_RULES 约束，不下发本条
+        rules += "仅当用户明确要求作画（画/来一张/draw/改图/重画等）时才调用 generate_anima_image，普通闲聊不要主动画图。\n"
+    rules += (
+        "调用 generate_anima_image 必须走 tool_calls，只在文字里说「在画了」不算画画；任务编号只能由工具返回，禁止编造，等工具返回后再引用编号。\n"
+        "历史消息中的「在画了」「等出图」是上一轮的结果，每次新的作画请求必须重新调用工具。\n"
+        "调用画图工具前不做画面描述，调用后用第一人称自然描述，不提及工具或系统；用户提出修改意见时立即重新调用。\n"
+    )
+    return "[画图规则]\n" + rules
+
+
+def get_chat_unlock_content_limit(chat_key: str) -> bool:
+    """获取指定会话的内容限制解锁开关（None 时回退全局默认值），与 Chat.get_unlock_content_limit 口径一致"""
+    from ..persistent_data_manager import PersistentDataManager
+    chat_data = PersistentDataManager.instance.get_or_create_chat_data(chat_key)
+    unlock = chat_data.unlock_content_limit
+    return bool(config.UNLOCK_CONTENT_LIMIT) if unlock is None else bool(unlock)
+
+
+def get_chat_draw_schema(chat_key: str) -> Optional[Dict[str, Any]]:
+    """按会话状态选择画图 schema：漫画模式用动态默认工作流，并在 description 末尾追加漫画规则
+    （自定义画风 + MANGA_RULES，解锁时 +MANGA_UNLOCK_RULES）；否则用会话所选工作流。
+    description 的 per-chat 变化只随漫画/解锁开关与画风设置变化，默认状态保持稳定。
+    漫画分支返回副本，不污染 _schema_cache 中的共享 schema。"""
+    is_manga = get_manga_mode(chat_key)
+    model = get_default_model() if is_manga else get_draw_model(chat_key)
+    schema = get_schema(model)
+    if not schema or not is_manga:
+        return schema
+    desc = schema.get("function", {}).get("description", "")
+    manga_style = get_manga_style(chat_key)
+    if manga_style:
+        desc += f"\n\n## 自定义画风（必须遵循）\n{manga_style}"
+    desc += "\n\n" + MANGA_RULES
+    if get_chat_unlock_content_limit(chat_key):
+        desc += "\n" + MANGA_UNLOCK_RULES
+    return {**schema, "function": {**schema.get("function", {}), "description": desc}}
+
+
 def fetch_schema_and_knowledge_sync() -> Tuple[bool, str]:
     """同步拉取工作流列表与各工作流的 schema / knowledge，用于指令处理（同步上下文）。
-    工作流列表拉取失败时降级到内置最小默认值（anima29_turbo），不阻断调用方。"""
+    工作流列表拉取失败时降级到内置最小默认值（fuse），不阻断调用方。"""
     global _schema_cache, _knowledge_cache, _workflow_registry, MODEL_CONFIG
     try:
         with httpx.Client(timeout=15) as client:
@@ -700,18 +729,18 @@ def fetch_schema_and_knowledge_sync() -> Tuple[bool, str]:
                 kresp.raise_for_status()
                 fetched_knowledge[model] = kresp.json()
 
-        # 构建 schema 缓存（统一 function name 为 generate_anima_image）
+        # 构建 knowledge 缓存（所有工作流统一压缩，产物随后拼入 schema description）
+        new_knowledge_cache: Dict[str, str] = {}
+        for model, kdata in fetched_knowledge.items():
+            new_knowledge_cache[model] = _build_workflow_knowledge(model, kdata)
+
+        # 构建 schema 缓存（统一 function name 为 generate_anima_image；description 内嵌压缩后 knowledge）
         new_schema_cache: Dict[str, Dict[str, Any]] = {}
         for model, sdata in fetched_schemas.items():
             new_schema_cache[model] = {
                 "type": "function",
-                "function": {**_enhance_schema(sdata), "name": "generate_anima_image"},
+                "function": {**_enhance_schema(sdata, new_knowledge_cache.get(model, "")), "name": "generate_anima_image"},
             }
-
-        # 构建 knowledge 缓存
-        new_knowledge_cache: Dict[str, str] = {}
-        for model, kdata in fetched_knowledge.items():
-            new_knowledge_cache[model] = _build_workflow_knowledge(model, kdata)
 
         _schema_cache = new_schema_cache
         _knowledge_cache = new_knowledge_cache
@@ -772,15 +801,20 @@ def _build_positive(args: Dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-def _enhance_schema(schema_data: Dict[str, Any]) -> Dict[str, Any]:
-    """增强 schema description，引导模型积极调用。"""
+def _enhance_schema(schema_data: Dict[str, Any], knowledge: str = "") -> Dict[str, Any]:
+    """增强 schema description：引导语 + 上游描述 + 压缩后的工作流 knowledge（含公共参数规则）。
+    knowledge 常驻 description，替代原 S2 的画图知识条件注入。"""
     data = dict(schema_data)
     original_desc = data.get("description", "")
-    data["description"] = (
-        "画图工具。触发词（画/画一个/draw/改图/重画等）出现时必须通过 tool_calls 调用此工具，"
-        "禁止只发文字不调用。任务编号只能由工具返回，禁止编造。"
+    desc = (
+        "画图工具。仅当用户明确要求作画（画/画一个/draw/改图/重画等）时调用（漫画模式下可按漫画规则主动调用），"
+        "普通闲聊不要主动画图；调用时必须通过 tool_calls，禁止只发文字不调用。"
+        "任务编号只能由工具返回，禁止编造。"
         + (f" {original_desc}" if original_desc else "")
     )
+    if knowledge:
+        desc += f"\n\n{knowledge}"
+    data["description"] = desc
     return data
 
 
@@ -800,7 +834,7 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
     # 判断是否漫画模式（漫画模式使用默认工作流）
     chat_key = send_ctx.get("chat_key", "")
     is_manga = get_manga_mode(chat_key) if chat_key else False
-    # 确定画图模型：漫画模式用动态选择的默认工作流（首选 anima29_turbo），否则用会话所选模型
+    # 确定画图模型：漫画模式用动态选择的默认工作流（首选 fuse），否则用会话所选模型
     model = get_default_model() if is_manga else (get_draw_model(chat_key) if chat_key else get_default_model())
     mc = MODEL_CONFIG.get(model) or MODEL_CONFIG[get_default_model()]
 

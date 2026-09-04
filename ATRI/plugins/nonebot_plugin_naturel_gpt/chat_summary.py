@@ -98,6 +98,7 @@ class ChatSummaryMixin:
         active_profile = self.get_active_profile() if hasattr(self, "get_active_profile") else config.OPENAI_ACTIVE_PROFILE
         profile = dict(config.OPENAI_PROFILES.get(active_profile, {}) or {})
         if profile:
+            profile["name"] = active_profile  # 稳定标识，供 per-profile 多 key 轮换索引用
             profile["api_keys"] = list(profile.get("api_keys", config.OPENAI_API_KEYS) or [""])
             profile["enable_stream"] = config.LLM_ENABLE_STREAM
             return profile
@@ -126,27 +127,33 @@ class ChatSummaryMixin:
         trigger_text: str = "",
         target_msg: Optional[ChatMessageData] = None,
     ) -> None:
-        """模式3: 异步生成工具调用摘要。搜索类工具生成摘要，其他工具保留原始结果。"""
-        if config.TOOL_CONTEXT_MODE != 3 or not tool_messages:
+        """同步生成工具调用摘要并一次写入终稿：搜索类工具生成摘要，其他工具保留原始结果。
+        tavily 有 AI answer 时直接使用；其余搜索场景同步 await 一次 mini 模型调用，失败保留截断
+        fallback。禁止 fallback→LLM 异步覆写两步写——异步回写会让后续请求的 prompt 前缀漂移。"""
+        if not tool_messages:
             return
 
-        SEARCH_TOOLS = {"tavily_search", "bocha_search", "fetch_url", "browse_url"}
-        IGNORED_TOOLS = {"generate_anima_image"}  # 不保留在历史上下文中的工具，避免 LLM 产生已调用的错觉
+        SEARCH_TOOLS = {"tavily_search", "browse_url"}  # bocha 已改为 tavily 内部 fallback，不再产生独立工具结果
+        IGNORED_TOOLS = {"generate_anima_image"}  # 工具结果不进历史；调用本身转为 [作画记录] 轻量留痕（见下）
 
         search_entries: List[Dict[str, Any]] = []
         other_entries: List[Dict[str, Any]] = []
+        draw_descs: List[str] = []  # 作画留痕：直接取调用的 tags/nltags 作为历史作画内容摘要（不调 LLM）
         tavily_ai_answers: List[str] = []  # 收集 tavily_search 返回的 AI 摘要
         for msg in tool_messages:
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
                     func = tc.get("function", {})
                     name = func.get("name", "")
-                    if name in IGNORED_TOOLS:
-                        continue
                     try:
                         args = json.loads(func.get("arguments", "{}")) if isinstance(func.get("arguments"), str) else func.get("arguments", {})
                     except Exception:
                         args = {}
+                    if name in IGNORED_TOOLS:
+                        if name == "generate_anima_image" and isinstance(args, dict):
+                            desc_parts = [str(args.get(k)).strip() for k in ("tags", "nltags") if str(args.get(k) or "").strip()]
+                            draw_descs.append("；".join(desc_parts) if desc_parts else "（无画面描述）")
+                        continue
                     entry = {"name": name, "args": args}
                     if name in SEARCH_TOOLS:
                         search_entries.append(entry)
@@ -167,40 +174,46 @@ class ChatSummaryMixin:
                     if ai_answer:
                         tavily_ai_answers.append(ai_answer)
 
-        if not search_entries and not other_entries:
+        if not search_entries and not other_entries and not draw_descs:
             return
 
         if not target_msg or not target_msg.tool_calls:
             logger.warning(f"[会话: {self.chat_key}] 工具摘要缺少绑定的 assistant tool_calls 消息，已跳过")
             return
 
-        # 同步构建 fallback（other 结果 + search 摘要），立即写入
+        # 作画轻量留痕：说明只完成了上述任务，后续新的作画请求必须重新调用画图工具。
+        # 替代原先"画图轮在历史中零痕迹"的做法——模型看不到任何作画记录时容易模仿
+        # 纯文本的「说画了→说图来了」模式而不实际调用工具。
+        draw_line = ""
+        if draw_descs:
+            draw_line = (
+                f"[作画记录] 以上作画任务已完成并发送，画面内容：{'；'.join(draw_descs)}。"
+                "该记录仅表示上述任务已完成；之后任何新的作画请求（含修改/重画/再画一张）"
+                "都必须重新调用 generate_anima_image 工具。"
+            )
+
+        def _raw_part(entries: List[Dict[str, Any]], sep: str = "; ") -> str:
+            raw = []
+            for entry in entries:
+                if "result" in entry:
+                    raw.append(f"{entry['name']}: {entry['result'][:80]}")
+                else:
+                    raw.append(f"{entry['name']}({json.dumps(entry.get('args', {}), ensure_ascii=False)[:60]})")
+            return sep.join(raw)[:max_chars]
+
+        # 截断 fallback（other 结果 + search 原文截断），任何路径失败都以此为终稿
         combined_parts = []
-
+        if draw_line:
+            combined_parts.append(draw_line)
         if other_entries:
-            raw_parts = []
-            for entry in other_entries:
-                if "result" in entry:
-                    raw_parts.append(f"{entry['name']}: {entry['result'][:80]}")
-                else:
-                    raw_parts.append(f"{entry['name']}({json.dumps(entry.get('args', {}), ensure_ascii=False)[:60]})")
-            combined_parts.append(f"[调用结果] {'; '.join(raw_parts)[:max_chars]}")
-
+            combined_parts.append(f"[调用结果] {_raw_part(other_entries)}")
         if search_entries:
-            search_raw = []
-            for entry in search_entries:
-                if "result" in entry:
-                    search_raw.append(f"{entry['name']}: {entry['result'][:80]}")
-                else:
-                    search_raw.append(f"{entry['name']}({json.dumps(entry.get('args', {}), ensure_ascii=False)[:60]})")
-            search_fallback = "；".join(search_raw)[:max_chars]
-            combined_parts.append(f"[搜索工具摘要] {search_fallback}")
-
+            combined_parts.append(f"[搜索工具摘要] {_raw_part(search_entries, sep='；')}")
         fallback = "\n".join(combined_parts)
-        target_msg.tool_call_summary = fallback
 
-        # 无搜索工具则无需 LLM 摘要
+        # 无搜索工具则无需摘要，fallback 即终稿
         if not search_entries:
+            target_msg.tool_call_summary = fallback
             return
 
         # tavily_search 已返回 AI 摘要时，直接使用，跳过 LLM 调用
@@ -208,77 +221,65 @@ class ChatSummaryMixin:
         non_tavily_search = [e for e in search_entries if e.get("name") != "tavily_search"]
         if tavily_ai_answers and not non_tavily_search:
             tavily_summary = "；".join(tavily_ai_answers)[:max_chars]
-            tavily_part = f"[搜索工具摘要] {tavily_summary}"
+            parts = []
+            if draw_line:
+                parts.append(draw_line)
             if other_entries:
-                other_raw = []
-                for entry in other_entries:
-                    if "result" in entry:
-                        other_raw.append(f"{entry['name']}: {entry['result'][:80]}")
-                    else:
-                        other_raw.append(f"{entry['name']}({json.dumps(entry.get('args', {}), ensure_ascii=False)[:60]})")
-                other_part_str = f"[调用结果] {'; '.join(other_raw)[:max_chars]}"
-                target_msg.tool_call_summary = other_part_str + "\n" + tavily_part
-            else:
-                target_msg.tool_call_summary = tavily_part
+                parts.append(f"[调用结果] {_raw_part(other_entries)}")
+            parts.append(f"[搜索工具摘要] {tavily_summary}")
+            target_msg.tool_call_summary = "\n".join(parts)
             if config.DEBUG_LEVEL > 0:
                 logger.info(f"[会话: {self.chat_key}] 工具调用摘要(Tavily AI): {target_msg.tool_call_summary}")
             _save_summary_log(self.chat_key, "tool", "", tavily_summary,
                               self.chat_preset.context_summary, target_msg.tool_call_summary)
             return
 
-        # 如果已有任务在运行，跳过 LLM 调用（fallback 已就位）
-        if self._tool_summary_task and not self._tool_summary_task.done():
-            if config.DEBUG_LEVEL > 0:
-                logger.info(f"[会话: {self.chat_key}] 工具摘要任务运行中，跳过本次 LLM 摘要")
-            return
-
-        # 启动后台 LLM 摘要任务（仅针对搜索工具）
-        # 混合场景：tavily AI 摘要单独拼接，LLM 只总结其他搜索工具
+        # 其余搜索场景：同步 await 一次 mini 模型摘要调用（调用方在回复落库时 await 本函数），
+        # 成功写终稿，失败保留 fallback。单飞由调用方的回复处理串行保证，不再需要任务去重。
+        chat_key = self.chat_key
         llm_search_entries = non_tavily_search if tavily_ai_answers else search_entries
         summary_input = json.dumps(llm_search_entries, ensure_ascii=False)
         other_part = f"[调用结果] {json.dumps(other_entries, ensure_ascii=False)}" if other_entries else ""
         trigger_part = f"\n触发问题: {trigger_text}" if trigger_text else ""
         tavily_part = f"[搜索工具摘要] {'；'.join(tavily_ai_answers)[:max_chars]}" if tavily_ai_answers else ""
-        chat_key = self.chat_key
         request_profile = self._snapshot_request_profile()
-
-        async def _do_tool_summary():
-            prompt = (
-                f"[工具调用记录]\n{summary_input}\n{trigger_part}\n\n"
-                f"请以\"[搜索工具摘要]\"为开头，用一句话概括上述工具调用的用途和结果，不超过{max_chars}字。"
-                f"不要加其他前缀或标签。"
-            )
-            tg = TextGenerator.instance
-            summary_response = ""
-            try:
-                res, success = await tg.get_response(prompt, type='summarize', request_profile=request_profile)
-                summary_response = res or ""
-                if success and res and res.strip():
-                    new_summary = res.strip()[:max_chars]
-                    if not new_summary.startswith("[搜索工具摘要]"):
-                        new_summary = f"[搜索工具摘要] {new_summary}"
-                    # 拼接：other 结果 + tavily AI 摘要 + LLM 搜索摘要
-                    parts = []
-                    if other_part:
-                        parts.append(other_part)
-                    if tavily_part:
-                        parts.append(tavily_part)
-                    parts.append(new_summary)
-                    target_msg.tool_call_summary = "\n".join(parts)
-                    if config.DEBUG_LEVEL > 0:
-                        logger.info(f"[会话: {chat_key}] 工具调用摘要(LLM): {target_msg.tool_call_summary}")
-                    _save_summary_log(chat_key, "tool", prompt, summary_response,
-                                      self.chat_preset.context_summary, target_msg.tool_call_summary)
-                    return
-            except Exception as e:
-                summary_response = f"[异常] {e!r}"
-                logger.warning(f"[会话: {chat_key}] 工具调用摘要 LLM 异常: {e!r}")
-            if config.DEBUG_LEVEL > 0:
-                logger.info(f"[会话: {chat_key}] 工具调用摘要 LLM 失败，保留 fallback")
-            _save_summary_log(chat_key, "tool", prompt, summary_response,
-                              self.chat_preset.context_summary, target_msg.tool_call_summary)
-
-        self._tool_summary_task = asyncio.create_task(_do_tool_summary())
+        prompt = (
+            f"[工具调用记录]\n{summary_input}\n{trigger_part}\n\n"
+            f"请以\"[搜索工具摘要]\"为开头，用一句话概括上述工具调用的用途和结果，不超过{max_chars}字。"
+            f"不要加其他前缀或标签。"
+        )
+        tg = TextGenerator.instance
+        summary_response = ""
+        try:
+            res, success = await tg.get_response(prompt, type='summarize', request_profile=request_profile)
+            summary_response = res or ""
+            if success and res and res.strip():
+                new_summary = res.strip()[:max_chars]
+                if not new_summary.startswith("[搜索工具摘要]"):
+                    new_summary = f"[搜索工具摘要] {new_summary}"
+                parts = []
+                if draw_line:
+                    parts.append(draw_line)
+                if other_part:
+                    parts.append(other_part)
+                if tavily_part:
+                    parts.append(tavily_part)
+                parts.append(new_summary)
+                target_msg.tool_call_summary = "\n".join(parts)
+                if config.DEBUG_LEVEL > 0:
+                    logger.info(f"[会话: {chat_key}] 工具调用摘要(LLM): {target_msg.tool_call_summary}")
+                _save_summary_log(chat_key, "tool", prompt, summary_response,
+                                  self.chat_preset.context_summary, target_msg.tool_call_summary)
+                return
+        except Exception as e:
+            summary_response = f"[异常] {e!r}"
+            logger.warning(f"[会话: {chat_key}] 工具调用摘要 LLM 异常: {e!r}")
+        # LLM 失败：保留截断 fallback 为终稿
+        target_msg.tool_call_summary = fallback
+        if config.DEBUG_LEVEL > 0:
+            logger.info(f"[会话: {chat_key}] 工具调用摘要 LLM 失败，保留 fallback")
+        _save_summary_log(chat_key, "tool", prompt, summary_response,
+                          self.chat_preset.context_summary, target_msg.tool_call_summary)
 
     @staticmethod
     def _message_user_id_for_impression(preset: PresetData, msg: ChatMessageData) -> str:
@@ -323,8 +324,8 @@ class ChatSummaryMixin:
             self._compress_failure_time = 0
 
         # 找到溢出轮的截断点：第 overflow_rounds+1 个真实 user 是保留的最旧轮，
-        # 其之前的完整消息段需要摘要/裁剪。注意保留轮 user 前的前导印象 system
-        # 属于保留轮，需回溯排除，避免把保留轮的印象误纳入溢出部分。
+        # 其之前的完整消息段需要摘要/裁剪。注意保留轮 user 前的前导印象 system 与
+        # 本轮 flush 的 context_only 均属于保留轮，需回溯排除，避免误纳入溢出部分。
         user_count = 0
         cut_index = 0
         for i, msg in enumerate(preset.prompt_messages):
@@ -332,7 +333,9 @@ class ChatSummaryMixin:
                 user_count += 1
                 if user_count > overflow_rounds:
                     cut_index = i
-                    while cut_index > 0 and isinstance(preset.prompt_messages[cut_index - 1], ChatMessageData) and preset.prompt_messages[cut_index - 1].is_impression:
+                    while cut_index > 0 and isinstance(preset.prompt_messages[cut_index - 1], ChatMessageData) and (
+                        preset.prompt_messages[cut_index - 1].is_impression or preset.prompt_messages[cut_index - 1].context_only
+                    ):
                         cut_index -= 1
                     break
 
@@ -346,10 +349,8 @@ class ChatSummaryMixin:
             m for m in overflow_span
             if id(m) not in pending_item_ids and id(m) not in compressing_item_ids
         ]
-        new_remove_item_ids = {
-            id(m) for m in new_overflow_messages
-            if not m.context_only
-        }
+        # context_only 已取消摘要豁免（append-only 普通历史条目），随溢出区间一并删除
+        new_remove_item_ids = {id(m) for m in new_overflow_messages}
 
         # 提取本次溢出中实际产生互动的用户 ID
         current_active_ids = set()
@@ -361,10 +362,8 @@ class ChatSummaryMixin:
 
         if not config.CONTEXT_SUMMARY_ENABLED:
             if cut_index > 0:
-                # 保留 context_only 消息，只删除溢出的 user/assistant/tool 轮次
-                del_indices = [i for i in range(cut_index) if not preset.prompt_messages[i].context_only]
-                for i in sorted(del_indices, reverse=True):
-                    del preset.prompt_messages[i]
+                # context_only 视为普通历史条目，随溢出区间一并删除
+                del preset.prompt_messages[:cut_index]
                 preset.prompt_messages = self._cleanup_orphan_history_messages(preset.prompt_messages)
             self._pending_overflow_text = ""
             self._pending_overflow_item_ids = set()
@@ -496,7 +495,7 @@ class ChatSummaryMixin:
                     new_summary = new_summary[:hard_summary_limit]
                 preset.context_summary = new_summary
                 self._compress_failure_time = 0  # 成功，重置冷却
-                # 摘要成功，删除已总结的溢出消息（保留 context_only 消息）
+                # 摘要成功，删除已总结的溢出消息（context_only 不豁免，一并删除）
                 removed_count = 0
                 if remove_item_ids:
                     before_count = len(preset.prompt_messages)
@@ -544,6 +543,9 @@ class ChatSummaryMixin:
             # 摘要裁剪掉溢出轮次（含其绑定的旧印象 system）后，下次该用户触发时
             # 上下文中不再有他的印象，自然注入此处更新后的新印象，避免旧印象残留。
             impression_results: Dict[str, str] = {}
+            # 先串行构建各用户的印象 prompt（纯本地计算），再并发请求 LLM，
+            # 多用户溢出时印象生成总耗时从 Σt 降为 max(t)
+            imp_tasks: List[tuple] = []  # (uid, imp, imp_prompt, imp_hard_limit)
             for uid in _active_user_ids:
                 imp = preset.chat_impressions.get(uid)
                 if not imp:
@@ -598,6 +600,10 @@ class ChatSummaryMixin:
                         f"请以{preset_key}的视角更新对该用户的印象，{imp_target_chars} 字以内，只输出印象文本。"
                     )},
                 ]
+                imp_tasks.append((uid, imp, imp_prompt, imp_hard_limit))
+
+            async def _gen_impression(uid: str, imp_prompt: list, imp_hard_limit: int):
+                """单个用户的印象生成请求；失败记录 error 日志并返回 None，不影响其他用户。"""
                 imp_response = ""
                 try:
                     imp_res, imp_success = await tg.get_response(imp_prompt, type='summarize', request_profile=request_profile)
@@ -607,12 +613,25 @@ class ChatSummaryMixin:
                         # 硬截断：超出软目标 2 倍时才截断
                         if len(imp_text) > imp_hard_limit:
                             imp_text = imp_text[:imp_hard_limit]
-                        imp.chat_impression = imp_text
-                        impression_results[uid] = imp.chat_impression
+                        return uid, imp_text
                 except Exception as e:
                     imp_response = f"[异常] {e!r}"
                     _save_error_log(chat_key, imp_prompt, imp_response, tg.cal_token_count(imp_prompt) + tg.cal_token_count(imp_response))
-                    pass  # 印象生成失败不影响主流程
+                return None
+
+            if imp_tasks:
+                for result in await asyncio.gather(*(
+                    _gen_impression(uid, imp_prompt, imp_hard_limit)
+                    for uid, _imp, imp_prompt, imp_hard_limit in imp_tasks
+                )):
+                    if not result:
+                        continue
+                    uid, imp_text = result
+                    imp = preset.chat_impressions.get(uid)
+                    if imp is None:
+                        continue
+                    imp.chat_impression = imp_text
+                    impression_results[uid] = imp.chat_impression
 
             # 保存印象日志
             if impression_results:

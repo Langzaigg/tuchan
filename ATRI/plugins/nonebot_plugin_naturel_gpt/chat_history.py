@@ -45,16 +45,16 @@ class ChatHistoryMixin:
         content_is_labeled: bool = False,
         context_only: bool = False,
         user_id: str = "",
-    ) -> None:
-        """更新当前预设的结构化对话历史。"""
+    ) -> Optional[ChatMessageData]:
+        """更新当前预设的结构化对话历史。返回新写入的消息对象（未写入时返回 None），供调用方按需回滚。"""
         tg = TextGenerator.instance
         messageunit = tg.generate_msg_template(sender=sender, msg=msg, time_str=f"[{time.strftime('%H:%M:%S %p', time.localtime())}] ")
-        
+
         # 获取当前预设的数据
         preset = self.chat_preset_dicts.get(self._preset_key)
         if not preset:
             logger.error(f"[会话: {self.chat_key}] 无法获取当前预设 '{self._preset_key}' 的数据")
-            return
+            return None
         
         message_index = self._chat_data.next_message_index
         self._chat_data.next_message_index += 1
@@ -70,14 +70,11 @@ class ChatHistoryMixin:
                 f"prompt_messages={len(preset.prompt_messages)} | images={len(valid_images)}"
             )
 
+        history_item: Optional[ChatMessageData] = None
         if record_for_prompt or is_bot_reply or context_only:
-            if context_only:
-                # 移除所有已有的 context_only 消息，保证仅保留最新一条
-                preset.prompt_messages = [
-                    m for m in preset.prompt_messages
-                    if not (isinstance(m, ChatMessageData) and m.context_only)
-                ]
-            # context_only 消息使用 system 角色，不进入持久化存储
+            # context_only 消息使用 system 角色，不进入持久化存储。
+            # append-only：不再删除旧 context_only，每轮 flush 追加一条新消息，
+            # 旧 context_only 随所在区间被窗口裁剪/摘要删除自然淘汰。
             if context_only:
                 role = "system"
             elif is_bot_reply:
@@ -132,7 +129,11 @@ class ChatHistoryMixin:
                         _threshold = _max_len_mem * 4 // 5
                         _memory_reminder = ""
                         if _user_mem_count >= _threshold:
-                            _memory_reminder = f"\n[记忆提醒] 用户记忆已达 {_user_mem_count}/{_max_len_mem}，建议调用记忆整理工具精简。"
+                            _memory_reminder = (
+                                f"\n[记忆提醒] 用户记忆已达 {_user_mem_count}/{_max_len_mem}。"
+                                "请主动调用 remember 工具（action=consolidate）批量整理：合并重复或同类条目、压缩冗长表述，"
+                                "在尽量少占条数的前提下尽量保留完整信息，关键事实、称呼与设定细节不得丢失。"
+                            )
                         # Only inject if there's content (impression or memory)
                         if _imp_text or _user_memory_text:
                             _combined_text = _imp_text + _user_memory_text + _memory_reminder
@@ -150,11 +151,12 @@ class ChatHistoryMixin:
         
         if record_time:
             self._last_msg_time = time.time()   # 更新上次对话时间
-        
+
         if require_summary:
             await self._compress_prompt_messages_if_needed(preset)
         elif not config.CONTEXT_SUMMARY_ENABLED:
             self._trim_prompt_messages_without_summary(preset)
+        return history_item
 
     async def save_tool_messages(self, tool_messages: List[Dict[str, Any]]) -> Optional[ChatMessageData]:
         """保存工具调用消息到内存中的prompt_messages（不持久化）"""
@@ -250,14 +252,18 @@ class ChatHistoryMixin:
         if len(impression_data.chat_history) > max_history:
             impression_data.chat_history = impression_data.chat_history[-max_history:]
 
-    def remove_last_prompt_user_message(self) -> None:
-        """移除最后一条用户消息（用于并发控制时合并消息）"""
+    def remove_last_prompt_user_message(self, expected: Optional[ChatMessageData] = None) -> None:
+        """移除最后一条用户消息（用于并发控制时合并消息）。
+        传入 expected 时，仅当最后一条用户消息就是该对象时才删除——
+        用于节流放弃后的回滚，避免误删并发合并场景下后写入的新消息。"""
         preset = self.chat_preset_dicts.get(self._preset_key)
         if not preset:
             return
         for idx in range(len(preset.prompt_messages) - 1, -1, -1):
             item = preset.prompt_messages[idx]
             if isinstance(item, ChatMessageData) and item.role == "user":
+                if expected is not None and item is not expected:
+                    return
                 del preset.prompt_messages[idx]
                 return
 
@@ -284,7 +290,7 @@ class ChatHistoryMixin:
 
     def _trim_prompt_messages_without_summary(self, preset: PresetData) -> None:
         """滑动窗口截断：保留最近独立缓冲窗口内的对话，保护工具调用链完整性。
-        保留 context_only 消息（非触发上下文），只删除溢出的 user/assistant 轮次。"""
+        context_only 视为普通历史条目（append-only），随所在区间一并删除，不再有裁剪豁免。"""
         max_rounds = self._history_buffer_round_limit()
         # 先清理没有真实 user 承接的 assistant/tool 消息
         preset.prompt_messages = self._cleanup_orphan_history_messages(preset.prompt_messages)
@@ -301,20 +307,14 @@ class ChatHistoryMixin:
             # 不足 max_rounds 轮，不截断
             return
         if cut_index > 0:
-            # 保留 context_only 消息，只删除溢出的 user/assistant/tool 轮次
-            del_indices = [i for i in range(cut_index) if not preset.prompt_messages[i].context_only]
-            for i in sorted(del_indices, reverse=True):
-                del preset.prompt_messages[i]
-            if config.DEBUG_LEVEL > 0:
-                preserved_ctx = sum(1 for i in range(min(cut_index, len(preset.prompt_messages))) if preset.prompt_messages[i].context_only)
-                if preserved_ctx:
-                    logger.info(f"[会话: {self.chat_key}] 截断时保留了 {preserved_ctx} 条 context_only 消息")
+            # 截断点之前的消息（含 context_only）全部删除
+            del preset.prompt_messages[:cut_index]
             # 截断可能切断 user -> assistant/tool 链，产生新的孤立消息
             preset.prompt_messages = self._cleanup_orphan_history_messages(preset.prompt_messages)
 
     @staticmethod
     def _cleanup_orphan_history_messages(messages: List[ChatMessageData]) -> List[ChatMessageData]:
-        """清理没有真实 user 轮次承接的 assistant/tool 历史，保留 context_only。
+        """清理没有真实 user 轮次承接的 assistant/tool 历史，context_only 原样保留（append-only，可存在多条）。
         印象 system 绑定到紧随其后的 user 轮：若该 user 被清理则印象一并丢弃，避免孤立印象残留。"""
         cleaned = ChatHistoryMixin._cleanup_orphan_tool_messages(messages)
         result: List[ChatMessageData] = []
@@ -333,7 +333,13 @@ class ChatHistoryMixin:
                 round_open = True
                 active_tool_call_ids = set()
                 if pending_impression is not None:
-                    result.append(pending_impression)
+                    # 保持写入顺序 [印象, context_only, user]：context_only 是在印象随 user 落位后
+                    # 才插入到 user 之前的，清理时将印象插回末尾连续 context_only 之前，
+                    # 避免尾部状态块插入位置与摘要裁剪边界错位
+                    insert_at = len(result)
+                    while insert_at > 0 and result[insert_at - 1].context_only:
+                        insert_at -= 1
+                    result.insert(insert_at, pending_impression)
                     pending_impression = None
                 result.append(item)
                 continue

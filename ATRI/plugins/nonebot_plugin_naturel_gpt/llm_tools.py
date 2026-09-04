@@ -34,13 +34,10 @@ def get_tool_schemas(config, chat_key: str = "") -> List[Dict[str, Any]]:
                 continue
             if _chat_profile.get("multimodal", True) or not _chat_profile.get("model_vision"):
                 continue
-        # 画图工具：根据 draw_model 或 manga_mode 选择 schema
+        # 画图工具：根据 draw_model 或 manga_mode 选择 schema（漫画模式在 description 末尾追加漫画规则）
         if name == "generate_anima_image" and chat_key:
             from .llm_tool_plugins import anima_generate
-            is_manga = anima_generate.get_manga_mode(chat_key)
-            # 漫画模式使用动态选择的默认工作流 schema；否则用会话所选模型
-            model = anima_generate.get_default_model() if is_manga else anima_generate.get_draw_model(chat_key)
-            model_schema = anima_generate.get_schema(model)
+            model_schema = anima_generate.get_chat_draw_schema(chat_key)
             if model_schema:
                 schemas.append(model_schema)
                 continue

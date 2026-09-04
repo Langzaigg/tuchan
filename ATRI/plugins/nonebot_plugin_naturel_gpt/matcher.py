@@ -19,7 +19,7 @@ from ATRI.config import BotSelfConfig
 from .config import *
 from .utils import *
 from .chat import Chat
-from .persistent_data_manager import PersistentDataManager
+from .persistent_data_manager import ChatMessageData, PersistentDataManager
 from .chat_manager import ChatManager
 from .openai_func import (
     TextGenerator,
@@ -44,43 +44,12 @@ is_progress:bool = False
 msg_sent_set:Set[str] = set() # bot 自己发送的消息
 
 
-async def _wait_for_tool_completion(chat_key: str, timeout: float = 60.0) -> bool:
-    """等待工具调用完成，返回是否成功等到"""
-    tg = TextGenerator.instance
-    if not tg.is_tool_calling(chat_key):
-        return True
-    
-    event = _chat_tool_done_events.setdefault(chat_key, asyncio.Event())
-    event.clear()
-    
-    try:
-        await asyncio.wait_for(event.wait(), timeout=timeout)
-        return True
-    except asyncio.TimeoutError:
-        logger.warning(f"[并发控制] 群 {chat_key} 等待工具调用超时")
-        return False
-
-
-def _notify_tool_completion(chat_key: str) -> None:
-    """通知工具调用完成"""
-    event = _chat_tool_done_events.get(chat_key)
-    if event:
-        event.set()
-
-
-def _setup_tool_done_callback(chat_key: str) -> None:
-    """为TextGenerator设置工具调用完成回调"""
-    tg = TextGenerator.instance
-    def on_done():
-        _notify_tool_completion(chat_key)
-    tg.set_tool_done_callback(chat_key, on_done)
-
 # ======== 并发控制 ========
-# 不同会话并行；同一会话新请求取消旧请求，并把旧新问题合并后重新生成。
+# 不同会话并行；同一会话新触发消息不再取消旧任务，而是落库后推入循环邮箱，
+# 由运行中的 stream_response 循环在轮边界批量插入（插入式 agent 循环）。
 _chat_locks: Dict[str, asyncio.Lock] = {}                     # chat_key → 该群的锁
 _chat_running_tasks: Dict[str, asyncio.Task] = {}          # chat_key → 当前运行中的 Task
 _chat_active_inputs: Dict[str, Dict[str, Any]] = {}        # chat_key → 当前请求输入快照
-_chat_tool_done_events: Dict[str, asyncio.Event] = {}      # chat_key → 工具调用完成事件
 _recent_context_buffers: Dict[str, Deque[Dict[str, Any]]] = {}  # chat_key → 非触发消息缓冲
 
 def _get_chat_lock(chat_key: str) -> asyncio.Lock:
@@ -191,6 +160,14 @@ def _flush_recent_context_buffer(chat_key: str, trigger_sender: str = "") -> Tup
         parts.append(f"[{ts}] {item.get('sender') or 'anonymous'}: {text}")
 
     return "\n".join(parts), images
+
+
+def _format_loop_entry_text(recorded_msg: Optional[ChatMessageData], sender_name: str, raw_text: str) -> str:
+    """预格式化循环邮箱 entry 的文本，与 prompt 中 user 消息格式一致：[HH:MM] sender: 正文。
+    正文保留 [回复 xxx 的消息] 前缀与 [图片N] 标记（插入时图片编号按 messages 内已有最大值续编）。"""
+    ts = getattr(recorded_msg, "timestamp", 0) or time.time()
+    return f"[{time.strftime('%H:%M', time.localtime(ts))}] {sender_name}: {raw_text}"
+
 
 """消息发送钩子，用于记录自己发送的消息(默认不开启，只有在用户自定义了message_sent事件之后message_sent事件才会被发送到 on_message 回调)"""
 # @Bot.on_called_api
@@ -612,6 +589,25 @@ def _is_empty_content_error(text: Optional[str]) -> bool:
     return "must not be empty" in lower_text
 
 
+def _is_context_length_error(text: Optional[str]) -> bool:
+    """判断是否为上下文长度超限错误。
+    只匹配明确的 context-length 特征，鉴权/quota/rate limit 等错误虽然也常含
+    "token" 字样，但不应触发清理历史。"""
+    if not text:
+        return False
+    lower_text = text.lower()
+    context_markers = (
+        "context_length",     # OpenAI 系错误码 context_length_exceeded
+        "context length",     # "maximum context length is ... tokens"
+        "maximum context",
+        "context window",
+        "too many tokens",
+        "prompt is too long",
+        "reduce the length",  # "Please reduce the length of the messages"
+    )
+    return any(marker in lower_text for marker in context_markers)
+
+
 def _prompt_contains_images(prompt: List[Dict[str, Any]]) -> bool:
     for message in prompt:
         content = message.get("content")
@@ -620,6 +616,48 @@ def _prompt_contains_images(prompt: List[Dict[str, Any]]) -> bool:
                 if isinstance(item, dict) and item.get("type") == "image_url":
                     return True
     return False
+
+
+def _collect_passthrough_image_urls(prompt: List[Dict[str, Any]]) -> List[str]:
+    """收集 prompt 中直传的 http(s) 图片 URL（QQ/内网图片在构建 prompt 时已转 data URI，
+    此处残留的 http(s) 即为公开直传项）"""
+    urls: List[str] = []
+    for message in prompt:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "image_url":
+                url = item.get("image_url", {}).get("url", "")
+                if url.startswith(("http://", "https://")):
+                    urls.append(url)
+    return urls
+
+
+async def _convert_passthrough_images_to_base64(prompt: List[Dict[str, Any]], urls: List[str]) -> None:
+    """provider 拉取直传 URL 失败（400）时，标记回退并把 prompt 中的直传图原位转 base64；
+    下载失败的图片项直接丢弃（不影响文本部分）"""
+    from . import image_cache
+    for url in urls:
+        image_cache.mark_passthrough_failed(url)
+    for message in prompt:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        new_content = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "image_url":
+                url = item.get("image_url", {}).get("url", "")
+                if url.startswith(("http://", "https://")):
+                    data_uri = await image_cache.resolve_url(url)  # 已标记直传失败，走下载
+                    if data_uri:
+                        item["image_url"]["url"] = data_uri
+                        new_content.append(item)
+                else:
+                    new_content.append(item)
+            else:
+                new_content.append(item)
+        message["content"] = new_content
 
 
 def _count_prompt_text_and_images(prompt: List[Dict[str, Any]], tg: TextGenerator) -> Tuple[int, int]:
@@ -645,6 +683,7 @@ def _snapshot_request_profile(chat: Chat) -> Dict[str, Any]:
     active_profile = chat.get_active_profile()
     profile = dict(config.OPENAI_PROFILES.get(active_profile, {}) or {})
     if profile:
+        profile["name"] = active_profile  # 稳定标识，供 per-profile 多 key 轮换索引用
         profile["api_keys"] = list(profile.get("api_keys", config.OPENAI_API_KEYS) or [""])
         profile["enable_stream"] = config.LLM_ENABLE_STREAM
         return profile
@@ -720,6 +759,14 @@ def _save_debug_log(chat_key: str, prompt: List[Dict[str, Any]], response: str,
         "prompt": _sanitize_prompt_for_log(prompt),
         "response": response,
     }
+    # 工具循环的最终完整消息列表（含循环邮箱插入的新触发消息、assistant tool_calls、
+    # tool 响应与内部控制提示）：prompt 是请求发出前的快照，loop_messages 才是循环结束时的
+    # 真实状态，排查插入式打断/工具轮问题时应以它为准。
+    _loop_msgs = getattr(TextGenerator.instance, "_last_loop_messages_by_chat", {}).get(chat_key)
+    if _loop_msgs:
+        data["loop_messages"] = _sanitize_prompt_for_log(
+            [m for m in _loop_msgs if isinstance(m, dict)]
+        )
     if tool_messages:
         data["tool_messages"] = _sanitize_prompt_for_log(tool_messages)
         # 提取中间轮的 assistant 回复文本，便于查看工具调用阶段说了什么
@@ -773,6 +820,108 @@ def _strip_think_tags(text: str) -> Tuple[str, str]:
     return cleaned, reasoning
 
 
+def _split_think_leak(text: str, short_segment: int = 50) -> Optional[Tuple[str, str]]:
+    """思考泄漏兜底切分：按双换行分段，思考通常是连续长段落，而真实回复常以短段落开头
+    （口头语/情绪词等），因此从第一个长度 < short_segment 字的段落开始（含）视为真实回复，
+    之前视为思考；若所有段落都不短，回退取最后一段为回复。返回 (思考, 回复) 或 None（无法切分）。"""
+    parts = [p.strip() for p in text.split("\n\n")]
+    parts = [p for p in parts if p]  # 去掉空段
+    if len(parts) < 2:
+        return None
+    split_idx = None
+    for i, p in enumerate(parts):
+        if len(p) < short_segment:
+            split_idx = i
+            break
+    if split_idx is None:
+        split_idx = len(parts) - 1  # 无短段落，回退原逻辑：最后一段为回复
+    leaked = "\n\n".join(parts[:split_idx]).strip()
+    reply = "\n\n".join(parts[split_idx:]).strip()
+    if not leaked or not reply:
+        return None
+    return leaked, reply
+
+
+async def _send_tool_image_outputs(chat_key: str, matcher: Type[Matcher]) -> None:
+    """消费并发送本会话工具产生的图片（pixiv 搜图等），含拍立得装饰/Pixiv 画廊链接兜底。"""
+    tg = TextGenerator.instance
+    for tool_output in tg.consume_tool_outputs(chat_key):
+        if tool_output.get("type") == "image" and tool_output.get("url"):
+            image_url = tool_output["url"]
+            author = tool_output.get("author")
+            pid = tool_output.get("pid")
+            gallery_url = tool_output.get("gallery_url")
+
+            # 第一档：直接发原图
+            try:
+                await matcher.send(MessageSegment.image(file=image_url))
+                continue
+            except Exception as e:
+                logger.warning(f"图片直接发送失败 ({image_url}): {e}")
+
+            # 第二档：拍立得装饰后重试
+            polaroid_path = None
+            try:
+                polaroid_path = await _make_polaroid_image(image_url, author, pid)
+                if polaroid_path:
+                    await matcher.send(MessageSegment.image(file=polaroid_path))
+                    continue
+            except Exception as e2:
+                logger.warning(f"拍立得图片发送也失败: {e2}")
+            finally:
+                if polaroid_path:
+                    try:
+                        Path(polaroid_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+            # 第三档：发 Pixiv 画廊链接
+            if gallery_url:
+                await matcher.send(f"图片发送失败，Pixiv 画廊链接：{gallery_url}")
+            else:
+                await matcher.send(f"[图片]({image_url})")
+
+
+async def _finalize_chat_task(
+    chat_key: str,
+    matcher: Type[Matcher],
+    chat_type: str,
+    bot: Bot = None,
+) -> None:
+    """运行中任务收尾：锁内原子注销任务注册并抽取循环邮箱残留，残留 entry 作为新触发
+    重新走 do_msg_response（其 user 消息在首次推入邮箱时已落库，经 recorded_msg 复用，不重复写入）。
+    与锁内的邮箱推送互斥：注销前推入的 entry 必定被本次 drain 拿到重处理；
+    注销后到达的消息走"无运行中任务"分支自行注册为新任务。
+    覆盖所有出口：正常完成、失败返回、人格切换/节流放弃的提前 return、异常传播。"""
+    chat_lock = _get_chat_lock(chat_key)
+    async with chat_lock:
+        if _chat_running_tasks.get(chat_key) is asyncio.current_task():
+            _chat_running_tasks.pop(chat_key, None)
+            _chat_active_inputs.pop(chat_key, None)
+        drained = TextGenerator.instance.drain_loop_inputs(chat_key)
+    if not drained:
+        return
+    logger.info(
+        f"[循环邮箱] 任务收尾发现邮箱残留，重新处理 | 会话: {chat_key} | 残留: {len(drained)} | "
+        f"senders: {', '.join(str(e.get('sender') or 'anonymous') for e in drained)}"
+    )
+    for entry in drained:
+        try:
+            await do_msg_response(
+                trigger_userid=str(entry.get("userid") or ""),
+                trigger_text=str(entry.get("raw_text") or ""),
+                is_tome=True,
+                matcher=matcher,
+                chat_type=chat_type,
+                chat_key=chat_key,
+                sender_name=str(entry.get("sender") or "anonymous"),
+                bot=bot,
+                recorded_msg=entry.get("recorded_msg"),
+            )
+        except Exception as e:
+            logger.warning(f"[循环邮箱] 残留重处理失败 | 会话: {chat_key} | sender={entry.get('sender')}: {e!r}")
+
+
 async def do_msg_response(
     trigger_userid: str,
     trigger_text: str,
@@ -782,29 +931,29 @@ async def do_msg_response(
     chat_key: str,
     sender_name: Optional[str] = None,
     wake_up: bool = False,
-    loop_times=0,
-    loop_data=None,
     bot: Bot = None,
     image_urls: Optional[List[str]] = None,
     event: Optional[Event] = None,
+    recorded_msg: Optional[ChatMessageData] = None,
 ): # type: ignore
-    """消息响应方法"""
-    loop_data = loop_data or {}
-
-    # 设置工具调用完成回调
-    _setup_tool_done_callback(chat_key)
-
+    """消息响应方法。
+    recorded_msg 非空表示该触发消息的 user 已写入 prompt_messages（循环邮箱残留重处理路径），
+    跳过唤醒/违禁/落库步骤，直接进入节流与 prompt 构造。"""
     sender_name = sender_name or 'anonymous'
     chat:Chat = ChatManager.instance.get_or_create_chat(chat_key=chat_key)
     chat.apply_profile()  # 按群切换到对应的 OpenAI profile
 
-    # ======== 并发控制：第一阶段（锁内）========
-    # 读取旧输入、判断是否需要回复、合并输入、决定是否打断
-    old_task_to_cancel = None
+    # ======== 并发控制（锁内决定 + 落库）========
+    # 不同会话并行；同一会话新触发不再 cancel 旧任务：
+    #   · 旧任务尚未落库触发消息（启动前窗口）→ 文本合并进其活跃输入，由旧任务统一记录；
+    #   · 旧任务循环进行中 → 本条触发照常落库后推入循环邮箱，由旧任务在轮边界批量插入；
+    #   · 无运行中任务 → 注册本任务并在锁内落库触发消息（与并发消息严格保序）。
     should_reply = False
     content_is_labeled = False
+    recorded_user_msg: Optional[ChatMessageData] = recorded_msg
+    prerecorded = recorded_msg is not None
     chat_lock = _get_chat_lock(chat_key)
-    
+
     async with chat_lock:
         old_input = _chat_active_inputs.get(chat_key)
         incoming_text = trigger_text
@@ -816,72 +965,118 @@ async def do_msg_response(
             _chat_active_inputs.pop(chat_key, None)
             return
 
-        # 检测是否包含违禁词
-        for w in config.WORD_FOR_FORBIDDEN:
-            if str(w).lower() in trigger_text.lower():
-                if config.DEBUG_LEVEL > 0: logger.info(f"检测到违禁词 {w}，拒绝处理...")
-                _chat_active_inputs.pop(chat_key, None)
-                return
+        if prerecorded:
+            # 邮箱残留重新处理：唤醒/违禁/随机等判定在首次推入邮箱时已完成，本条必定回复
+            should_reply = True
+            reply_reasons = ["mailbox"]
+        else:
+            # 检测是否包含违禁词
+            for w in config.WORD_FOR_FORBIDDEN:
+                if str(w).lower() in trigger_text.lower():
+                    if config.DEBUG_LEVEL > 0: logger.info(f"检测到违禁词 {w}，拒绝处理...")
+                    _chat_active_inputs.pop(chat_key, None)
+                    return
 
-        # 唤醒词检测（支持当前激活角色名，仅在句首出现时无条件唤醒）
-        text_head = incoming_text.lower().lstrip()
-        wake_prefix = False
-        if chat.preset_key.lower() and text_head.startswith(chat.preset_key.lower()):
-            wake_prefix = True
-        for w in config.WORD_FOR_WAKE_UP:
-            if str(w).lower() and text_head.startswith(str(w).lower()):
+            # 唤醒词检测（支持当前激活角色名，仅在句首出现时无条件唤醒）
+            text_head = incoming_text.lower().lstrip()
+            wake_prefix = False
+            if chat.preset_key.lower() and text_head.startswith(chat.preset_key.lower()):
                 wake_prefix = True
-                break
-        if wake_prefix:
-            wake_up = True
-
-        # 随机回复判断（唤醒词不在句首时，也通过随机概率触发）
-        if not wake_up and random.random() < config.RANDOM_CHAT_PROBABILITY:
-            wake_up = True
-
-        # 其它人格唤醒判断
-        if chat.preset_key.lower() not in incoming_text.lower() and chat.enable_auto_switch_identity:
-            for preset_key in chat.preset_keys:
-                if preset_key.lower() in incoming_text.lower():
-                    chat.change_presettings(preset_key)
-                    logger.info(f"检测到 {preset_key} 的唤醒词，切换到 {preset_key} 的人格")
-                    await matcher.send(f'[NG] 已切换到 {preset_key} (￣▽￣)-ok !')
-                    wake_up = True
+            for w in config.WORD_FOR_WAKE_UP:
+                if str(w).lower() and text_head.startswith(str(w).lower()):
+                    wake_prefix = True
                     break
+            if wake_prefix:
+                wake_up = True
 
-        # 判断是否需要回复
-        has_name_mention = any(n.lower() in incoming_text.lower() for n in list(BotSelfConfig.nickname) + [chat.preset_key])
-        name_mention_reply = random.random() < config.REPLY_ON_NAME_MENTION_PROBABILITY and has_name_mention
-        at_reply = config.REPLY_ON_AT and is_tome and '全体成员' not in incoming_text.lower()
-        should_reply = wake_up or name_mention_reply or at_reply
-        reply_reasons: List[str] = []
-        if wake_up:
-            reply_reasons.append("wake")
-        if name_mention_reply:
-            reply_reasons.append("name")
-        if at_reply:
-            reply_reasons.append("at")
+            # 随机回复判断（唤醒词不在句首时，也通过随机概率触发）
+            if not wake_up and random.random() < config.RANDOM_CHAT_PROBABILITY:
+                wake_up = True
 
-        if should_reply and chat_key in _chat_running_tasks and TextGenerator.instance.is_tool_calling(chat_key):
-            # 旧请求正在工具调用时不能合并或删除旧 active input。
-            # 旧请求会自己完成；这里只把本次触发消息排队到下一轮，避免形成孤立 assistant。
-            logger.info(f"[并发控制] 群 {chat_key} 旧请求正在工具调用中，排队新触发输入")
-            TextGenerator.instance.set_pending_merge_input(chat_key, {
-                "text": incoming_text,
+            # 其它人格唤醒判断
+            if chat.preset_key.lower() not in incoming_text.lower() and chat.enable_auto_switch_identity:
+                for preset_key in chat.preset_keys:
+                    if preset_key.lower() in incoming_text.lower():
+                        chat.change_presettings(preset_key)
+                        logger.info(f"检测到 {preset_key} 的唤醒词，切换到 {preset_key} 的人格")
+                        await matcher.send(f'[NG] 已切换到 {preset_key} (￣▽￣)-ok !')
+                        wake_up = True
+                        break
+
+            # 判断是否需要回复
+            has_name_mention = any(n.lower() in incoming_text.lower() for n in list(BotSelfConfig.nickname) + [chat.preset_key])
+            name_mention_reply = random.random() < config.REPLY_ON_NAME_MENTION_PROBABILITY and has_name_mention
+            at_reply = config.REPLY_ON_AT and is_tome and '全体成员' not in incoming_text.lower()
+            should_reply = wake_up or name_mention_reply or at_reply
+            reply_reasons = []
+            if wake_up:
+                reply_reasons.append("wake")
+            if name_mention_reply:
+                reply_reasons.append("name")
+            if at_reply:
+                reply_reasons.append("at")
+
+        if should_reply and not prerecorded and chat_key in _chat_running_tasks \
+                and old_input and not old_input.get("recorded"):
+            # 启动前合并：运行中任务尚未落库触发消息（注册与落库已在锁内原子完成，实际很难命中，
+            # 保留作为防御），把本条合并进它的活跃输入，由它统一记录
+            old_text = str(old_input.get("text") or "").strip()
+            old_sender = str(old_input.get("sender") or "").strip()
+            new_text = incoming_text.strip()
+            if old_sender and old_sender != sender_name:
+                merged_parts = []
+                if old_text:
+                    merged_parts.append(f"{old_sender}: {old_text}")
+                if new_text:
+                    merged_parts.append(f"{sender_name}: {new_text}")
+                old_input["text"] = "\n\n".join(merged_parts)
+                old_input["content_is_labeled"] = True
+            else:
+                old_input["text"] = "\n\n".join(part for part in [old_text, new_text] if part)
+            old_input["images"] = list(old_input.get("images") or []) + incoming_images
+            if config.DEBUG_LEVEL > 0:
+                logger.info(f"[并发控制] 群 {chat_key} 的运行中任务尚未落库，已合并新输入")
+            return
+
+        if should_reply and chat_key in _chat_running_tasks:
+            # 循环邮箱路径：本群已有运行中任务 → 照常落库触发 user（保证格式/时间戳/user_id），
+            # 然后推入邮箱，由运行中的 stream_response 循环在轮边界批量插入（不再 cancel 旧任务）。
+            # 落库 + 推送均在锁内完成，与旧任务 finally 的残留检查互斥，保证 entry 必定被消费。
+            tg = TextGenerator.instance
+            if recorded_user_msg is None:
+                recorded_user_msg = await chat.update_chat_history_row(
+                    sender=sender_name,
+                    msg=incoming_text,
+                    require_summary=False, record_time=True, images=incoming_images,
+                    record_for_prompt=True,
+                    user_id=trigger_userid)
+                await chat.update_chat_history_row_for_user(
+                    sender=sender_name, msg=incoming_text, userid=trigger_userid,
+                    username=sender_name, require_summary=False)
+            tg.push_loop_input(chat_key, {
+                "text": _format_loop_entry_text(recorded_user_msg, sender_name, incoming_text),
+                "raw_text": incoming_text,
                 "sender": sender_name,
-                "trigger_userid": trigger_userid,
-                "images": incoming_images,
-                "matcher": matcher,
-                "chat_type": chat_type,
-                "is_tome": is_tome,
-                "event": event,
-                "bot": bot,
+                "userid": trigger_userid,
+                "image_urls": incoming_images,
+                "recorded_msg": recorded_user_msg,
             })
-            _chat_active_inputs.pop(chat_key, None)
+            preview = incoming_text.replace("\n", " ")[:50]
+            logger.info(
+                f"[循环邮箱] 新触发消息已推入 | 会话: {chat_key} | sender={sender_name} | "
+                f"文本: {preview}{'...' if len(incoming_text) > 50 else ''}"
+            )
+            # 触发统计按触发消息计：每条邮箱 entry 计一次
+            try:
+                from .stats import stats
+                stats.inc_trigger()
+            except Exception:
+                pass
             return
 
         if should_reply:
-            if old_input:
+            if not prerecorded and old_input:
+                # 陈旧输入合并（无运行中任务但留有未消费的活跃输入，如上次请求异常退出）
                 old_text = str(old_input.get("text") or "").strip()
                 old_sender = str(old_input.get("sender") or "").strip()
                 new_text = incoming_text.strip()
@@ -904,21 +1099,30 @@ async def do_msg_response(
             else:
                 trigger_text = incoming_text
                 image_urls = incoming_images
-            # 只有确定需要回复的消息，才设置活跃输入、打断旧请求并注册自己
+            # 只有确定需要回复的消息，才设置活跃输入并注册自己
             _chat_active_inputs[chat_key] = {
                 "text": trigger_text,
                 "sender": sender_name,
                 "images": list(image_urls or []),
-                "recorded": False,
+                "recorded": prerecorded,
             }
-            if chat_key in _chat_running_tasks:
-                old_task = _chat_running_tasks[chat_key]
-                # 标记需要打断旧任务
-                old_task_to_cancel = old_task
-                _chat_running_tasks[chat_key] = asyncio.current_task()
-                logger.info(f"[并发控制] 将打断群 {chat_key} 的旧请求")
-            else:
-                _chat_running_tasks[chat_key] = asyncio.current_task()
+            _chat_running_tasks[chat_key] = asyncio.current_task()
+            if not prerecorded:
+                # 锁内落库触发消息（读取可能被启动前合并更新的活跃输入），与并发消息严格保序
+                active_input = _chat_active_inputs.get(chat_key)
+                if active_input and not active_input.get("recorded"):
+                    trigger_text = str(active_input.get("text") or trigger_text)
+                    image_urls = list(active_input.get("images") or [])
+                    content_is_labeled = bool(active_input.get("content_is_labeled") or content_is_labeled)
+                recorded_user_msg = await chat.update_chat_history_row(
+                    sender=sender_name,
+                    msg=trigger_text,
+                    require_summary=False, record_time=True, images=image_urls,
+                    record_for_prompt=True,
+                    content_is_labeled=content_is_labeled,
+                    user_id=trigger_userid)
+                if chat_key in _chat_active_inputs:
+                    _chat_active_inputs[chat_key]["recorded"] = True
         else:
             # 不需要回复的消息，推入临时缓冲区，不进入 prompt_messages
             if not old_input:
@@ -931,31 +1135,18 @@ async def do_msg_response(
             )
             return
 
-    # ======== 并发控制：第二阶段（锁外）========
-    # 执行打断（在锁外避免死锁）
-    if old_task_to_cancel:
-        old_task_to_cancel.cancel()
-        logger.info(f"[并发控制] 已打断群 {chat_key} 的旧请求")
-
     current_preset_key = chat.preset_key
-
-    # 记录用户消息到 prompt_messages
-    await chat.update_chat_history_row(sender=sender_name,
-                                msg=trigger_text,
-                                require_summary=False, record_time=True, images=image_urls,
-                                record_for_prompt=True,
-                                content_is_labeled=content_is_labeled,
-                                user_id=trigger_userid)
-    if chat_key in _chat_active_inputs:
-        _chat_active_inputs[chat_key]["recorded"] = True
 
     wake_up = False # 进入对话流程，重置唤醒状态
 
-    # 记录对用户的对话信息
-    await chat.update_chat_history_row_for_user(sender=sender_name, msg=trigger_text, userid=trigger_userid, username=sender_name, require_summary=False)
+    # 记录对用户的对话信息（邮箱残留重处理路径在首次推入邮箱时已记录）
+    if not prerecorded:
+        await chat.update_chat_history_row_for_user(sender=sender_name, msg=trigger_text, userid=trigger_userid, username=sender_name, require_summary=False)
 
     if chat.preset_key != current_preset_key:
         if config.DEBUG_LEVEL > 0: logger.warning(f'等待OpenAI请求返回的过程中人格预设由[{current_preset_key}]切换为[{chat.preset_key}],当前消息不再继续响应.1')
+        # 回滚本次写入的触发 user，避免留下无 assistant 回应的孤儿触发轮
+        chat.remove_last_prompt_user_message(expected=recorded_user_msg)
         return
 
     # 节流判断
@@ -963,32 +1154,26 @@ async def do_msg_response(
     await asyncio.sleep(config.REPLY_THROTTLE_TIME)
     if last_recv_time != chat.last_msg_time:
         if config.DEBUG_LEVEL > 0: logger.info('节流时间内收到新消息，跳过处理...')
+        # 回滚本次刚写入的触发消息，避免留下无 assistant 回应的孤儿触发轮；
+        # 若新消息走了并发合并（本条已被 remove_last_prompt_user_message 移除），
+        # expected 校验失败则不动作，不会误删合并后新写入的消息
+        chat.remove_last_prompt_user_message(expected=recorded_user_msg)
         return
 
-    # 将缓冲区的非触发消息和中断回复合并为一条 context_only 消息注入。
+    # 将缓冲区的非触发消息合并为一条 context_only 消息注入（append-only，不清除旧 context_only）。
     # 放在节流之后，确保触发消息附近新出现的非触发群聊也能进入本轮 prompt。
-    legacy_context, legacy_images = chat.flush_context_buffer()
-    recent_context, recent_images = _flush_recent_context_buffer(chat_key, trigger_sender=sender_name)
-    buffered_context = "\n".join(part for part in [legacy_context, recent_context] if part)
-    buffered_images = legacy_images + recent_images
-    interrupted = chat.pop_interrupted_response()
+    buffered_context, buffered_images = _flush_recent_context_buffer(chat_key, trigger_sender=sender_name)
 
-    context_parts = []
     if buffered_context:
-        context_parts.append(f"[群聊上下文-非触发消息]\n{buffered_context}")
-    if interrupted:
-        context_parts.append(f"[上一轮被中断的回复] {interrupted}")
-
-    if context_parts:
         await chat.update_chat_history_row(
             sender="群聊上下文",
-            msg="\n\n".join(context_parts),
+            msg=f"[群聊上下文-非触发消息]\n{buffered_context}",
             images=buffered_images,
             context_only=True,
         )
         if config.DEBUG_LEVEL > 0:
             logger.info(
-                f"[上下文缓冲] 已注入 context_only: 文本段={len(context_parts)} | 图片={len(buffered_images)}"
+                f"[上下文缓冲] 已注入 context_only: 图片={len(buffered_images)}"
             )
     # context 图片由 _apply_image_gating 注入到 context_only 消息中，不再合并到触发消息
 
@@ -1061,10 +1246,43 @@ async def do_msg_response(
     _saw_reasoning = False      # 本次是否收到过 reasoning_content（模型走了正常思考通道）
     _skip_think_buffer_mode = False  # 模型跳过思考标签、content 可能混入思考时，收完再发避免泄漏
     _tool_called = False        # 本次请求是否发生过工具调用（用于过滤"整条被括号包围"的噪音分段）
+    # 漫画自动画图兜底的去重状态：同一触发内每个完成的回复在 _on_reply_complete 各检查一次；
+    # 尾部仅当"没有任何回复被检查过"或"最近一次回复检查后又有新工具调用"（最终回复为空的工具轮）才补查，
+    # 避免同一触发在回复回调与尾部重复触发 manga_idle_draw 导致连画多张。
+    _manga_replies_checked = 0
+    _manga_tool_dirty = False
 
     async def _on_tool_call(tool_calls: List[Dict[str, Any]]) -> None:
-        nonlocal _tool_called
+        nonlocal _tool_called, _manga_tool_dirty
         _tool_called = True
+        _manga_tool_dirty = True
+
+    def _maybe_manga_autodraw(draw_reqs: List[str], tool_msgs) -> None:
+        """漫画模式自动画图检查（每个回复/每次尾部补查至多执行一次）：
+        有画图请求但该段回复未实际调用画图工具 → 用 mini 模型强制画图兜底，锚定该段请求；
+        否则按空闲策略兜底。两种兜底提交前都 mark_manga_drawn 重置空闲计时，
+        保证同一触发内回复回调与尾部检查不会重复触发（否则一条消息会连画多张）。"""
+        from .llm_tool_plugins import anima_generate
+        if not anima_generate.get_manga_mode(chat_key):
+            return
+        if draw_reqs:
+            _drew = False
+            for tm in tool_msgs or []:
+                if isinstance(tm, dict):
+                    for tc in tm.get("tool_calls", []) or []:
+                        if isinstance(tc, dict) and tc.get("function", {}).get("name") == "generate_anima_image":
+                            _drew = True
+                            break
+            if not _drew:
+                logger.info(f"[漫画强制画图] 群 {chat_key} manga 模式，触发句含画图关键词但该回复未画，强制画图兜底")
+                anima_generate.mark_manga_drawn(chat_key)
+                asyncio.create_task(anima_generate.manga_idle_draw(
+                    chat_key, chat, config, bot,
+                    pending_request="\n".join(draw_reqs),
+                ))
+        elif anima_generate.should_inject_manga_idle(chat_key):
+            anima_generate.mark_manga_drawn(chat_key)
+            asyncio.create_task(anima_generate.manga_idle_draw(chat_key, chat, config, bot))
 
     async def send_segment(segment: str) -> None:
         nonlocal sent_segments, last_send_time
@@ -1151,10 +1369,98 @@ async def do_msg_response(
         if config.LLM_SHOW_REASONING:
             await on_text_chunk(chunk)
 
+    async def _flush_reply_stream_buffer() -> None:
+        """发送当前回复未分段发送的残余缓冲，并重置 per-reply 流式状态。"""
+        nonlocal stream_buffer, sent_segments, _tool_called, _skip_think_buffer_mode, _saw_reasoning
+        if stream_buffer:
+            await send_segment(stream_buffer)
+        stream_buffer = ""
+        sent_segments = 0
+        _tool_called = False
+        _skip_think_buffer_mode = False
+        _saw_reasoning = False
+
+    async def _on_reply_complete(reply_text: str, reply_tool_messages: List[Dict[str, Any]],
+                                 reply_entries: Optional[List[Dict[str, Any]]] = None) -> None:
+        """stream_response 逐轮回复完成回调：流式收尾 + 工具图发送 + 落库，每个回复恰好执行一次。
+        覆盖因邮箱插入而继续前的回复与整个循环的最终回复。
+        reply_entries 为本回复应答的邮箱插入批次（None 表示应答原始触发消息），
+        用于漫画兜底画图按批次锚定正确的用户请求。"""
+        nonlocal stream_buffer, _manga_replies_checked, _manga_tool_dirty
+        text = sanitize_internal_control_text(reply_text or "")
+        text = sanitize_draw_reply_text(text, allow_task_ids=True)
+        text, _ = _strip_think_tags(text)
+        text = text.strip()
+        if not text:
+            return
+        # 思考泄漏兜底（按回复维度）：避免思考内容随回复进入历史/群消息
+        if _skip_think_buffer_mode and not (_saw_reasoning or _extracted_reasoning):
+            threshold = int(getattr(config, "THINK_LEAK_THRESHOLD", 150))
+            short_seg = int(getattr(config, "THINK_LEAK_SHORT_SEGMENT", 50))
+            if len(text) > threshold and "\n\n" in text:
+                split = _split_think_leak(text, short_seg)
+                if split:
+                    leaked, reply = split
+                    text = reply
+                    stream_buffer = reply
+                    logger.info(
+                        f"[思考泄漏兜底] 检测到 content 混入思考({len(leaked)}字)，"
+                        f"已截取回复部分({len(reply)}字)"
+                    )
+        # 流式收尾：发送该回复最后一段并重置分段计数器与 _tool_called 等 per-reply 状态
+        await _flush_reply_stream_buffer()
+        raw_parts.clear()  # 该回复已落库，失败路径只保留未落库的增量
+        # 工具产生的图片（如 pixiv 搜图）随该回复发送
+        await _send_tool_image_outputs(chat_key, matcher)
+        if chat.preset_key != current_preset_key:
+            if config.DEBUG_LEVEL > 0: logger.warning(f'等待OpenAI响应返回的过程中人格预设由[{current_preset_key}]切换为[{chat.preset_key}],本轮回复不再保存.2')
+            return
+        # 保存工具调用消息到内存（不持久化）；同步生成工具调用摘要（一次成稿，禁异步回写）
+        if reply_tool_messages:
+            tool_summary_target = await chat.save_tool_messages(reply_tool_messages)
+            if tool_summary_target:
+                await chat.generate_tool_call_summary(
+                    reply_tool_messages,
+                    trigger_text=trigger_text,
+                    target_msg=tool_summary_target,
+                )
+        # 记录 Bot 回复，is_bot_reply=True 表示同时更新精简窗口和全量窗口（require_summary=True 触发滑窗/摘要）
+        await chat.update_chat_history_row(sender=chat.preset_key, msg=text, require_summary=True, record_time=False, is_bot_reply=True)
+        chat.update_send_time()
+        await chat.update_chat_history_row_for_user(sender=chat.preset_key, msg=text, userid=trigger_userid, username=sender_name, require_summary=True)
+        PersistentDataManager.instance.save_to_file()
+        if config.DEBUG_LEVEL > 0: logger.info(f"对话响应完成 | 耗时: {time.time() - sta_time}s")
+        # 回复完成日志（按回复计）：合并缓存命中和 token 统计
+        _usage = getattr(tg, "_last_stream_usage", None) or {}
+        _prompt_t = _usage.get("prompt_tokens", 0) or 0
+        _cached_t = (_usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
+        _comp_t = _usage.get("completion_tokens", 0) or 0
+        _total_t = _usage.get("total_tokens", 0) or 0
+        _ratio = f"{_cached_t / _prompt_t * 100:.0f}%" if _prompt_t > 0 else "N/A"
+        logger.info(
+            f"回复完成 | 会话: {chat_key} | "
+            f"prompt={_prompt_t} cached={_cached_t}({_ratio}) completion={_comp_t} total={_total_t}"
+        )
+        # 漫画模式：按回复维度增加轮数计数；本回复的画图兜底检查（每个回复恰好一次）。
+        # 锚定本回复应答的请求：原始触发消息，或邮箱插入批次中含画图关键词的新消息。
+        from .llm_tool_plugins import anima_generate
+        anima_generate.increment_manga_round(chat_key)
+        _manga_replies_checked += 1
+        _manga_tool_dirty = False
+        if reply_entries is None:
+            _reply_draw_reqs = [f"{sender_name}: {trigger_text}"] if _has_draw_request else []
+        else:
+            _reply_draw_reqs = [
+                f"{e.get('sender')}: {e.get('raw_text')}" for e in reply_entries
+                if any(kw in str(e.get('raw_text') or '').lower() for kw in _DRAWING_KEYWORDS)
+            ]
+        _maybe_manga_autodraw(_reply_draw_reqs, reply_tool_messages)
+
     try:
         # 生成对话结果（含图片 400 重试 + 空响应上下文清理重试）
         MAX_RETRIES = 2
         _empty_retried = False
+        _passthrough_retried = False  # 直传图片转 base64 的回退是否已用过（仅一次）
         for _retry in range(1 + MAX_RETRIES):
             raw_res, success, tool_messages, reasoning_content = await tg.stream_response(
                 prompt=prompt_template,
@@ -1165,6 +1471,7 @@ async def do_msg_response(
                 on_text=on_text_chunk,
                 on_reasoning=on_reasoning_chunk,
                 on_tool_call=_on_tool_call,
+                on_reply_complete=_on_reply_complete,
             )
 
             # 每次失败都保存完整的未脱敏 error log（即使后续会重试）
@@ -1229,6 +1536,18 @@ async def do_msg_response(
                 logger.warning(f"已达到最大重试次数 ({MAX_RETRIES})，停止重试")
                 break
 
+            # 直传图片 URL 被 provider 拉取失败：先原位转 base64 重试一次，仍失败再走无图剥离
+            if not _passthrough_retried:
+                _pt_urls = _collect_passthrough_image_urls(prompt_template)
+                if _pt_urls:
+                    _passthrough_retried = True
+                    logger.warning(f"provider 无法拉取直传图片（{len(_pt_urls)} 张），转 base64 重试...")
+                    await _convert_passthrough_images_to_base64(prompt_template, _pt_urls)
+                    raw_parts.clear()
+                    stream_buffer = ""
+                    sent_segments = 0
+                    continue
+
             logger.warning(f"含图片上下文请求返回 400 (第 {_retry + 1} 次)，回退到无图片上下文重试...")
             chat.cleanup_after_bad_request(keep_history=5)
             PersistentDataManager.instance.save_to_file(must_save=True)
@@ -1242,17 +1561,19 @@ async def do_msg_response(
                 has_draw_request=_has_draw_request,
             )
 
-        # 回复完成日志：合并缓存命中和 token 统计
-        _usage = getattr(tg, "_last_stream_usage", None) or {}
-        _prompt_t = _usage.get("prompt_tokens", 0) or 0
-        _cached_t = (_usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
-        _comp_t = _usage.get("completion_tokens", 0) or 0
-        _total_t = _usage.get("total_tokens", 0) or 0
-        _ratio = f"{_cached_t / _prompt_t * 100:.0f}%" if _prompt_t > 0 else "N/A"
-        logger.info(
-            f"回复完成 | 会话: {chat_key} | "
-            f"prompt={_prompt_t} cached={_cached_t}({_ratio}) completion={_comp_t} total={_total_t}"
-        )
+        # 回复完成日志：成功的回复已由 _on_reply_complete 逐回复各记一次（含 token 统计）；
+        # 这里仅在没有任何回复完成（失败路径）时记录请求结束，避免与回调日志重复。
+        if _manga_replies_checked == 0:
+            _usage = getattr(tg, "_last_stream_usage", None) or {}
+            _prompt_t = _usage.get("prompt_tokens", 0) or 0
+            _cached_t = (_usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
+            _comp_t = _usage.get("completion_tokens", 0) or 0
+            _total_t = _usage.get("total_tokens", 0) or 0
+            _ratio = f"{_cached_t / _prompt_t * 100:.0f}%" if _prompt_t > 0 else "N/A"
+            logger.info(
+                f"请求结束（无完成回复） | 会话: {chat_key} | "
+                f"prompt={_prompt_t} cached={_cached_t}({_ratio}) completion={_comp_t} total={_total_t}"
+            )
 
         # 工具产生的图片（如pixiv搜图）始终发送，不受后续错误影响
         for tool_output in tg.consume_tool_outputs(chat_key):
@@ -1320,12 +1641,12 @@ async def do_msg_response(
                 # 思考泄漏兜底（失败路径）：避免思考内容随部分回复进入对话历史
                 if _skip_think_buffer_mode and not reasoning_content and raw_res_for_save:
                     _candidate = raw_res_for_save.strip()
-                    _threshold = int(getattr(config, "THINK_LEAK_THRESHOLD", 300))
+                    _threshold = int(getattr(config, "THINK_LEAK_THRESHOLD", 150))
+                    _short_seg = int(getattr(config, "THINK_LEAK_SHORT_SEGMENT", 50))
                     if len(_candidate) > _threshold and "\n\n" in _candidate:
-                        _parts = _candidate.rsplit("\n\n", 1)
-                        _leaked = _parts[0].strip()
-                        _reply = _parts[1].strip() if len(_parts) > 1 else ""
-                        if _leaked and _reply:
+                        _split = _split_think_leak(_candidate, _short_seg)
+                        if _split:
+                            _leaked, _reply = _split
                             raw_res_for_save = _reply
             if raw_res_for_save:
                 await chat.update_chat_history_row(sender=chat.preset_key, msg=raw_res_for_save, require_summary=False, record_time=False, is_bot_reply=True)
@@ -1348,8 +1669,8 @@ async def do_msg_response(
                 PersistentDataManager.instance.save_to_file(must_save=True)
                 await matcher.send("[系统] 请求上下文异常，已清理近期上下文，请继续对话")
                 return
-            if raw_res and "token" in raw_res.lower():
-                logger.warning("检测到 token 超限错误，清理近期历史...")
+            if _is_context_length_error(raw_res):
+                logger.warning("检测到上下文长度超限错误，清理近期历史...")
                 chat.cleanup_after_bad_request(keep_history=5)
                 PersistentDataManager.instance.save_to_file(must_save=True)
                 await matcher.send("[系统] 对话历史过长已自动清理，请继续对话")
@@ -1376,22 +1697,23 @@ async def do_msg_response(
             reasoning_content = think_reasoning
 
         # 思考泄漏兜底：模型跳过思考标签，把思考过程混入 content（无 reasoning_content 也无 <think> 标签）。
-        # 此时 stream_buffer 为全部 content（收完再发模式下未分段发送），取最后一个 \n\n 后的部分作为实际回复，
+        # 此时 stream_buffer 为全部 content（收完再发模式下未分段发送），按双换行分段切分：
+        # 从第一个短段落（< THINK_LEAK_SHORT_SEGMENT 字，通常为回复开头的口头语/短句）开始视为实际回复，
         # 前段视为思考存入 reasoning_content（仅用于 debug 日志，不进入历史、不发送到群里）。
         if _skip_think_buffer_mode and not reasoning_content:
             candidate = (raw_res or stream_buffer).strip()
-            threshold = int(getattr(config, "THINK_LEAK_THRESHOLD", 300))
+            threshold = int(getattr(config, "THINK_LEAK_THRESHOLD", 150))
+            short_seg = int(getattr(config, "THINK_LEAK_SHORT_SEGMENT", 50))
             if len(candidate) > threshold and "\n\n" in candidate:
-                parts = candidate.rsplit("\n\n", 1)
-                leaked = parts[0].strip()
-                reply = parts[1].strip() if len(parts) > 1 else ""
-                if leaked and reply:
+                split = _split_think_leak(candidate, short_seg)
+                if split:
+                    leaked, reply = split
                     reasoning_content = leaked
                     raw_res = reply
                     stream_buffer = reply
                     logger.info(
                         f"[思考泄漏兜底] 检测到 content 混入思考({len(leaked)}字)，"
-                        f"已截取最后一段作为回复({len(reply)}字)"
+                        f"已截取回复部分({len(reply)}字)"
                     )
 
         if stream_buffer:
@@ -1414,83 +1736,31 @@ async def do_msg_response(
         except Exception:
             pass
         
-        # 保存工具调用消息到内存（不持久化）
-        if tool_messages:
-            tool_summary_target = await chat.save_tool_messages(tool_messages)
-            # 模式3: 异步生成工具调用摘要（不阻塞响应）
-            if config.TOOL_CONTEXT_MODE == 3 and tool_summary_target:
-                asyncio.create_task(chat.generate_tool_call_summary(
-                    tool_messages,
-                    trigger_text=trigger_text,
-                    target_msg=tool_summary_target,
-                ))
-        
-        # 记录Bot回复，is_bot_reply=True表示同时更新精简窗口和全量窗口
-        await chat.update_chat_history_row(sender=chat.preset_key, msg=raw_res, require_summary=True, record_time=False, is_bot_reply=True)
-        chat.update_send_time()
-        await chat.update_chat_history_row_for_user(sender=chat.preset_key, msg=raw_res, userid=trigger_userid, username=sender_name, require_summary=True)
+        # 回复与工具段已由 on_reply_complete 逐轮落库（含同步工具摘要），此处仅持久化。
+        # 逐轮落库前已按回复清空 raw_parts，失败路径只会保留未落库的增量，不会重复保存。
         PersistentDataManager.instance.save_to_file()
         if config.DEBUG_LEVEL > 0: logger.info(f"对话响应完成 | 耗时: {time.time() - sta_time}s")
         
-        # 漫画模式：增加轮数计数，检查是否需要自动画图
+        # 漫画模式：增加轮数计数；尾部兜底补查。
+        # 各完成的回复已在 _on_reply_complete 逐个检查过，此处仅补查两种漏网情况：
+        # 1) 整个循环没有任何完成的回复（全空回复），画图请求尚未被任何检查覆盖；
+        # 2) 最近一次回复检查后又发生了新工具调用（最终工具轮无文本，其 tool_calls 未被检查）。
         from .llm_tool_plugins import anima_generate
         anima_generate.increment_manga_round(chat_key)
-        
-        _draw_mode = anima_generate.get_chat_mode(chat_key)
-        _is_manga = anima_generate.get_manga_mode(chat_key)
-        
-        # manga + force + 画图关键词 + 本轮未画 → 直接用 mini 模型强制画图
-        if _is_manga and _draw_mode == "force" and _has_draw_request:
-            _drew_this_round = False
-            if tool_messages:
-                for tm in tool_messages:
-                    if isinstance(tm, dict):
-                        for tc in tm.get("tool_calls", []):
-                            if isinstance(tc, dict) and tc.get("function", {}).get("name") == "generate_anima_image":
-                                _drew_this_round = True
-                                break
-            if not _drew_this_round:
-                logger.info(f"[漫画强制画图] 群 {chat_key} manga+force 模式，触发句含画图关键词但本轮未画，强制画图")
-                anima_generate.mark_manga_drawn(chat_key)
-                asyncio.create_task(anima_generate.manga_idle_draw(chat_key, chat, config, bot))
-        elif anima_generate.should_inject_manga_idle(chat_key):
-            asyncio.create_task(anima_generate.manga_idle_draw(chat_key, chat, config, bot))
-        
-        # 检查是否有待合并的输入
-        pending_input = tg.get_pending_merge_input(chat_key)
-        if pending_input:
-            logger.info(f"[并发控制] 群 {chat_key} 检测到待合并的输入，继续处理")
-            await do_msg_response(
-                trigger_userid=pending_input.get("trigger_userid", trigger_userid),
-                trigger_text=pending_input.get("text", ""),
-                is_tome=pending_input.get("is_tome", is_tome),
-                matcher=pending_input.get("matcher", matcher),
-                chat_type=pending_input.get("chat_type", chat_type),
-                chat_key=chat_key,
-                sender_name=pending_input.get("sender", sender_name),
-                bot=pending_input.get("bot", bot),
-                image_urls=pending_input.get("images"),
-                event=pending_input.get("event"),
+        if _manga_replies_checked == 0 or _manga_tool_dirty:
+            _maybe_manga_autodraw(
+                [f"{sender_name}: {trigger_text}"] if _has_draw_request else [],
+                tool_messages,
             )
+
         return
     except asyncio.CancelledError:
-        try:
-            partial = ''.join(raw_parts).strip()
-        except NameError:
-            partial = ""
-        if partial:
-            partial = sanitize_internal_control_text(partial)
-            partial = sanitize_draw_reply_text(partial, allow_task_ids=True)
-            # 剥离 <think> 标签，只保留实际回复内容
-            partial = re.sub(r'<think>.*?</think>', '', partial, flags=re.DOTALL).strip()
-        if partial:
-            chat.set_interrupted_response(partial)
-            logger.info(f"[并发控制] 群 {chat_key} 请求被中断，已保存 {len(partial)} 字的部分回复")
+        # 打断机制已改为循环邮箱插入式（新消息不再 cancel 本任务），此处仅作防御；
+        # 已完成的回复均经 on_reply_complete 逐轮落库，直接传播取消即可
         raise
     finally:
-        if _chat_running_tasks.get(chat_key) is asyncio.current_task():
-            _chat_running_tasks.pop(chat_key, None)
-            _chat_active_inputs.pop(chat_key, None)
+        # 注销任务注册并抽取循环邮箱残留（残留 entry 作为新触发重新处理，覆盖所有出口）
+        await _finalize_chat_task(chat_key, matcher, chat_type, bot)
         # 注销 Anima 发送上下文
         from .llm_tool_plugins import anima_generate
         anima_generate.unregister_send_context(chat_key)

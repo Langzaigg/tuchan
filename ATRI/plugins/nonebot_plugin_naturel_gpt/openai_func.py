@@ -1,11 +1,11 @@
 import asyncio
-import copy
 import json
 import os
 import re
 import time
+from collections import OrderedDict, deque
 from contextvars import ContextVar
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Tuple
 
 from tiktoken import Encoding, encoding_for_model
 
@@ -31,6 +31,14 @@ _CURRENT_VISION_CONFIG: ContextVar[Optional[Dict[str, Any]]] = ContextVar("natur
 
 _TOTAL_TOOL_LIMIT_TEXT = f"工具调用次数已达上限（{MAX_TOTAL_TOOL_CALLS}次）。停止继续调用工具，基于已有工具结果直接回答当前用户。"
 _SEARCH_TOOL_LIMIT_TEXT = f"搜索工具调用次数已达上限（{MAX_SEARCH_TOOL_CALLS}次），请基于已有搜索结果回复，不要再调用搜索工具。"
+_TOOL_LOOP_TIMEOUT_TEXT = "工具调用总耗时超限。停止继续调用工具，基于已有工具结果直接回答当前用户。"
+# force 模式强制画图提示：主流 provider 的思考模式均不兼容 tool_choice 强制指定（400），
+# force 模式改为在消息尾部追加该提示（尾部追加不破坏历史前缀缓存；仅注入一次，
+# 模型仍不调用则由 matcher 的伪造编号拦截/漫画强制画图兜底）
+_FORCE_DRAW_HINT_TEXT = (
+    "当前用户明确要求作画。你必须通过 tool_calls 调用 generate_anima_image 工具完成作画，"
+    "禁止只在文字里说「画了」「在画了」「等图吧」而不实际调用工具；任务编号只能由工具返回，禁止编造。"
+)
 _INTERNAL_CONTROL_PATTERNS = (
     re.compile(r"单轮?工具调用次数已达上限（?\d+次）?[。，,]?\s*请基于已有结果回复[。.]?"),
     re.compile(r"工具调用次数已达上限（?\d+次）?[。，,]?\s*停止继续调用工具，基于已有工具结果直接回答当前用户[。.]?"),
@@ -58,17 +66,6 @@ def strip_tool_call_xml(content: str) -> str:
     return _normalize_draw_cleanup(content)
 
 
-# 伪造任务编号检测正则
-# 匹配带前缀的格式（任务编号/单号 + 可选分隔符 + 可选markdown加粗 + 可选draw- + 6位字母数字）
-_FAKE_TASK_ID_PREFIX_RE = re.compile(
-    r'(?:任务编号|单号)[：:\s]*\*{0,2}(?:draw-)?[A-Za-z0-9]{6}\b\*{0,2}'
-)
-# 匹配不带前缀的格式（必须有draw- + 6位字母数字，可选markdown加粗）
-_FAKE_TASK_ID_DRAW_RE = re.compile(
-    r'\*{0,2}draw-[A-Za-z0-9]{6}\b\*{0,2}'
-)
-
-
 # 历史上下文中隐去单号的占位符（与 chat_prompt.py 一致）
 _TASK_ID_PLACEHOLDER = '[请调用 generate_anima_image 画图工具获取编号]'
 _TASK_ID_PLACEHOLDER_RE = re.compile(
@@ -84,12 +81,58 @@ def _normalize_draw_cleanup(content: str) -> str:
     return content.strip()
 
 
+_IMG_MARKER_RE = re.compile(r"\[图片(\d+)\]")
+
+
+def _next_image_index(messages: List[Dict[str, Any]]) -> int:
+    """扫描 messages 文本中已有的 [图片N] 标记，返回下一张可用编号（最大值+1）。"""
+    max_n = 0
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, str):
+            texts: Tuple[str, ...] = (content,)
+        elif isinstance(content, list):
+            texts = tuple(
+                str(item.get("text") or "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        else:
+            continue
+        for t in texts:
+            for match in _IMG_MARKER_RE.finditer(t):
+                max_n = max(max_n, int(match.group(1)))
+    return max_n + 1
+
+
+def _user_text_already_in_messages(messages: List[Dict[str, Any]], text: str) -> bool:
+    """检查与该文本完全一致的 user 消息是否已在 messages 中。
+    用于循环邮箱 entry 去重：entry 的消息在任务进入循环前已落库时，
+    可能已被本轮 prompt 快照纳入，重复插入会让模型看到两条相同消息。"""
+    target = text.strip()
+    if not target:
+        return False
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, str) and content.strip() == target:
+            return True
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text" \
+                        and str(item.get("text") or "").strip() == target:
+                    return True
+    return False
+
+
 def sanitize_internal_control_text(content: str) -> str:
     """清理仅供模型内部遵循的控制提示，防止其进入群消息和历史。"""
     if not content:
         return content
     content = content.replace(_TOTAL_TOOL_LIMIT_TEXT, "")
     content = content.replace(_SEARCH_TOOL_LIMIT_TEXT, "")
+    content = content.replace(_TOOL_LOOP_TIMEOUT_TEXT, "")
     for pattern in _INTERNAL_CONTROL_PATTERNS:
         content = pattern.sub("", content)
     # 过滤 LLM 输出的工具调用 XML 标签（模型可能在 content 中输出 function_calls 或 tool_call 格式）
@@ -119,49 +162,23 @@ def _clean_placeholder_echo(content: str) -> str:
     return _normalize_draw_cleanup(content)
 
 
-def _clean_fake_task_ids(content: str, warn: bool = False) -> str:
-    """检测并清除伪造的任务编号（仅在未调用画图工具时调用）。返回清理后的文本。"""
-    original = content
-    if _FAKE_TASK_ID_PREFIX_RE.search(content) or _FAKE_TASK_ID_DRAW_RE.search(content):
-        content = _FAKE_TASK_ID_PREFIX_RE.sub('', content)
-        content = _FAKE_TASK_ID_DRAW_RE.sub('', content)
-        if warn and content.strip() != original.strip():
-            logger.warning(f"[伪造任务编号] 已从回复中清除")
-    return _normalize_draw_cleanup(content)
-
-
-_FAKE_DRAW_PATTERNS = [
-    re.compile(r'\d+\s*秒出图'),        # "82秒出图" "178 秒出图"
-    re.compile(r'编号.{0,6}(系统|返回|等)'),  # "编号等系统返回" "编号和图一起出来"
-    re.compile(r'(系统|返回).{0,6}编号'),
-]
-
-
-def _contains_fake_draw_reply(content: str) -> bool:
-    """判断模型是否在未调用画图工具时伪造了画图确认信息。"""
-    return bool(
-        _FAKE_TASK_ID_PREFIX_RE.search(content)
-        or _FAKE_TASK_ID_DRAW_RE.search(content)
-        or _TASK_ID_PLACEHOLDER_RE.search(content)
-        or _TASK_ID_PLACEHOLDER in content
-        or "generate_anima_image" in content
-        or ("任务编号" in content and "工具" in content)
-        or ("任务编号" in content and "返回" in content)
-        or "在画了" in content
-        or any(p.search(content) for p in _FAKE_DRAW_PATTERNS)
-    )
-
-
 def sanitize_draw_reply_text(content: str, allow_task_ids: bool = True) -> str:
-    """清理不应直接出现在聊天中的画图占位符；未调用工具时也清理伪任务编号。"""
+    """清理不应直接出现在聊天中的画图占位符与内部控制文本。
+    allow_task_ids 保留用于调用方兼容：伪造编号检测链已删除（force 模式改由 tool_choice 约束），
+    输出侧只保留占位符回显与内部控制提示的兜底清洗。"""
     content = _clean_placeholder_echo(content)
-    if not allow_task_ids:
-        content = _clean_fake_task_ids(content)
     content = sanitize_internal_control_text(content)
     return content.strip()
 
 enc_cache: Dict[str, Encoding] = {}
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# 单张图片的 token 估算（OpenAI vision 高分辨率约 765~1105，取保守值让预算裁剪留有余量）
+IMAGE_TOKEN_ESTIMATE = 1000
+
+# 文本 token 计数 LRU：token 裁剪的 while 循环会反复编码同一批消息文本，缓存消除 O(n²) 重编码
+_TEXT_TOKEN_CACHE_MAX = 2048
+_text_token_cache: "OrderedDict[Tuple[str, str], int]" = OrderedDict()
 
 ChunkCallback = Callable[[str], Awaitable[None]]
 
@@ -214,18 +231,20 @@ class TextGenerator(Singleton["TextGenerator"]):
     def init(self, api_keys: list, config: dict, proxy=None, base_url="", extra_prompt: str = ""):
         self.api_keys = api_keys or [""]
         self.key_index = 0
+        self._profile_key_indices: Dict[str, int] = {}  # profile 稳定标识 → 当前 key 索引（request_profile 快照路径的多 key 轮询）
         self.config = config
         self.proxy = proxy
         self.base_url = base_url
         self.extra_prompt = extra_prompt or ""
         self.last_tool_outputs: List[Dict[str, Any]] = []
         self._last_tool_outputs_by_chat: Dict[str, List[Dict[str, Any]]] = {}
-        self._tool_calling: bool = False  # 兼容旧读取：任意会话是否正在执行工具调用
-        self._tool_calling_chat_keys: Set[str] = set()  # chat_key → 正在执行工具调用（受保护阶段）
-        self._on_tool_done_callbacks: Dict[str, Callable[[], None]] = {}  # chat_key → 工具调用完成回调
         self._current_chat_key: str = ""  # 当前会话的chat_key，供工具使用
         self._current_trigger_userid: str = ""  # 当前触发用户的userid，供工具使用
-        self._pending_merge_input: Dict[str, Dict[str, Any]] = {}  # chat_key → 待合并的输入
+        # 循环邮箱：chat_key → 待插入的新触发消息队列（插入式打断，由运行中的 stream_response 循环在轮边界批量消费）
+        self._loop_mailbox: Dict[str, Deque[Dict[str, Any]]] = {}
+        # chat_key → 最近一次 stream_response 工具循环的最终消息列表引用（循环内原地 append/pop，
+        # matcher 在请求结束后可读到的完整状态：含邮箱插入的新触发消息、assistant tool_calls、tool 响应）
+        self._last_loop_messages_by_chat: Dict[str, List[Dict[str, Any]]] = {}
         self._last_stream_usage: Optional[Dict[str, Any]] = None  # 最近一次流式请求的 usage 信息
 
     @property
@@ -262,34 +281,54 @@ class TextGenerator(Singleton["TextGenerator"]):
     def _current_vision_config(self, value: Dict[str, Any]) -> None:
         _CURRENT_VISION_CONFIG.set(dict(value or {}))
 
-    def is_tool_calling(self, chat_key: Optional[str] = None) -> bool:
-        if not hasattr(self, "_tool_calling_chat_keys"):
-            self._tool_calling_chat_keys = set()
-        if chat_key:
-            return chat_key in self._tool_calling_chat_keys
-        return bool(self._tool_calling_chat_keys)
+    # ======== 循环邮箱（插入式打断）========
+    def push_loop_input(self, chat_key: str, entry: Dict[str, Any]) -> None:
+        """推入一条循环邮箱输入。entry 字段：text（按 prompt 用户消息格式预格式化，
+        [HH:MM] sender: 正文，含 [回复xxx]/[图片N] 标记）、raw_text、sender、userid、
+        image_urls、recorded_msg（matcher 已写入 prompt_messages 的 ChatMessageData）。"""
+        if not hasattr(self, "_loop_mailbox"):
+            self._loop_mailbox = {}
+        self._loop_mailbox.setdefault(chat_key, deque()).append(entry)
 
-    def set_tool_done_callback(self, chat_key: str, callback: Callable[[], None]) -> None:
-        if not hasattr(self, "_on_tool_done_callbacks"):
-            self._on_tool_done_callbacks = {}
-        self._on_tool_done_callbacks[chat_key] = callback
+    def drain_loop_inputs(self, chat_key: str) -> List[Dict[str, Any]]:
+        """一次性取空指定会话的循环邮箱，按顺序返回全部待处理 entry。"""
+        if not hasattr(self, "_loop_mailbox"):
+            return []
+        box = self._loop_mailbox.pop(chat_key, None)
+        return list(box) if box else []
 
-    def _set_tool_calling(self, chat_key: str, active: bool) -> None:
-        if not hasattr(self, "_tool_calling_chat_keys"):
-            self._tool_calling_chat_keys = set()
-        if chat_key:
-            if active:
-                self._tool_calling_chat_keys.add(chat_key)
-            else:
-                self._tool_calling_chat_keys.discard(chat_key)
-        self._tool_calling = bool(self._tool_calling_chat_keys)
+    def has_loop_inputs(self, chat_key: str) -> bool:
+        """检查指定会话的循环邮箱是否有待处理输入"""
+        return bool(getattr(self, "_loop_mailbox", None) and self._loop_mailbox.get(chat_key))
 
-    def _notify_tool_done(self, chat_key: str) -> None:
-        if not hasattr(self, "_on_tool_done_callbacks"):
-            self._on_tool_done_callbacks = {}
-        callback = self._on_tool_done_callbacks.get(chat_key)
-        if callback:
-            callback()
+    async def _build_loop_user_message(
+        self,
+        entry: Dict[str, Any],
+        img_index: int,
+        multimodal_enabled: bool = True,
+    ) -> Tuple[Dict[str, Any], int]:
+        """把循环邮箱 entry 组装成 user 消息：[图片N] 从 img_index 续编；
+        含图片时经 image_cache 转 data URI 组装 multipart content。返回 (message, 下一张图片编号)。"""
+        text = str(entry.get("text") or "").strip()
+        images = [str(u) for u in (entry.get("image_urls") or []) if u]
+        if images:
+            found = len(_IMG_MARKER_RE.findall(text))
+            text = _IMG_MARKER_RE.sub(lambda m: f"[图片{int(m.group(1)) + img_index - 1}]", text)
+            # 文本中的占位符比图片少（异常数据/纯图片消息）：追加缺失的标记
+            for i in range(found, len(images)):
+                text = f"{text} [图片{img_index + i}]".strip()
+            img_index += len(images)
+        if not text:
+            text = "[图片]"
+        message: Dict[str, Any] = {"role": "user", "content": text}
+        if images and multimodal_enabled:
+            from . import image_cache
+            resolved = await image_cache.resolve_urls(images)
+            if resolved:
+                message["content"] = [{"type": "text", "text": text}] + [
+                    {"type": "image_url", "image_url": {"url": url}} for url in resolved
+                ]
+        return message, img_index
 
     def switch_profile(self, profile_name: str, profile: Dict[str, Any]) -> str:
         """切换 OpenAI 配置 profile，返回切换结果描述"""
@@ -322,6 +361,26 @@ class TextGenerator(Singleton["TextGenerator"]):
     def _rotate_key(self) -> None:
         self.key_index = (self.key_index + 1) % len(self.api_keys)
 
+    @staticmethod
+    def _profile_key_id(profile: Dict[str, Any]) -> str:
+        """profile 快照的稳定标识，用于 per-profile 的 key 轮换索引"""
+        name = profile.get("name")
+        if name:
+            return str(name)
+        return f"{profile.get('base_url', '')}|{profile.get('model', '')}"
+
+    def _profile_current_key(self, profile: Dict[str, Any], api_keys: List[str]) -> str:
+        """按 profile 的轮换索引取当前 key"""
+        index = self._profile_key_indices.get(self._profile_key_id(profile), 0)
+        return api_keys[index % len(api_keys)]
+
+    def _rotate_profile_key(self, profile: Dict[str, Any], keys_count: int) -> None:
+        """推进 profile 的 key 轮换索引（profile 快照路径请求失败时调用）"""
+        if keys_count <= 1:
+            return
+        profile_id = self._profile_key_id(profile)
+        self._profile_key_indices[profile_id] = (self._profile_key_indices.get(profile_id, 0) + 1) % keys_count
+
     def _request_state(self, profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if profile:
             api_keys = profile.get("api_keys", [""]) or [""]
@@ -339,12 +398,13 @@ class TextGenerator(Singleton["TextGenerator"]):
                 "reasoning_effort": profile.get("reasoning_effort"),
             }
             return {
-                "api_key": api_keys[0],
+                "api_key": self._profile_current_key(profile, api_keys),
                 "config": request_config,
                 "base_url": profile.get("base_url", ""),
                 "proxy": profile.get("proxy") or None,
                 "use_socket_proxy": profile.get("use_socket_proxy", False),
                 "multimodal": profile.get("multimodal", True),
+                "keep_reasoning": bool(profile.get("keep_reasoning", False)),
             }
         return {
             "api_key": self._current_key(),
@@ -353,6 +413,7 @@ class TextGenerator(Singleton["TextGenerator"]):
             "proxy": self.proxy,
             "use_socket_proxy": getattr(self, "use_socket_proxy", False),
             "multimodal": getattr(self, "multimodal", True),
+            "keep_reasoning": bool(self.config.get("keep_reasoning", False)),
         }
 
     def _build_vision_config(self, request_profile: Optional[Dict[str, Any]], request_state: Dict[str, Any]) -> Dict[str, Any]:
@@ -372,7 +433,7 @@ class TextGenerator(Singleton["TextGenerator"]):
         return {
             "model": vision_model,
             "base_url": request_profile.get("model_vision_base_url") or request_profile.get("base_url", "") or "",
-            "api_key": (api_keys[0] if api_keys else "") or "",
+            "api_key": self._profile_current_key(request_profile, api_keys) if api_keys else "",
             "max_tokens": request_profile.get("model_vision_max_tokens", 1024),
             "timeout": request_profile.get("timeout", 60),
             "proxy": request_profile.get("proxy"),
@@ -386,28 +447,22 @@ class TextGenerator(Singleton["TextGenerator"]):
         stream: bool,
         tools: Optional[List[Dict[str, Any]]] = None,
         request_state: Optional[Dict[str, Any]] = None,
+        tool_choice: Optional[Any] = None,
     ) -> Dict[str, Any]:
         state = request_state or self._request_state()
         request_config = state.get("config") or self.config
-        # 为 API 请求准备消息副本：清理非标准字段，并确保 assistant tool_calls 消息 content 非空
-        # 避免 provider（如 Moonshot）因空 content 或 reasoning_content 拒绝多轮工具调用
+        # 为 API 请求准备消息副本：确保 assistant tool_calls 消息 content 非空
+        # 避免 provider（如 Moonshot）因空 content 拒绝多轮工具调用。
+        # reasoning_content 不在此剥离：跨轮历史在 stream_response 循环起始处按
+        # profile keep_reasoning 统一处理，循环内 assistant 的思考链原样保留。
         api_messages: List[Dict[str, Any]] = []
         for msg in messages:
             if msg.get("role") == "assistant":
-                needs_copy = False
                 c = msg.get("content")
-                # 剥离非标准响应侧字段 reasoning_content，避免 provider 拒绝
-                if "reasoning_content" in msg:
-                    needs_copy = True
                 # assistant 消息 content 不能为空（Moonshot 等 provider 会 400）
                 if c is None or (isinstance(c, str) and not c.strip()):
-                    needs_copy = True
-                if needs_copy:
                     msg = dict(msg)
-                    msg.pop("reasoning_content", None)
-                    c = msg.get("content")
-                    if c is None or (isinstance(c, str) and not c.strip()):
-                        msg["content"] = "[无内容]"
+                    msg["content"] = "[无内容]"
             api_messages.append(msg)
         # 当前 profile 不支持多模态时，剥离 image_url 内容
         if not state.get("multimodal", True):
@@ -453,7 +508,12 @@ class TextGenerator(Singleton["TextGenerator"]):
             kwargs["proxy"] = effective_proxy
         if tools:
             kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+            # tool_choice：None 默认 "auto"；"" 完全省略该字段（provider 不支持 tool_choice 的降级重试）；
+            # 其余值（"none" / 指定函数的 dict）原样透传
+            if tool_choice is None:
+                kwargs["tool_choice"] = "auto"
+            elif tool_choice != "":
+                kwargs["tool_choice"] = tool_choice
         return kwargs
 
     def _normalize_prompt(self, prompt, custom: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -652,8 +712,9 @@ class TextGenerator(Singleton["TextGenerator"]):
         on_reasoning: Optional[ChunkCallback],
         request_state: Optional[Dict[str, Any]] = None,
         on_tool_call: Optional[Callable] = None,
+        tool_choice: Optional[Any] = None,
     ) -> Tuple[str, List[Dict[str, Any]], str]:
-        kwargs = self._completion_kwargs(messages, type, True, tools, request_state)
+        kwargs = self._completion_kwargs(messages, type, True, tools, request_state, tool_choice=tool_choice)
         content_parts: List[str] = []
         reasoning_parts: List[str] = []
         tool_call_chunks: Dict[int, Dict[str, Any]] = {}
@@ -731,8 +792,9 @@ class TextGenerator(Singleton["TextGenerator"]):
         tools: Optional[List[Dict[str, Any]]],
         request_state: Optional[Dict[str, Any]] = None,
         on_tool_call: Optional[Callable] = None,
+        tool_choice: Optional[Any] = None,
     ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
-        kwargs = self._completion_kwargs(messages, type, False, tools, request_state)
+        kwargs = self._completion_kwargs(messages, type, False, tools, request_state, tool_choice=tool_choice)
         response = await self._acompletion(**kwargs)
         message = _get(_get(response, "choices", [])[0], "message", {})
         message_dict = _message_to_dict(message)
@@ -796,12 +858,25 @@ class TextGenerator(Singleton["TextGenerator"]):
         on_text: Optional[ChunkCallback] = None,
         on_reasoning: Optional[ChunkCallback] = None,
         on_tool_call: Optional[Callable] = None,
+        on_reply_complete: Optional[Callable[[str, List[Dict[str, Any]], Optional[List[Dict[str, Any]]]], Awaitable[None]]] = None,
     ) -> Tuple[str, bool, List[Dict[str, Any]], str]:
         custom = custom or {}
-        messages = copy.deepcopy(self._normalize_prompt(prompt, custom))
+        # 逐 dict 浅拷贝即可：循环内对消息的所有改动（reasoning pop、图片剥离、空 content 填充）
+        # 都是 dict 级替换而非原地改嵌套列表，调用方的 prompt 对象保持请求前快照不被污染。
+        messages = [dict(m) for m in self._normalize_prompt(prompt, custom)]
         request_chat_key = self._current_chat_key
+        # 驻留循环消息列表引用：循环内只做原地 append/pop，请求结束后 matcher 读到的即最终完整状态
+        #（含循环邮箱插入的新触发消息与工具调用段），写入 latest.json 的 loop_messages 便于排查。
+        if request_chat_key:
+            self._last_loop_messages_by_chat[request_chat_key] = messages
         request_trigger_userid = self._current_trigger_userid
         request_state = self._request_state(request_profile)
+        # 跨轮持久化历史中的 reasoning 默认剥离（profile keep_reasoning=true 才保留，
+        # 兼容不接受该字段的 provider）；本循环内 append 的 assistant 消息在此之后产生，
+        # 思考链在同一 user turn 的工具循环内天然保留，保证多步工具任务连贯。
+        if not request_state.get("keep_reasoning", False):
+            for _m in messages:
+                _m.pop("reasoning_content", None)
         # 视觉工具快照：触发图片 URL 列表 + 视觉模型配置，按本轮 profile 钉死，避免多群并发串数据。
         # trigger_images 由 matcher 在调用 stream_response 前写入；这里重新置位以绑定到本次请求的上下文。
         self._current_trigger_images = list(self._current_trigger_images or [])
@@ -821,7 +896,12 @@ class TextGenerator(Singleton["TextGenerator"]):
         total_tool_calls = 0  # 总工具调用次数
         search_tool_calls = 0  # 联网搜索工具调用次数
         has_anima_call = False  # 是否已调用过 generate_anima_image 画图工具
-        _allow_terminal_tools = False  # 工具超限后是否允许终端工具（画图/记忆）作为最后一轮
+        _allow_terminal_tools = False  # 工具超限后进入终端阶段：允许终端工具（画图/记忆）单次调用后收尾
+        _terminal_wrapup_pending = False  # 终端工具已执行一次，下一轮为无工具收尾轮（tool_choice="none"）
+        _bad_json_retries = 0  # 工具参数 JSON 全丢的重试次数（≤1，第二次撤工具强制出文本）
+        _tool_choice_dropped = False  # provider 不支持 tool_choice（400）后置 True，后续轮完全省略该字段
+        _force_draw_hint_injected = False  # force 模式的尾部强制画图提示是否已注入（仅一次）
+        _reasoning_stripped = False  # keep_reasoning=true 但 provider 400 拒绝 reasoning_content 后置 True，剥离重试一次
         internal_control_injected = False  # 是否向模型注入过内部控制提示
 
         # 检测用户消息中是否包含画图相关关键词
@@ -835,49 +915,165 @@ class TextGenerator(Singleton["TextGenerator"]):
                 _has_draw_request = any(kw in c.lower() for kw in _DRAWING_KEYWORDS)
                 break
 
-        # 获取画图模式并决定工具注入和拦截策略
+        # 画图工具常驻注册（auto/on/force 与漫画模式），仅 off 模式过滤；
+        # 调用时机改由工具 description 与 S1 画图行为规则约束，保持 tools 数组稳定以最大化缓存命中
         from .llm_tool_plugins import anima_generate as _ag
         _draw_mode = _ag.get_chat_mode(request_chat_key) if request_chat_key else "auto"
         _is_manga = _ag.get_manga_mode(request_chat_key) if request_chat_key else False
-        if _is_manga:
-            # 漫画模式：始终启用画图工具，不拦截（不需要任务编号保护）
-            _enable_intercept = False
-        elif _draw_mode == "off" or (_draw_mode == "auto" and not _has_draw_request):
-            # off 模式或 auto 无画图关键词：过滤掉画图工具
+        if not _is_manga and _draw_mode == "off":
             # danbooru_search 只服务于画图时的作画标签确定，随画图工具一起进出，避免闲聊轮白占工具位
             tool_schemas = [s for s in tool_schemas if s.get("function", {}).get("name") not in _DRAW_ONLY_TOOLS]
-            _enable_intercept = False
-        else:
-            # force 模式：画图关键词时启用拦截；其他模式不拦截
-            _enable_intercept = (_draw_mode == "force" and _has_draw_request)
-        # force 模式 + 画图关键词：预先注入引导消息，减少模型编造编号的概率
-        if _enable_intercept:
-            messages.append({
-                "role": "system",
-                "content": (
-                    "用户要求画画，你意图画图时必须通过 tool_calls 调用 generate_anima_image 画图工具。"
-                    "在 content 中回应的同时，必须附带 tool_calls。"
-                    "任务编号只能由工具返回，禁止在 content 中编造。"
-                ),
-            })
+        # force 模式 + 画图关键词：尾部注入强制画图提示（不用 tool_choice——主流 provider
+        # 在思考模式下均不兼容强制指定，会 400；提示词强制 + matcher 伪造编号拦截兜底）
+        _force_draw_request = (_draw_mode == "force" and _has_draw_request)
 
-        _fake_retry_count = 0  # 伪造任务编号重试次数
-        _thinking_check_done = False  # reasoning 中提到画图工具但未调用的检查是否已执行
-        _force_tools_next = False  # 强制下一轮提供工具定义
         _image_stripped = False  # 工具调用后续轮是否已剥离图片
 
+        # 工具循环终止保护：轮数闸门（LLM_MAX_TOOL_ROUNDS）+ 时间闸门（LLM_TOOL_LOOP_MAX_SECONDS）
+        _tool_loop_max_seconds = getattr(plugin_config, "LLM_TOOL_LOOP_MAX_SECONDS", 180) if plugin_config else 180
+        loop_start = time.monotonic()
+
         round_idx = 0
+        round_tool_choice: Any = None  # 本轮请求的 tool_choice（None=默认 auto，"none"=强制出文本，""=省略字段）
+
+        _all_reply_texts: List[str] = []  # 本次循环已完成的全部回复文本（逐轮落库，返回值保留全部文本）
+        _entries_for_next_reply: List[Dict[str, Any]] = []  # 上一回复边界插入的邮箱批次（下一个回复所应答的新消息）
+
+        async def _emit_reply(merged_text: str) -> None:
+            """一个回复完成（无 tool_calls 的最终文本轮）：累计文本并立即回调 matcher 逐轮落库。
+            每个完成的回复恰好回调一次（含因插入而继续前的这一轮与整个循环的最终轮）。
+            reply_entries 为本回复应答的邮箱插入批次（空 → None，表示应答原始触发消息）。"""
+            nonlocal _entries_for_next_reply
+            if not merged_text or not merged_text.strip():
+                return
+            _all_reply_texts.append(merged_text)
+            if on_reply_complete:
+                await on_reply_complete(merged_text, list(tool_messages), list(_entries_for_next_reply) or None)
+            _entries_for_next_reply = []
+
+        def _joined_reply_text(fallback: str) -> str:
+            """返回全部已完成回复的合并文本（无已完成回复时回退本轮 merged）。"""
+            return "\n\n".join(_all_reply_texts) if _all_reply_texts else (fallback or "")
+
+        async def _insert_mailbox_entries(reply_completed: bool, round_content: str = "", round_reasoning: str = "") -> bool:
+            """轮边界批量消费循环邮箱：一次性取空，把新触发消息作为多条独立 user 消息插入 messages。
+            返回 True 表示已插入、循环应继续（round_idx 与 loop_start 已重置）。
+            终端阶段（_allow_terminal_tools/_terminal_wrapup_pending）不接收插入，
+            残留 entry 由 matcher 任务收尾时作为新触发重新处理。
+            reply_completed=True 表示上一轮产出了最终文本（无 tool_calls，回复已完成）；
+            False 表示上一轮以 tool_calls 结束（被插入打断的触发尚未完成回复）。"""
+            nonlocal round_idx, loop_start, intermediate_texts, tool_messages, _entries_for_next_reply
+            if not request_chat_key or not hasattr(self, "_loop_mailbox"):
+                return False
+            if _allow_terminal_tools or _terminal_wrapup_pending:
+                if self._loop_mailbox.get(request_chat_key):
+                    logger.info(
+                        f"[循环邮箱] 终端阶段跳过插入 | 会话: {request_chat_key} | "
+                        f"残留 {len(self._loop_mailbox[request_chat_key])} 条将由 matcher 重新处理"
+                    )
+                return False
+            drained = self.drain_loop_inputs(request_chat_key)
+            if not drained:
+                return False
+            # 去重：entry 的消息在任务进入循环前已落库、并被本轮 prompt 快照纳入时跳过插入
+            entries: List[Dict[str, Any]] = []
+            for entry in drained:
+                entry_text = str(entry.get("text") or "").strip()
+                if entry_text and _user_text_already_in_messages(messages, entry_text):
+                    logger.info(
+                        f"[循环邮箱] entry 已在当前 messages 中，跳过插入 | 会话: {request_chat_key} | "
+                        f"sender={entry.get('sender')}"
+                    )
+                    continue
+                entries.append(entry)
+            if not entries:
+                return False
+            if reply_completed:
+                # 刚产出的本轮回复作为 assistant 消息入列（仅本轮 content；
+                # 中间轮文本已在之前的 assistant(tool_calls) 消息里），模型完整看到自己说过的话
+                assistant_reply: Dict[str, Any] = {"role": "assistant", "content": round_content or ""}
+                if round_reasoning:
+                    assistant_reply["reasoning_content"] = round_reasoning
+                messages.append(assistant_reply)
+            count = len(entries)
+            # 未处理标记（ephemeral system：不落历史、不进 tool_messages、不进返回的 tool_messages 列表）
+            if reply_completed:
+                notice = f"[新消息提醒] 以下 {count} 条是尚未处理的新消息，请一并回应"
+            else:
+                notice = f"[新消息提醒] 你上一条消息的回复尚未完成，请继续完成它；以下 {count} 条新消息也均未处理，请一并回应"
+            messages.append({"role": "system", "content": notice})
+            multimodal_enabled = bool(getattr(plugin_config, "MULTIMODAL_ENABLE", True)) if plugin_config else True
+            img_index = _next_image_index(messages)
+            trigger_images = list(self._current_trigger_images)
+            for entry in entries:
+                user_msg, img_index = await self._build_loop_user_message(entry, img_index, multimodal_enabled)
+                messages.append(user_msg)
+                entry_images = [str(u) for u in (entry.get("image_urls") or []) if u]
+                if entry_images:
+                    trigger_images.extend(entry_images)
+                # 触发者上下文更新为最新发言者（记忆工具 user 维度归属最新触发者）
+                if entry.get("userid"):
+                    self._current_trigger_userid = str(entry["userid"])
+            self._current_trigger_images = trigger_images
+            # 新输入到来：重置轮数与循环计时（终端标志此时必为 False），继续循环。
+            # per-reply 累积（中间文本/工具消息）仅在刚完成的回复已经 on_reply_complete 落库
+            # （reply_completed=True）时清零；工具轮被插入打断（False）时工具段与中间文本
+            # 尚未落库，必须保留给最终完成回复的回调一并落库，否则历史丢失整个工具调用段。
+            round_idx = 0
+            loop_start = time.monotonic()
+            if reply_completed:
+                intermediate_texts = []
+                tool_messages = []
+            # 记录本批次 entry，随下一个完成的回复回调给 matcher（该回复应答的就是这批新消息）
+            _entries_for_next_reply = list(entries)
+            logger.info(
+                f"[循环邮箱] 轮边界批量插入 | 会话: {request_chat_key} | 批量: {count} | "
+                f"senders: {', '.join(str(e.get('sender') or 'anonymous') for e in entries)} | "
+                f"上一轮未完成回复: {not reply_completed}"
+            )
+            return True
+
         while True:
             try:
-                # 最后一轮不带工具定义，强制模型直接回复；重试轮忽略此限制
-                is_last_round = round_idx >= max_rounds and not _force_tools_next
-                # 工具超限后，最后一轮仍提供终端工具（画图/记忆）供模型完成关键操作
-                if is_last_round and _allow_terminal_tools and not _force_tools_next:
-                    current_tools = [s for s in tool_schemas if s.get("function", {}).get("name") in TERMINAL_TOOLS]
+                # 时间闸门：工具循环总耗时超限 → 进终端轮优雅收尾（不强制丢弃已产出文本）
+                # 协议约束：该检查点在轮边界，正常不会紧跟 assistant(tool_calls)；
+                # 若为异常重试等罕见路径导致末尾是带 tool_calls 的 assistant，则跳过提示注入，
+                # 仅置终端标志，避免 system 隔断 assistant(tool_calls) → tool 响应的连续配对
+                if not _allow_terminal_tools and time.monotonic() - loop_start > _tool_loop_max_seconds:
+                    logger.warning(f"工具循环总耗时超过 {_tool_loop_max_seconds}s，进入终端轮收尾")
+                    _tail_msg = messages[-1] if messages else {}
+                    if not (_tail_msg.get("role") == "assistant" and _tail_msg.get("tool_calls")):
+                        messages.append({"role": "system", "content": _TOOL_LOOP_TIMEOUT_TEXT})
+                        internal_control_injected = True
+                    round_idx = max_rounds
+                    _allow_terminal_tools = True
+
+                # force 模式：不使用 tool_choice 强制指定（主流 provider 在思考模式下均不兼容，
+                # 会 400），改为在消息尾部注入强制画图提示（仅一次；尾部追加不破坏历史前缀缓存；
+                # 末尾是 assistant(tool_calls) 时跳过注入，避免 system 隔断 tool_calls → tool 响应的
+                # 连续配对）。模型仍不调用时由 matcher 的伪造编号拦截/漫画强制画图兜底。
+                if (
+                    _force_draw_request
+                    and not has_anima_call
+                    and not _force_draw_hint_injected
+                ):
+                    _force_draw_hint_injected = True
+                    _tail_msg = messages[-1] if messages else {}
+                    if not (_tail_msg.get("role") == "assistant" and _tail_msg.get("tool_calls")):
+                        messages.append({"role": "system", "content": _FORCE_DRAW_HINT_TEXT})
+                        logger.info("force 模式：已在尾部注入强制画图提示（不使用 tool_choice）")
+
+                # 最后一轮 tools 数组保持全量不变，改传 tool_choice="none" 强制模型直接回复（保住缓存前缀）；
+                # 终端阶段（_allow_terminal_tools）同样保持全量 tools，非终端调用在执行侧过滤
+                is_last_round = round_idx >= max_rounds
+                _terminal_this_round = is_last_round and _allow_terminal_tools and not _terminal_wrapup_pending
+                current_tools = tool_schemas
+                if _tool_choice_dropped:
+                    round_tool_choice = ""  # 降级：完全省略 tool_choice 字段
+                elif _terminal_wrapup_pending or (is_last_round and not _allow_terminal_tools):
+                    round_tool_choice = "none"
                 else:
-                    current_tools = tool_schemas if (not is_last_round or _force_tools_next) else None
-                if _force_tools_next:
-                    _force_tools_next = False
+                    round_tool_choice = None
 
                 # 最后一轮前，若有中间文本，注入提醒避免最终回复重复（终端工具轮不注入）
                 if is_last_round and not _allow_terminal_tools and intermediate_texts:
@@ -927,24 +1123,9 @@ class TextGenerator(Singleton["TextGenerator"]):
                         await on_text(safe_text)
 
                 if (request_state.get("config") or {}).get("enable_stream", True):
-                    # 画图请求且尚未调用画图工具时先缓冲，避免伪编号/占位符在流式发送中泄漏。
-                    # force 模式额外触发一次重试；其他模式只发送清理后的文本。
-                    _intercept_final = (
-                        _has_draw_request and not has_anima_call
-                        and not is_last_round  # 工具仍可用（非最后一轮），模型本可调用但未调用
+                    content, tool_calls, reasoning_content = await self._stream_once(
+                        messages, type, current_tools, effective_on_text, round_on_reasoning, request_state, on_tool_call, tool_choice=round_tool_choice
                     )
-                    _draw_buf: Optional[List[str]] = None
-                    if _intercept_final:
-                        _draw_buf = []
-                        async def _draw_on_text(chunk: str):
-                            _draw_buf.append(chunk)
-                        content, tool_calls, reasoning_content = await self._stream_once(
-                            messages, type, current_tools, _draw_on_text, round_on_reasoning, request_state, on_tool_call
-                        )
-                    else:
-                        content, tool_calls, reasoning_content = await self._stream_once(
-                            messages, type, current_tools, effective_on_text, round_on_reasoning, request_state, on_tool_call
-                        )
                     # 过滤参数 JSON 不完整的 tool_calls（流式截断导致），让模型重试
                     if tool_calls:
                         _valid_tool_calls = []
@@ -958,15 +1139,21 @@ class TextGenerator(Singleton["TextGenerator"]):
                                 logger.warning(f"[工具调用] 丢弃参数不完整的 tool_call: {func_name}({raw_args!r})")
                         if len(_valid_tool_calls) < len(tool_calls):
                             if not _valid_tool_calls:
-                                # 全部丢弃，注入提示让模型重新调用
+                                # 全部丢弃：首次注入提示让模型重新调用；
+                                # 第二次撤工具（下一轮 tool_choice="none"）强制出文本，防无界循环
                                 tool_calls = []
+                                _bad_json_retries += 1
+                                if _bad_json_retries > 1:
+                                    round_idx = max_rounds
+                                    _terminal_wrapup_pending = True
+                                    messages.append({"role": "system", "content": "工具调用参数多次不完整（JSON 截断），停止调用工具，直接基于已有信息用文字回复。"})
+                                    internal_control_injected = True
+                                    continue
                                 messages.append({"role": "system", "content": "你刚才的工具调用参数不完整（JSON 截断），请重新调用。"})
                                 continue
                             tool_calls = _valid_tool_calls
                     if not tool_calls:
                         final_reasoning_content = reasoning_content or ""
-                        raw_merged = _join_intermediate(content)
-                        merged = _merge_intermediate(content)
                         # 工具调用后续轮返回空内容：可能是图片撑爆上下文导致，
                         # 剥离图片后重试（兜底，正常情况下 except 分支已处理异常场景）
                         if not content.strip() and not intermediate_texts and tool_messages and not _image_stripped:
@@ -977,62 +1164,43 @@ class TextGenerator(Singleton["TextGenerator"]):
                                     m["content"] = "\n".join(text_parts) if text_parts else "[图片已省略]"
                             logger.warning("工具轮返回空内容，已剥离图片并重试")
                             continue
-                        # 拦截模式：检查伪造编号
-                        if _intercept_final:
-                            has_fake = _contains_fake_draw_reply(raw_merged)
-                            if _enable_intercept and has_fake and _fake_retry_count == 0:
-                                _fake_retry_count += 1
-                                logger.warning(f"[伪造任务编号] 整轮结束后拦截伪造回复，触发重试")
-                                _force_tools_next = True
-                                intermediate_texts.clear()
-                                messages.append({
-                                    "role": "system",
-                                    "content": (
-                                        "你在回复中编造了任务编号但没有调用 generate_anima_image 画图工具。"
-                                        "任务编号只能由画图工具返回给你，不能凭空编造。"
-                                        "你必须通过 tool_calls 调用画图工具。重新回复。"
-                                    ),
-                                })
-                                continue
-                            # 通过检查或已重试过：只发送清理后的缓冲内容，避免占位符泄漏
-                            if on_text and _draw_buf:
-                                safe_text = sanitize_draw_reply_text("".join(_draw_buf), allow_task_ids=False)
-                                if safe_text:
-                                    await on_text(safe_text)
-                        elif control_stream_buf is not None:
+                        if control_stream_buf is not None:
                             await _flush_control_stream_buffer()
-                        # 思考或回复中提到画图工具但未实际调用：注入提示强制重试（漫画模式不强制）
-                        # 仅在工具实际可用时检查：auto+无画图关键词时工具已从 schemas 中过滤，不误判
-                        _draw_tool_available = _draw_mode not in ("off",) and (_draw_mode != "auto" or _has_draw_request)
-                        if (
-                            not _thinking_check_done
-                            and not has_anima_call
-                            and not _is_manga
-                            and _draw_tool_available
-                            and (
-                                (reasoning_content and "generate_anima_image" in reasoning_content)
-                                or (content and "generate_anima_image" in content)
-                            )
+                        merged_reply = _merge_intermediate(content)
+                        # 逐轮落库：本回复完成，立即回调 matcher 落库（每个回复恰好一次）
+                        await _emit_reply(merged_reply)
+                        # 回复完成边界：邮箱有新触发消息则批量插入并继续循环（终端阶段内部跳过）
+                        if await _insert_mailbox_entries(
+                            reply_completed=bool(merged_reply and merged_reply.strip()),
+                            round_content=content,
+                            round_reasoning=reasoning_content or "",
                         ):
-                            _thinking_check_done = True
-                            _force_tools_next = True
-                            intermediate_texts.clear()
-                            messages.append({
-                                "role": "system",
-                                "content": (
-                                    "你在回复中提到了 generate_anima_image 画图工具，但没有通过 tool_calls 实际调用。"
-                                    "请立即通过 tool_calls 调用 generate_anima_image 画图工具完成绘图。"
-                                ),
-                            })
-                            logger.info("[画图工具检测] 输出中提到 generate_anima_image 但未调用，触发重试")
                             continue
-                        return merged, True, tool_messages, final_reasoning_content
+                        return _joined_reply_text(merged_reply), True, tool_messages, final_reasoning_content
+                    if _terminal_wrapup_pending:
+                        # 收尾轮模型仍返回 tool_calls（不遵守 tool_choice="none"）：不再执行工具，直接以已产出文本收尾
+                        final_reasoning_content = reasoning_content or ""
+                        if control_stream_buf is not None:
+                            await _flush_control_stream_buffer()
+                        merged_reply = _merge_intermediate(content)
+                        await _emit_reply(merged_reply)
+                        # 终端阶段不接收插入，仅记录邮箱残留日志（残留由 matcher 任务收尾时重新处理）
+                        await _insert_mailbox_entries(reply_completed=True)
+                        return _joined_reply_text(merged_reply), True, tool_messages, final_reasoning_content
                     if is_last_round and not _allow_terminal_tools:
                         final_reasoning_content = reasoning_content or ""
                         if control_stream_buf is not None:
                             await _flush_control_stream_buffer()
                         if content or intermediate_texts:
-                            return _merge_intermediate(content), True, tool_messages, final_reasoning_content
+                            merged_reply = _merge_intermediate(content)
+                            await _emit_reply(merged_reply)
+                            if await _insert_mailbox_entries(
+                                reply_completed=bool(merged_reply and merged_reply.strip()),
+                                round_content=content,
+                                round_reasoning=reasoning_content or "",
+                            ):
+                                continue
+                            return _joined_reply_text(merged_reply), True, tool_messages, final_reasoning_content
                         if not _image_stripped:
                             _image_stripped = True
                             for m in messages:
@@ -1064,7 +1232,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                     messages.append(assistant_msg)
                     tool_messages.append(assistant_msg)
                 else:
-                    content, tool_calls, message_dict = await self._complete_once(messages, type, current_tools, request_state, on_tool_call)
+                    content, tool_calls, message_dict = await self._complete_once(messages, type, current_tools, request_state, on_tool_call, tool_choice=round_tool_choice)
                     # 过滤参数 JSON 不完整的 tool_calls
                     if tool_calls:
                         _valid_tool_calls = []
@@ -1078,66 +1246,60 @@ class TextGenerator(Singleton["TextGenerator"]):
                                 logger.warning(f"[工具调用] 丢弃参数不完整的 tool_call: {func_name}({raw_args!r})")
                         if len(_valid_tool_calls) < len(tool_calls):
                             if not _valid_tool_calls:
+                                # 全部丢弃：首次注入提示让模型重新调用；
+                                # 第二次撤工具（下一轮 tool_choice="none"）强制出文本，防无界循环
                                 tool_calls = []
+                                _bad_json_retries += 1
+                                if _bad_json_retries > 1:
+                                    round_idx = max_rounds
+                                    _terminal_wrapup_pending = True
+                                    messages.append({"role": "system", "content": "工具调用参数多次不完整（JSON 截断），停止调用工具，直接基于已有信息用文字回复。"})
+                                    internal_control_injected = True
+                                    continue
                                 messages.append({"role": "system", "content": "你刚才的工具调用参数不完整（JSON 截断），请重新调用。"})
                                 continue
                             tool_calls = _valid_tool_calls
                     if not tool_calls:
-                        # 检测伪造任务编号并重试（拦截不发送）
-                        # 仅在工具仍可用时拦截（非最后一轮），最后一轮模型无法调工具则跳过
-                        if (_enable_intercept and not has_anima_call and not is_last_round):
-                            raw_merged = _join_intermediate(content)
-                            has_fake = _contains_fake_draw_reply(raw_merged)
-                            if has_fake and _fake_retry_count == 0:
-                                _fake_retry_count += 1
-                                logger.warning(f"[伪造任务编号] 整轮结束后拦截伪造回复，触发重试")
-                                _force_tools_next = True
-                                intermediate_texts.clear()
-                                messages.append({
-                                    "role": "system",
-                                    "content": (
-                                        "你在回复中编造了任务编号但没有调用 generate_anima_image 画图工具。"
-                                        "任务编号只能由画图工具返回给你，不能凭空编造。"
-                                        "你必须通过 tool_calls 调用画图工具。重新回复。"
-                                    ),
-                                })
-                                continue
                         final_reasoning_content = message_dict.get("reasoning_content", "")
-                        # 思考或回复中提到画图工具但未实际调用：注入提示强制重试（漫画模式不强制）
-                        # 仅在工具实际可用时检查：auto+无画图关键词时工具已从 schemas 中过滤，不误判
-                        _draw_tool_available = _draw_mode not in ("off",) and (_draw_mode != "auto" or _has_draw_request)
-                        if (
-                            not _thinking_check_done
-                            and not has_anima_call
-                            and not _is_manga
-                            and _draw_tool_available
-                            and (
-                                (final_reasoning_content and "generate_anima_image" in final_reasoning_content)
-                                or (content and "generate_anima_image" in content)
-                            )
-                        ):
-                            _thinking_check_done = True
-                            _force_tools_next = True
-                            intermediate_texts.clear()
-                            messages.append({
-                                "role": "system",
-                                "content": (
-                                    "你在回复中提到了 generate_anima_image 画图工具，但没有通过 tool_calls 实际调用。"
-                                    "请立即通过 tool_calls 调用 generate_anima_image 画图工具完成绘图。"
-                                ),
-                            })
-                            logger.info("[画图工具检测] 输出中提到 generate_anima_image 但未调用，触发重试")
-                            continue
                         safe_content = sanitize_draw_reply_text(content, allow_task_ids=has_anima_call)
                         if on_text and safe_content:
                             await on_text(safe_content)
-                        return _merge_intermediate(content), True, tool_messages, final_reasoning_content
+                        merged_reply = _merge_intermediate(content)
+                        # 逐轮落库：本回复完成，立即回调 matcher 落库（每个回复恰好一次）
+                        await _emit_reply(merged_reply)
+                        # 回复完成边界：邮箱有新触发消息则批量插入并继续循环（终端阶段内部跳过）
+                        if await _insert_mailbox_entries(
+                            reply_completed=bool(merged_reply and merged_reply.strip()),
+                            round_content=content,
+                            round_reasoning=final_reasoning_content or "",
+                        ):
+                            continue
+                        return _joined_reply_text(merged_reply), True, tool_messages, final_reasoning_content
+                    if _terminal_wrapup_pending:
+                        # 收尾轮模型仍返回 tool_calls（不遵守 tool_choice="none"）：不再执行工具，直接以已产出文本收尾
+                        final_reasoning_content = message_dict.get("reasoning_content", "")
+                        safe_content = sanitize_draw_reply_text(content, allow_task_ids=has_anima_call)
+                        if on_text and safe_content:
+                            await on_text(safe_content)
+                        merged_reply = _merge_intermediate(content)
+                        await _emit_reply(merged_reply)
+                        # 终端阶段不接收插入，仅记录邮箱残留日志（残留由 matcher 任务收尾时重新处理）
+                        await _insert_mailbox_entries(reply_completed=True)
+                        return _joined_reply_text(merged_reply), True, tool_messages, final_reasoning_content
                     if is_last_round and not _allow_terminal_tools:
                         safe_content = sanitize_draw_reply_text(content, allow_task_ids=has_anima_call)
                         if on_text and safe_content:
                             await on_text(safe_content)
                         if content or intermediate_texts:
-                            return _merge_intermediate(content), True, tool_messages, final_reasoning_content
+                            merged_reply = _merge_intermediate(content)
+                            await _emit_reply(merged_reply)
+                            if await _insert_mailbox_entries(
+                                reply_completed=bool(merged_reply and merged_reply.strip()),
+                                round_content=content,
+                                round_reasoning=message_dict.get("reasoning_content", "") or "",
+                            ):
+                                continue
+                            return _joined_reply_text(merged_reply), True, tool_messages, final_reasoning_content
                         if not _image_stripped:
                             _image_stripped = True
                             for m in messages:
@@ -1221,20 +1383,19 @@ class TextGenerator(Singleton["TextGenerator"]):
                 # 更新计数器
                 total_tool_calls += current_tool_count
                 search_tool_calls += current_search_count
-                
-                # 通知外部：工具调用阶段开始（受保护，不打断）
-                self._set_tool_calling(request_chat_key, True)
+
                 self._current_chat_key = request_chat_key
                 self._current_trigger_userid = request_trigger_userid
-                try:
-                    await self._execute_tool_calls(messages, tool_calls, plugin_config)
-                    # 收集tool消息
-                    for msg in messages:
-                        if msg.get("role") == "tool" and msg not in tool_messages:
-                            tool_messages.append(msg)
-                finally:
-                    self._set_tool_calling(request_chat_key, False)
-                    self._notify_tool_done(request_chat_key)
+                await self._execute_tool_calls(messages, tool_calls, plugin_config)
+                # 收集tool消息
+                for msg in messages:
+                    if msg.get("role") == "tool" and msg not in tool_messages:
+                        tool_messages.append(msg)
+
+                # 终端阶段只允许单次终端工具调用：本轮以终端模式进入且已执行完毕
+                # （含非终端调用全部被过滤的情况），下一轮进入无工具收尾轮（tool_choice="none"）
+                if _terminal_this_round:
+                    _terminal_wrapup_pending = True
 
                 # 搜索超限提示在工具响应全部追加完成后才插入，
                 # 避免隔断 assistant(tool_calls) → tool 响应的连续配对。
@@ -1261,10 +1422,34 @@ class TextGenerator(Singleton["TextGenerator"]):
                 tool_names = {_get(_get(tc, "function", {}), "name", "") for tc in tool_calls}
                 if tool_names - {"remember"}:
                     round_idx += 1
+
+                # 工具轮边界：批量插入循环邮箱中的新触发消息（回复未完成版标记；终端阶段内部跳过）
+                await _insert_mailbox_entries(reply_completed=False)
             except Exception as e:
-                self._set_tool_calling(request_chat_key, False)
-                self._notify_tool_done(request_chat_key)
                 err_text = str(e).lower()
+                # keep_reasoning=true 但 provider 不接受 reasoning_content（400）：
+                # 剥离全部 reasoning 后重试一次
+                if (
+                    not _reasoning_stripped
+                    and "reasoning" in err_text
+                    and ("400" in err_text or "bad request" in err_text)
+                ):
+                    _reasoning_stripped = True
+                    for _m in messages:
+                        _m.pop("reasoning_content", None)
+                    logger.warning(f"provider 拒绝 reasoning_content，已剥离思考字段并重试: {e!r}")
+                    continue
+                # provider 不支持 tool_choice（400 且错误文本提及该字段）：
+                # 后续轮完全省略 tool_choice 重试一次，退化为纯提示词约束（仅此一次）
+                if (
+                    not _tool_choice_dropped
+                    and round_tool_choice
+                    and "tool_choice" in err_text
+                    and ("400" in err_text or "bad request" in err_text)
+                ):
+                    _tool_choice_dropped = True
+                    logger.warning(f"provider 拒绝 tool_choice 参数，后续请求省略该字段并重试: {e!r}")
+                    continue
                 # 工具调用后续轮：图片已无用，任何疑似上下文/token 错误都尝试剥离图片重试
                 is_ctx_error = (
                     "context" in err_text
@@ -1285,7 +1470,11 @@ class TextGenerator(Singleton["TextGenerator"]):
                     logger.warning(f"工具轮请求失败，已剥离图片并重试: {e!r}")
                     continue
                 logger.warning(f"LLM 请求失败: {e!r}")
-                self._rotate_key()
+                if request_profile:
+                    # profile 快照路径：推进该 profile 自己的 key 轮换索引，下次请求换 key
+                    self._rotate_profile_key(request_profile, len(request_profile.get("api_keys") or [""]))
+                else:
+                    self._rotate_key()
                 return f"请求大模型时发生错误: {e!r}", False, tool_messages, ""
         return "", False, tool_messages, ""
 
@@ -1321,58 +1510,31 @@ class TextGenerator(Singleton["TextGenerator"]):
         self.last_tool_outputs = []
         return outputs
 
-    def set_pending_merge_input(self, chat_key: str, input_data: Dict[str, Any]) -> None:
-        """设置待合并的输入"""
-        if chat_key in self._pending_merge_input:
-            # 已有待合并的输入，合并文本和图片
-            existing = self._pending_merge_input[chat_key]
-            old_text = existing.get("text", "")
-            new_text = input_data.get("text", "")
-            old_sender = existing.get("sender", "")
-            new_sender = input_data.get("sender", "")
-            
-            # 合并文本，保留发送者信息
-            merged_parts = []
-            if old_text:
-                merged_parts.append(f"{old_sender}: {old_text}" if old_sender else old_text)
-            if new_text:
-                merged_parts.append(f"{new_sender}: {new_text}" if new_sender else new_text)
-            
-            existing["text"] = "\n\n".join(merged_parts)
-            existing["images"] = list(existing.get("images") or []) + list(input_data.get("images") or [])
-            # 更新matcher为最新的
-            existing["matcher"] = input_data.get("matcher")
-            existing["trigger_userid"] = input_data.get("trigger_userid", existing.get("trigger_userid"))
-            existing["sender"] = input_data.get("sender", existing.get("sender"))
-            logger.info(f"[工具调用] 已合并输入到待处理: {chat_key}")
-        else:
-            self._pending_merge_input[chat_key] = input_data
-            logger.info(f"[工具调用] 设置待合并输入: {chat_key}")
-
-    def get_pending_merge_input(self, chat_key: str) -> Optional[Dict[str, Any]]:
-        """获取并清除待合并的输入"""
-        return self._pending_merge_input.pop(chat_key, None)
-
-    def has_pending_merge_input(self, chat_key: str) -> bool:
-        """检查是否有待合并的输入"""
-        return chat_key in self._pending_merge_input
-
     @staticmethod
     def generate_msg_template(sender: str, msg: str, time_str: str = "") -> str:
         return f"{time_str}{sender}: {msg}"
 
     @staticmethod
     def _cal_text_tokens(text: str, model: str = "gpt-3.5-turbo") -> int:
-        """计算纯文本的token数"""
+        """计算纯文本的token数（LRU 缓存：裁剪循环会反复编码同一文本）"""
+        cache_key = (model, text)
+        cached = _text_token_cache.get(cache_key)
+        if cached is not None:
+            _text_token_cache.move_to_end(cache_key)
+            return cached
         try:
             if model in enc_cache:
                 enc = enc_cache[model]
             else:
                 enc = encoding_for_model(model)
                 enc_cache[model] = enc
-            return len(enc.encode(text))
+            tokens = len(enc.encode(text))
         except Exception:
-            return max(1, len(text) // 2)
+            tokens = max(1, len(text) // 2)
+        _text_token_cache[cache_key] = tokens
+        if len(_text_token_cache) > _TEXT_TOKEN_CACHE_MAX:
+            _text_token_cache.popitem(last=False)
+        return tokens
 
     @staticmethod
     def _cal_messages_tokens(messages: List[Dict[str, Any]], model: str = "gpt-3.5-turbo") -> int:
@@ -1388,7 +1550,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                         if item.get("type") == "text":
                             total += TextGenerator._cal_text_tokens(item.get("text", ""), model)
                         elif item.get("type") == "image_url":
-                            total += 85  # OpenAI vision图片token估算
+                            total += IMAGE_TOKEN_ESTIMATE
             total += 4  # 消息格式开销 (role, etc.)
         return total
 

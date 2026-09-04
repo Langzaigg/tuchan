@@ -67,155 +67,94 @@ def _calc_rating_stats(count_dict: Dict[str, int]) -> Dict[str, Any]:
     }
 
 
-# ============ 工具 Schema 定义 ============
+# ============ 工具 Schema 定义（5 合 1：单工具 + action 分发）============
 
-# 搜索条目
-search_subject_schema = {
+bangumi_schema = {
     "type": "function",
     "function": {
-        "name": "bangumi_search_subject",
-        "description": "在 Bangumi 搜索动画、漫画、游戏、音乐、书籍等条目。返回匹配的条目列表（含ID、名称、评分、简介等）。如需更多信息（角色、关联作品等），用返回的 ID 调用 bangumi_get_subject。按会社搜索示例：keyword留空，tags设为['Key']可搜索Key社游戏。",
+        "name": "bangumi",
+        "description": (
+            "Bangumi 番组数据库工具，按 action 选择功能："
+            "search_subject=搜索条目（动画/漫画/游戏/音乐/书籍，含ID、名称、评分、简介；按会社搜索示例：keyword留空，tags设为['Key']可搜索Key社游戏）；"
+            "get_subject=按 ID 获取条目详情（角色、制作人员、关联作品，ID 从 search_subject 结果获取）；"
+            "search_character=搜索虚拟角色（含出演作品和声优）；"
+            "search_person=搜索现实人物（制作人员、声优、导演等，含参与作品）；"
+            "calendar=本周每日动画放送列表。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["search_subject", "get_subject", "search_character", "search_person", "calendar"],
+                    "description": "要执行的操作，默认 search_subject",
+                },
                 "keyword": {
                     "type": "string",
-                    "description": "搜索关键词（按会社搜索时可留空）",
+                    "description": "搜索关键词（search_subject 按会社搜索时可留空；search_character 填角色名；search_person 填人物名）",
                 },
                 "type": {
                     "type": "string",
                     "enum": ["anime", "book", "music", "game", "real"],
-                    "description": "条目类型筛选：anime=动画, book=书籍/漫画, music=音乐, game=游戏, real=真人/三次元",
+                    "description": "[search_subject] 条目类型筛选：anime=动画, book=书籍/漫画, music=音乐, game=游戏, real=真人/三次元",
                 },
                 "sort": {
                     "type": "string",
                     "enum": ["match", "heat", "rank", "score"],
-                    "description": "排序方式：match=匹配度(默认), heat=收藏人数, rank=排名, score=评分",
+                    "description": "[search_subject] 排序方式：match=匹配度(默认), heat=收藏人数, rank=排名, score=评分",
                 },
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "标签列表（且关系），如 ['治愈系','日常'] 或 ['Key'] 搜索Key社游戏",
+                    "description": "[search_subject] 标签列表（且关系），如 ['治愈系','日常'] 或 ['Key'] 搜索Key社游戏",
                 },
                 "air_date": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "播出/发售日期范围（且关系），格式 YYYY-MM-DD，如 ['>=2024-07-01','<2024-10-01'] 表示2024年7月新番",
+                    "description": "[search_subject] 播出/发售日期范围（且关系），格式 YYYY-MM-DD，如 ['>=2024-07-01','<2024-10-01'] 表示2024年7月新番",
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "返回数量上限，默认10",
+                    "description": "[search_subject] 返回数量上限，默认10",
                 },
-            },
-            "required": [],
-        },
-    },
-}
-
-# 获取条目详情
-get_subject_schema = {
-    "type": "function",
-    "function": {
-        "name": "bangumi_get_subject",
-        "description": "通过 ID 获取 Bangumi 条目的详细信息，包括角色、制作人员、关联作品等。",
-        "parameters": {
-            "type": "object",
-            "properties": {
                 "subject_id": {
                     "type": "integer",
-                    "description": "条目 ID（从 bangumi_search_subject 返回结果中获取）",
-                },
-            },
-            "required": ["subject_id"],
-        },
-    },
-}
-
-# 搜索角色（虚拟角色，直接返回出演作品）
-search_character_schema = {
-    "type": "function",
-    "function": {
-        "name": "bangumi_search_character",
-        "description": "在 Bangumi 搜索虚拟角色（动画、游戏、漫画中的角色）。返回匹配的角色列表，包含出演作品和声优信息。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "keyword": {
-                    "type": "string",
-                    "description": "搜索关键词（角色名）",
+                    "description": "[get_subject] 条目 ID（从 search_subject 返回结果中获取）",
                 },
                 "nsfw": {
                     "type": "boolean",
-                    "description": "是否包含NSFW角色，默认false（不包含）",
-                },
-            },
-            "required": ["keyword"],
-        },
-    },
-}
-
-# 搜索人物（制作人员、声优等，直接返回参与作品）
-search_person_schema = {
-    "type": "function",
-    "function": {
-        "name": "bangumi_search_person",
-        "description": "在 Bangumi 搜索现实人物（制作人员、声优、导演、编剧等）。返回匹配的人物列表，包含参与作品信息。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "keyword": {
-                    "type": "string",
-                    "description": "搜索关键词（人物名）",
+                    "description": "[search_character] 是否包含NSFW角色，默认false（不包含）",
                 },
                 "careers": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "职业筛选（且关系），如 ['artist','director']",
+                    "description": "[search_person] 职业筛选（且关系），如 ['artist','director']",
                 },
             },
-            "required": ["keyword"],
-        },
-    },
-}
-
-# 每日放送
-calendar_schema = {
-    "type": "function",
-    "function": {
-        "name": "bangumi_calendar",
-        "description": "获取 Bangumi 每日放送列表，返回本周每天的动画放送信息（含名称、评分、放送日期等）。",
-        "parameters": {
-            "type": "object",
-            "properties": {},
+            "required": ["action"],
         },
     },
 }
 
 
-# 自动发现接口：导出工具列表
-# run 函数在文件末尾定义，这里用延迟引用
-def _get_run_functions():
-    from . import bangumi_search as _self
-    return {
-        "bangumi_search_subject": _self.run_search_subject,
-        "bangumi_get_subject": _self.run_get_subject,
-        "bangumi_search_character": _self.run_search_character,
-        "bangumi_search_person": _self.run_search_person,
-        "bangumi_calendar": _self.run_calendar,
+async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
+    """单入口分发：按 action 调用对应子功能。"""
+    action = str(args.get("action") or "search_subject").strip()
+    handlers = {
+        "search_subject": run_search_subject,
+        "get_subject": run_get_subject,
+        "search_character": run_search_character,
+        "search_person": run_search_person,
+        "calendar": run_calendar,
     }
+    handler = handlers.get(action)
+    if not handler:
+        return f"未知 action: {action}，可用: {', '.join(handlers)}", []
+    return await handler(args, config)
 
 
-def get_tools():
-    """返回 (name, schema, run) 列表，供自动发现使用。"""
-    runs = _get_run_functions()
-    return [
-        ("bangumi_search_subject", search_subject_schema, runs["bangumi_search_subject"]),
-        ("bangumi_get_subject", get_subject_schema, runs["bangumi_get_subject"]),
-        ("bangumi_search_character", search_character_schema, runs["bangumi_search_character"]),
-        ("bangumi_search_person", search_person_schema, runs["bangumi_search_person"]),
-        ("bangumi_calendar", calendar_schema, runs["bangumi_calendar"]),
-    ]
-
+# 自动发现接口：单工具导出
+TOOLS = [("bangumi", bangumi_schema, run)]
 
 # ============ API 请求 ============
 

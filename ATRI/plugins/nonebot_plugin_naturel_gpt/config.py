@@ -7,8 +7,12 @@ import yaml
 from pathlib import Path
 from .persona_loader import load_personas_from_directory
 
-class GlobalConfig(NBConfig, extra=Extra.ignore):
-    """Plugin Config Here"""
+class GlobalConfig(NBConfig, extra=Extra.allow):
+    """Plugin Config Here
+
+    注意：extra 必须为 allow。nonebot2 >= 2.4 的 BaseSettings.__init__ 会写入
+    `_env_file` 等实例属性，pydantic v1 在 extra != allow 时会拒绝该赋值。
+    """
     ng_config_path: str = "config/naturel_gpt_config.yml"
     ng_dev_mode: bool = False
 
@@ -72,9 +76,7 @@ class Config(BaseModel, extra=Extra.ignore):
     IMPRESSION_TARGET_CHARS: int = 200
     """用户印象目标字数（提示词软限制，硬截断为2倍）"""
     TOOL_CONTEXT_TOKEN_BUDGET: int
-    """工具消息token预算，超出时全部抛弃"""
-    TOOL_CONTEXT_MODE: int
-    """工具上下文模式: 1=完整工具+思考, 2=仅思考, 3=仅工具调用摘要"""
+    """工具消息token预算（工具循环内），超出时进入终端轮收尾"""
 
     LLM_ENABLE_STREAM: bool
     """是否使用流式响应"""
@@ -88,6 +90,8 @@ class Config(BaseModel, extra=Extra.ignore):
     """单轮回复最多工具调用轮数"""
     LLM_MAX_TOTAL_TOOL_CALLS: int
     """单轮总工具调用次数上限"""
+    LLM_TOOL_LOOP_MAX_SECONDS: int
+    """工具调用循环总耗时上限（秒），超时进入终端收尾轮"""
 
     REPLY_ON_NAME_MENTION_PROBABILITY: float
     """是否在被提及时回复"""
@@ -146,7 +150,9 @@ class Config(BaseModel, extra=Extra.ignore):
     REPLY_MAX_SEGMENTS: int
     """单次回复最多分段数，最后一段会接收剩余流式内容"""
     THINK_LEAK_THRESHOLD: int
-    """思考泄漏兜底阈值：思考模式下模型跳过思考标签、把思考混入 content 时，content 字符数超过此值且含双换行，则取最后一个\\n\\n之后的部分作为回复，前段视为思考"""
+    """思考泄漏兜底阈值：思考模式下模型跳过思考标签、把思考混入 content 时，content 字符数超过此值且含双换行，则触发兜底切分，前段视为思考"""
+    THINK_LEAK_SHORT_SEGMENT: int
+    """兜底切分短段阈值：按双换行分段后，从第一个长度小于此值的段落开始（含）视为真实回复，之前视为思考；所有段落都不短时回退取最后一段"""
     NG_ENABLE_AWAKE_IDENTITIES: bool
     """是否允许自动唤醒其它人格"""
 
@@ -240,8 +246,7 @@ CONFIG_TEMPLATE = {
     'CONTEXT_COMPRESS_THRESHOLD_RATIO': 0.5,  # 压缩触发阈值乘数，溢出超过窗口*此比例才触发摘要生成
     'CONTEXT_SUMMARY_TARGET_CHARS': 800,  # 上下文摘要目标字数（提示词软限制，硬截断为2倍）；profile 的 max_summary_tokens 可覆盖
     'IMPRESSION_TARGET_CHARS': 200,  # 用户印象目标字数（提示词软限制，硬截断为2倍）
-    'TOOL_CONTEXT_TOKEN_BUDGET': 16384,  # 工具消息token预算（含思考），超出时从旧到新逐组去除
-    'TOOL_CONTEXT_MODE': 3,  # 工具上下文模式: 1=完整工具+思考, 2=仅思考, 3=仅工具调用摘要
+    'TOOL_CONTEXT_TOKEN_BUDGET': 16384,  # 工具循环内工具+思考 token 预算，超出时进入终端轮收尾
 
     'LLM_ENABLE_STREAM': True,
     'LLM_SHOW_REASONING': False,
@@ -249,6 +254,7 @@ CONFIG_TEMPLATE = {
     'LLM_DISABLED_TOOLS': [],  # 禁用的工具列表，填写工具模块名（如 browse_url、pixiv_search）
     'LLM_MAX_TOOL_ROUNDS': 3,
     'LLM_MAX_TOTAL_TOOL_CALLS': 15,
+    'LLM_TOOL_LOOP_MAX_SECONDS': 180,  # 工具调用循环总耗时上限（秒），超时进入终端收尾轮
 
     'REPLY_ON_NAME_MENTION_PROBABILITY': 0,  # 被提及时回复概率
     'REPLY_ON_AT': True,            # 是否在被at时回复
@@ -281,7 +287,8 @@ CONFIG_TEMPLATE = {
     'NG_ENABLE_MSG_SPLIT': True,   # 是否启用消息分割
     'REPLY_SEGMENT_INTERVAL': 1.0,
     'REPLY_MAX_SEGMENTS': 5,
-    'THINK_LEAK_THRESHOLD': 150,  # 思考泄漏兜底阈值（字符数），思考模式下 content 超过此值且含双换行则只取最后一段
+    'THINK_LEAK_THRESHOLD': 150,  # 思考泄漏兜底阈值（字符数），思考模式下 content 超过此值且含双换行则触发兜底切分
+    'THINK_LEAK_SHORT_SEGMENT': 50,  # 兜底切分短段阈值（字符数）：分段后从第一个短于该值的段落开始视为真实回复，避免回复开头的短句被误判为思考
     'NG_ENABLE_AWAKE_IDENTITIES': True, # 是否允许自动唤醒其它人格
 
     'MULTIMODAL_ENABLE': True,
@@ -440,6 +447,11 @@ def _load_config_obj_from_file()->Config:
                         "extra_prompt": "",
                         # 视觉工具：纯文本主模型可委托视觉模型理解图片（仅文档化默认值，读取处用 .get 兜底）
                         "model_vision": "mimo",
+                        # 关闭思考：true 时响应规则注入 /no_think 指令（仅文档化默认值，读取处用 .get 兜底）
+                        "no_think": False,
+                        # 跨轮历史携带 reasoning_content：true 时持久化历史中的思考字段随请求发送
+                        #（仅文档化默认值，读取处用 .get 兜底；provider 400 拒绝时自动剥离重试一次）
+                        "keep_reasoning": False,
                     },
                     "kimi": {
                         "api_keys": config_obj_from_file.get("OPENAI_API_KEYS", []),

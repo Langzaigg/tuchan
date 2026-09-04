@@ -160,9 +160,10 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
     url = urls[idx - 1]
 
     # 2) URL → base64（复用 image_cache 的 LRU 缓存 / QQ UA+Referer 下载）
+    # 强制 base64：AnimeTrace API 只接受 base64 提交，直传 URL 不可用
     from .. import image_cache
     try:
-        resolved = await image_cache.resolve_urls([url])
+        resolved = await image_cache.resolve_urls([url], force_base64=True)
     except Exception as e:
         logger.warning(f"[anime_trace] 图片下载异常: {e!r} | {str(url)[:80]}")
         return "图片下载失败，请让用户重新发送。", []

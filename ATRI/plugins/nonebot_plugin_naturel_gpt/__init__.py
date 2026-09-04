@@ -94,12 +94,12 @@ from .llm_tool_plugins import tavily_search
 tavily_search.init(config)
 init_tools(config)
 
-# 记录当前激活的搜索工具
+# 记录当前激活的搜索工具（bocha 为 tavily 内部 fallback，不注册独立工具）
 from .llm_tool_plugins import TOOL_REGISTRY
 if "tavily_search" in TOOL_REGISTRY:
-    logger.info("[搜索工具] Tavily Search 已激活（Bocha 作为 fallback）")
-elif "bocha_search" in TOOL_REGISTRY:
-    logger.info("[搜索工具] Bocha Search 已激活")
+    logger.info("[搜索工具] Tavily Search 已激活（Bocha 作为内部 fallback）")
+elif getattr(config, "BOCHA_API_KEY", None):
+    logger.info("[搜索工具] Tavily 不可用，BOCHA_API_KEY 已配置（Tavily 失败时经内部 fallback 使用）")
 else:
     logger.info("[搜索工具] 未配置任何搜索工具（TAVILY_API_KEY / BOCHA_API_KEY 均为空）")
 
