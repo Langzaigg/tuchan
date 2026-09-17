@@ -19,8 +19,9 @@ from .config import config
 
 # 单张图片大小上限（10MB）
 _MAX_SINGLE_IMAGE_BYTES = 10 * 1024 * 1024
-# 缓存总大小上限（50MB）
-_MAX_CACHE_TOTAL_BYTES = 50 * 1024 * 1024
+# 缓存总大小上限（200MB）：图片就地保留在上下文中直到过期（统一 1 小时有效期），
+# 缓存需覆盖一小时内的图片，被 LRU 挤出后重下载若遇 QQ rkey 过期会拿不到（该图退化为 [图片已过期]）
+_MAX_CACHE_TOTAL_BYTES = 200 * 1024 * 1024
 # 下载超时（秒）
 _DOWNLOAD_TIMEOUT = 15.0
 
@@ -165,6 +166,16 @@ async def resolve_urls(urls: List[str], force_base64: bool = False) -> List[str]
     tasks = [resolve_url(u, force_base64=force_base64) for u in unique_urls]
     results = await asyncio.gather(*tasks)
     return [r for r in results if r]
+
+
+async def resolve_urls_keep_order(urls: List[str], force_base64: bool = False) -> List[str]:
+    """按输入顺序逐项解析，失败项为空字符串（不过滤、不去重），供调用方按位置对齐；同一 URL 只解析一次。"""
+    if not urls:
+        return []
+    unique_urls = list(dict.fromkeys(u for u in urls if u))
+    results = await asyncio.gather(*(resolve_url(u, force_base64=force_base64) for u in unique_urls))
+    mapping = dict(zip(unique_urls, results))
+    return [(mapping.get(u) or "") if u else "" for u in urls]
 
 
 def collect_active_urls(messages: List) -> Set[str]:

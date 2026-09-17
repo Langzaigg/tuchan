@@ -16,8 +16,8 @@ schema = {
         "name": "vision",
         "description": (
             "视觉理解工具。当对话上下文中出现 [图片N] 占位符、且需要识别/描述/理解图片内容时调用。"
-            "[图片N] 的编号在整个对话上下文中全局唯一（1..N），image_index 对应 [图片N] 的 N。"
-            "可访问当前上下文里的任何图片，包括历史消息和非触发上下文里的图。"
+            "image_index 对应本次对话中出现的 [图片N] 的 N（显示编号，[图片已过期] 不可用）。"
+            "可访问当前上下文里的任何图片：用于当前消息自带或引用回复带来的图片；当前消息明显在问上下文里的某张图时也可用。没人问的图不要主动去看。"
             "返回的是对图片的纯文字描述，你应基于描述回答用户，不要再重复调用本工具确认同一张图。"
         ),
         "parameters": {
@@ -25,7 +25,7 @@ schema = {
             "properties": {
                 "image_index": {
                     "type": "integer",
-                    "description": "图片序号，对应 [图片N] 的 N（全局唯一，从 1 开始）",
+                    "description": "图片序号，对应本次对话中 [图片N] 的 N（从 1 开始）",
                 },
                 "prompt": {
                     "type": "string",
@@ -45,13 +45,15 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
     from ..openai_func import TextGenerator
     tg = TextGenerator.instance
 
-    # 1) 取当前触发消息的图片 URL 列表（ContextVar 快照，由 matcher 在 stream_response 前写入）
-    urls = list(tg._current_trigger_images or [])
-    if not urls:
-        return "当前消息没有可用图片（可能图片已过期或未开启多模态提取）。", []
-    if idx < 1 or idx > len(urls):
-        return f"图片序号超出范围：当前消息共 {len(urls)} 张图，请检查 [图片N] 的 N。", []
-    url = urls[idx - 1]
+    # 1) 按显示编号查本次请求可见图片表（ContextVar 快照，由 matcher 在 stream_response 前写入；
+    #    历史 / 群聊上下文 / 触发消息统一编号，与模型看到的 [图片N] 一致）
+    table = dict(tg._visible_images or {})
+    if not table:
+        return "当前上下文没有可用图片（可能图片已过期或未开启多模态提取）。", []
+    url = table.get(idx)
+    if not url:
+        available = ", ".join(str(k) for k in sorted(table))
+        return f"图片 {idx} 已过期或不在当前上下文（可用编号：{available}），请检查 [图片N] 的 N。", []
 
     # 2) 视觉模型配置快照（由 stream_response 按 request_profile 写入）
     vis = dict(tg._current_vision_config or {})

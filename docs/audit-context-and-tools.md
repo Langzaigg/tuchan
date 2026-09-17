@@ -149,7 +149,7 @@ System 1 里同一件事说了两遍：
 
 O(n²) 的 tiktoken 编码，且是在 event loop 里同步跑。32k 上下文下每次请求可能要编码十几万 token 的文本。这不花 API token，但**吃事件循环，直接体现为首字延迟**，并且会阻塞同一进程里其他群的消息处理。
 
-另外 `_cal_text_tokens` 固定用 `encoding_for_model("gpt-3.5-turbo")`（cl100k）去估 mimo / kimi / grok / glm / deepseek 的中文 token —— 误差可观，预算天然不准。
+另外 `_cal_text_tokens` 固定用 `encoding_for_model("gpt-3.5-turbo")`（cl100k）去估 kimi / grok / glm / deepseek 的中文 token —— 误差可观，预算天然不准。
 
 ### 3.5 后台任务的额外调用
 

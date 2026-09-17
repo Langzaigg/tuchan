@@ -429,7 +429,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
             report = pdm.init_global_memory(chat_data.chat_key)
             return {'msg': f"global 记忆已开启\n{report}", 'is_progress': True}
         else:
-            return {'msg': "global 记忆已关闭，恢复使用按人格隔离的记忆。", 'is_progress': True}
+            return {'msg': "global 记忆已关闭", 'is_progress': True}
 
     # rg mem global on
     if action == 'on':
@@ -444,7 +444,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
         if not is_global:
             return {'msg': "global 记忆已经是关闭状态。"}
         chat_data.global_memory_enabled = False
-        return {'msg': "global 记忆已关闭，恢复使用按人格隔离的记忆。", 'is_progress': True}
+        return {'msg': "global 记忆已关闭", 'is_progress': True}
 
     return {'msg': "用法: rg mem global [on|off]\n  无参数=切换  on=开启  off=关闭"}
 
@@ -612,8 +612,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
         config.COMFYUI_ENABLED = True
         save_config()
 
-    mode_desc = {'force': '常驻+强制调用', 'on': '常驻', 'auto': '常驻（由工具描述约束调用时机）'}
-    return {'msg': f"Anima 画图已设为 {mode} 模式（{mode_desc[mode]}）(￣▽￣)-ok!"}
+    return {'msg': f"Anima 画图已设为 {mode} 模式 (￣▽￣)-ok!"}
 
 
 @cmd.register(route='rg/turbo', params=['mode'])
@@ -621,7 +620,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
     # 兼容旧指令 rg turbo on/off，已废弃，请改用 rg draw <model>
     mode = param_dict.get('mode', '').strip().lower()
     model = anima_generate.get_draw_model(chat.chat_key)
-    hint = f"（此指令已废弃，请改用 rg draw <模型名>，可用: {', '.join(anima_generate.MODEL_CONFIG.keys())}）"
+    hint = f"（改用 rg draw <模型名>，可用: {', '.join(anima_generate.MODEL_CONFIG.keys())}）"
 
     # 无参数：显示当前模型
     if not mode:
@@ -643,7 +642,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
         if not ok:
             return {'msg': f"加载画图规范失败: {err}"}
     anima_generate.set_draw_model(chat.chat_key, target)
-    return {'msg': f"画图模型已切换为 {target}（兼容旧 turbo 指令）{hint} (￣▽￣)-ok!"}
+    return {'msg': f"画图模型已切换为 {target}{hint} (￣▽￣)-ok!"}
 
 
 @cmd.register(route='rg/manga', params=['mode'])
@@ -656,7 +655,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
         style = anima_generate.get_manga_style(chat.chat_key)
         status = "开启" if current else "关闭"
         style_info = f"\n当前画风: {style}" if style else ""
-        return {'msg': f"当前漫画模式: {status}{style_info}\n用法:\n  rg manga on/off  开启/关闭漫画模式\n  rg manga <画风描述>  开启漫画模式并设置自定义画风\n  rg manga clr  清除自定义画风\n漫画模式下 bot 会主动画图来增强角色扮演沉浸感，无视 draw_model 选项，使用动态选择的默认工作流（首选 fuse）。"}
+        return {'msg': f"当前漫画模式: {status}{style_info}\n用法:\n  rg manga on/off  开启/关闭漫画模式\n  rg manga <画风描述>  开启漫画模式并设置自定义画风\n  rg manga clr  清除自定义画风"}
 
     # 清除画风
     if mode.lower() == 'clr':
@@ -683,7 +682,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
         if not config.COMFYUI_ENABLED:
             config.COMFYUI_ENABLED = True
             save_config()
-        return {'msg': "漫画模式已开启！bot 会在对话中主动画图增强沉浸感 (￣▽￣)-ok!"}
+        return {'msg': "漫画模式已开启 (￣▽￣)-ok!"}
 
     # 自定义画风描述
     ok, err = anima_generate.health_check_sync()
@@ -713,8 +712,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
         return {'msg': (
             f"当前群内容限制解锁: {status}\n"
             f"全局默认: {default}\n"
-            "用法: rg nolimit <on|off>\n"
-            "解锁后 LLM 将配合处理 NSFW 内容请求。"
+            "用法: rg nolimit <on|off>"
         )}
 
     if mode not in ('on', 'off'):
@@ -795,11 +793,9 @@ def _create_draw_task_from_json(json_str: str, chat: Chat) -> dict:
         est_seconds = queue_info.get("estimated_remaining_seconds", 60)
         queue_length = queue_info.get("queue_length", 0)
         est_seconds = est_seconds + queue_length * 90 - 30
-        est_minutes = max(1, round(est_seconds / 60))
     else:
         # est_seconds 仅作展示用预估，按工作流配置给出
         est_seconds = mc.get("est_seconds") or int(60 + (int(draw_args.get('steps', 35)) - 35) * 1.5)
-        est_minutes = max(1, round(est_seconds / 60))
 
     # 提交后台生成任务
     positive_desc = anima_generate._build_positive(draw_args)
@@ -827,23 +823,25 @@ def _create_draw_task_from_json(json_str: str, chat: Chat) -> dict:
         return {'msg': f"提交绘图任务失败: {e}"}
 
     return {
-        'msg': f"绘图任务已创建！\n任务编号：{task_id}\n预计生成时间：{est_seconds}秒（约{est_minutes}分钟）\n提示词：{positive_desc[:200]}{'...' if len(positive_desc) > 200 else ''}"
+        'msg': f"绘图任务已创建！\n任务编号：{task_id}\n预计生成时间：{est_seconds}秒\n提示词：{positive_desc[:200]}{'...' if len(positive_desc) > 200 else ''}"
     }
 
 @cmd.register(route='rg/model', params=['profile_name'])
 def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     from .openai_func import TextGenerator
     profile_name = param_dict.get('profile_name', '').strip()
-    profiles = config.OPENAI_PROFILES
+    # 真实模型配置名（跳过 OPENAI_PROFILES 里的 default 指针）
+    names = config.get_profile_names()
 
-    if not profiles:
+    if not names:
         return {'msg': "未配置 OPENAI_PROFILES，无法切换"}
 
     # 无参数：列出所有 profile 及当前会话的配置
     if not profile_name:
         chat_profile = chat.get_active_profile()
-        lines = ["可用配置:"]
-        for name, p in profiles.items():
+        lines = [f"默认配置: {config.get_default_profile_name()}", "可用配置:"]
+        for name in names:
+            p = config.get_profile(name)
             marker = " ← 当前" if name == chat_profile else ""
             # 纯文本模型 + model_vision 配置时展示视觉模式
             vision_tag = ""
@@ -853,16 +851,19 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
         lines.append(f"\n用法: rg model <配置名>")
         return {'msg': '\n'.join(lines)}
 
-    # 切换 profile（按群）
-    if profile_name not in profiles:
-        return {'msg': f"配置 '{profile_name}' 不存在，可用: {', '.join(profiles.keys())}"}
+    # 切换 profile（按群）；default 是指针键（值为字符串）时不能当配置名切，
+    # 老配置里 default 仍是真实模型配置 dict 时依旧可切（names 只收 dict 条目）
+    if profile_name not in names:
+        if profile_name == config.DEFAULT_PROFILE_KEY:
+            return {'msg': f"'{config.DEFAULT_PROFILE_KEY}' 是指针，不是配置名。可用: {', '.join(names)}"}
+        return {'msg': f"配置 '{profile_name}' 不存在，可用: {', '.join(names)}"}
 
-    profile = profiles[profile_name]
+    profile = config.get_profile(profile_name)
     chat.set_active_profile(profile_name)
     # 立即应用到 TextGenerator
     tg = TextGenerator.instance
     tg.switch_profile(profile_name, profile)
-    config.OPENAI_ACTIVE_PROFILE = profile_name
+    # 只改本会话，不动全局默认：默认模型完全由配置文件的 default 指针决定
     PersistentDataManager.instance.save_to_file()
     return {'msg': f"已切换到 {profile_name}: {profile.get('model', '?')}"}
 
@@ -892,14 +893,14 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
         # 无参数：显示当前昵称或清除
         current = pdm.get_custom_nickname(user_id)
         if current:
-            return {'msg': f"你当前的自定义昵称: {current}\n发送 `rg nn 清除` 可以删除自定义昵称。"}
+            return {'msg': f"你当前的自定义昵称: {current}"}
         else:
-            return {'msg': "你还没有设置自定义昵称。\n用法: rg nn <昵称> 设置在 bot 中的固定昵称。"}
+            return {'msg': "你还没有设置自定义昵称。用法: rg nn <昵称>"}
 
     if nickname in ('清除', 'clear', 'reset', '删除', 'del'):
         pdm.set_custom_nickname(user_id, "")
         PersistentDataManager.instance.save_to_file(must_save=True)
-        return {'msg': "已清除自定义昵称，将使用群名片。", 'is_progress': True}
+        return {'msg': "已清除自定义昵称", 'is_progress': True}
 
     if len(nickname) > 30:
         return {'msg': "昵称最长 30 个字符 (；′⌒`)"}
@@ -940,7 +941,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
   rg draw <model>      切换画图模型（可用: {', '.join(anima_generate.MODEL_CONFIG.keys())}）
   rg draw <json>       根据JSON创建绘图任务
   rg draw-XXXXXX       查询绘图提示词
-  rg manga [on|off|画风] 漫画模式（主动画图增强沉浸感）
+  rg manga [on|off|画风] 漫画模式
 
 【其他】
   rg model [配置名]    查看/切换LLM配置

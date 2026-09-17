@@ -45,8 +45,10 @@ class ChatHistoryMixin:
         content_is_labeled: bool = False,
         context_only: bool = False,
         user_id: str = "",
+        image_meta: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[ChatMessageData]:
-        """更新当前预设的结构化对话历史。返回新写入的消息对象（未写入时返回 None），供调用方按需回滚。"""
+        """更新当前预设的结构化对话历史。返回新写入的消息对象（未写入时返回 None），供调用方按需回滚。
+        image_meta 与 images 平行（[{sender, timestamp}]），仅 context_only 块传入，供按张过期判定。"""
         tg = TextGenerator.instance
         messageunit = tg.generate_msg_template(sender=sender, msg=msg, time_str=f"[{time.strftime('%H:%M:%S %p', time.localtime())}] ")
 
@@ -59,7 +61,15 @@ class ChatHistoryMixin:
         message_index = self._chat_data.next_message_index
         self._chat_data.next_message_index += 1
         
-        valid_images = [url for url in (images or []) if self._is_supported_image_url(url)]
+        valid_images: List[str] = []
+        valid_meta: List[Dict[str, Any]] = []
+        for idx, url in enumerate(images or []):
+            if self._is_supported_image_url(url):
+                valid_images.append(url)
+                if image_meta and idx < len(image_meta) and isinstance(image_meta[idx], dict):
+                    valid_meta.append(dict(image_meta[idx]))
+        if len(valid_meta) != len(valid_images):
+            valid_meta = []
         dropped_image_count = len(images or []) - len(valid_images)
         if dropped_image_count and config.DEBUG_LEVEL > 0:
             logger.warning(f"[会话: {self.chat_key}] 已忽略 {dropped_image_count} 个不支持的图片 URL")
@@ -91,6 +101,7 @@ class ChatHistoryMixin:
                 context_only=context_only,
                 timestamp=time.time(),
                 triggered=record_for_prompt,
+                image_meta=valid_meta,
             )
             if context_only:
                 insert_at = len(preset.prompt_messages)
@@ -318,7 +329,9 @@ class ChatHistoryMixin:
         印象 system 绑定到紧随其后的 user 轮：若该 user 被清理则印象一并丢弃，避免孤立印象残留。"""
         cleaned = ChatHistoryMixin._cleanup_orphan_tool_messages(messages)
         result: List[ChatMessageData] = []
-        round_open = False
+        # 计数版轮次不变量：user +1、最终 assistant -1；循环邮箱会产生
+        # user(A) user(B) assistant(答A) assistant(答B)，布尔"首条 assistant 关轮"会误删答 B。
+        open_users = 0
         active_tool_call_ids = set()
         pending_impression: Optional[ChatMessageData] = None
         for item in cleaned:
@@ -330,7 +343,7 @@ class ChatHistoryMixin:
                 pending_impression = item
                 continue
             if item.role == "user":
-                round_open = True
+                open_users += 1
                 active_tool_call_ids = set()
                 if pending_impression is not None:
                     # 保持写入顺序 [印象, context_only, user]：context_only 是在印象随 user 落位后
@@ -347,10 +360,10 @@ class ChatHistoryMixin:
             if pending_impression is not None:
                 pending_impression = None
             if item.role == "assistant":
-                if not round_open:
+                if open_users <= 0:
                     continue
                 if is_model_request_error_text(item.text):
-                    round_open = False
+                    open_users -= 1
                     active_tool_call_ids = set()
                     continue
                 result.append(item)
@@ -361,11 +374,11 @@ class ChatHistoryMixin:
                         if isinstance(tc, dict) and tc.get("id")
                     }
                 else:
-                    round_open = False
+                    open_users -= 1
                     active_tool_call_ids = set()
                 continue
             if item.role == "tool":
-                if round_open and item.tool_call_id and item.tool_call_id in active_tool_call_ids:
+                if open_users > 0 and item.tool_call_id and item.tool_call_id in active_tool_call_ids:
                     result.append(item)
                     active_tool_call_ids.discard(item.tool_call_id)
                 continue

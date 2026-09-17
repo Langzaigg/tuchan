@@ -4,9 +4,9 @@
 - POST /v1/search 识别图片，返回每个人物检测框的候选「角色名 + 作品名称」列表；
 - GET  /v1/model/list 动态获取可用识别模型（文档要求不要写死模型名，本模块缓存 1 小时）。
 
-图片获取方式与 vision 工具一致：从 tg._current_trigger_images 取 [图片N] 对应的真实
-URL，经 image_cache 下载为 data URI 后剥前缀得纯 base64 提交（QQ 图床 URL 第三方无法
-直接访问，故不传 url 参数）。识别模型是专用角色数据库，比通用视觉模型更准确，因此
+图片获取方式与 vision 工具一致：从 tg._visible_images（本次请求可见图片表 {显示编号: URL}，
+覆盖历史 / 群聊上下文 / 触发消息）取 [图片N] 对应的真实 URL，经 image_cache 下载为 data URI
+后剥前缀得纯 base64 提交（QQ 图床 URL 第三方无法直接访问，故不传 url 参数）。识别模型是专用角色数据库，比通用视觉模型更准确，因此
 多模态 profile 同样暴露本工具。
 """
 
@@ -53,7 +53,8 @@ schema = {
             "动漫角色识别（以图搜番/搜角色）。基于专用 ACGN 角色数据库识别图片中的角色名字和出处作品，"
             "比通用视觉模型更准确。当用户发送动漫/游戏图片并询问「这是什么角色」「出自什么作品」"
             "「求出处」「这是谁」等问题时调用。"
-            "[图片N] 的编号在整个对话上下文中全局唯一（1..N），image_index 对应 [图片N] 的 N；"
+            "image_index 对应本次对话中出现的 [图片N] 的 N（[图片已过期] 不可用）。"
+            "用于当前消息自带或引用回复带来的图片；当前消息明显在问上下文里的某张图时也可用。没人问的图不要主动去认。"
             "图片中有多个人物时会在结果中分人物逐个返回候选。"
         ),
         "parameters": {
@@ -151,13 +152,15 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
     from ..openai_func import TextGenerator
     tg = TextGenerator.instance
 
-    # 1) 取图片 URL 列表（与 vision 工具同源：vision profile 为全上下文全局列表，否则为触发消息图片）
-    urls = list(tg._current_trigger_images or [])
-    if not urls:
-        return "当前会话没有可用图片（可能图片已过期或未开启多模态提取）。", []
-    if idx < 1 or idx > len(urls):
-        return f"图片序号超出范围：当前共 {len(urls)} 张图，请检查 [图片N] 的 N。", []
-    url = urls[idx - 1]
+    # 1) 按显示编号查本次请求可见图片表（与 vision 工具同源；历史 / 群聊上下文 / 触发消息统一编号，
+    #    与模型看到的 [图片N] 一致）
+    table = dict(tg._visible_images or {})
+    if not table:
+        return "当前上下文没有可用图片（可能图片已过期或未开启多模态提取）。", []
+    url = table.get(idx)
+    if not url:
+        available = ", ".join(str(k) for k in sorted(table))
+        return f"图片 {idx} 已过期或不在当前上下文（可用编号：{available}），请检查 [图片N] 的 N。", []
 
     # 2) URL → base64（复用 image_cache 的 LRU 缓存 / QQ UA+Referer 下载）
     # 强制 base64：AnimeTrace API 只接受 base64 提交，直传 URL 不可用

@@ -130,13 +130,10 @@ else:
     config.COMFYUI_ENABLED = False
     save_config()
 
-# 读取 OpenAI 配置（优先使用 OPENAI_PROFILES 中的 active profile）
-_profiles = config.OPENAI_PROFILES
-_active = config.OPENAI_ACTIVE_PROFILE
-if _profiles:
-    if _active not in _profiles:
-        _active = next(iter(_profiles))
-    _profile = _profiles[_active]
+# 读取 OpenAI 配置（默认 profile 由 OPENAI_PROFILES 的 default 指针决定）
+_active = config.get_default_profile_name()
+_profile = config.get_profile(_active)
+if _profile:
     api_keys = _profile.get("api_keys", config.OPENAI_API_KEYS)
     _init_config = {
         'model': _profile.get("model", config.CHAT_MODEL),

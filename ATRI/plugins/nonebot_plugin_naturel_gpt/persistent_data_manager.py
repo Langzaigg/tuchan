@@ -75,6 +75,9 @@ class ChatMessageData(StoreSerializable):
     # 同一用户在整个上下文中最多注入一次（首次触发时），随其绑定轮次一起被摘要/裁剪删除。
     is_impression: bool = field(default=False)
     impression_user_id: str = field(default="")
+    # 每张图片的元数据 [{sender, timestamp}]，与 images 平行；仅 context_only 块使用
+    #（块内各行来自不同时间/发送者，图片过期判定需按张而非按块）。普通消息用 item.timestamp。
+    image_meta: List[Dict[str, Any]] = field(default_factory=list)
 
     @override
     def _init_from_dict(self, self_dict: Dict[str, Any]) -> Self:
@@ -100,6 +103,7 @@ class ChatMessageData(StoreSerializable):
         self.tool_call_summary = str(getattr(self, "tool_call_summary", "") or "")
         self.is_impression = bool(getattr(self, "is_impression", False))
         self.impression_user_id = str(getattr(self, "impression_user_id", "") or "")
+        self.image_meta = [m for m in (getattr(self, "image_meta", []) or []) if isinstance(m, dict)]
         # 印象 system 在内存中保留以服务当次运行；持久化时由 PresetData._serializable 过滤掉（不落盘）。
         # 重启后历史轮的印象 system 丢失，下次该用户触发时按最新印象重新注入，避免旧印象残留。
         if self.is_impression:
@@ -180,21 +184,23 @@ class PresetData(StoreSerializable):
             for v in raw_messages
             if isinstance(v, (dict, ChatMessageData))
         ]
+        # 轮次不变量按计数而非布尔：user +1、最终 assistant -1，计数为 0 时的 assistant 才是孤儿。
+        # 循环邮箱插入会产生 user(A) user(B) assistant(答A) assistant(答B) 的合法序列，
+        # 布尔"首条 assistant 关轮"会把答 B 当孤儿丢掉。
         self.prompt_messages = []
-        round_open = False
+        open_users = 0
         for msg in loaded_messages:
             if msg.context_only:
                 continue
             if msg.role == "user":
-                round_open = True
+                open_users += 1
                 self.prompt_messages.append(msg)
                 continue
-            if msg.role == "assistant" and round_open and not msg.tool_calls:
+            if msg.role == "assistant" and open_users > 0 and not msg.tool_calls:
+                open_users -= 1
                 if _is_model_request_error_text(msg.text):
-                    round_open = False
                     continue
                 self.prompt_messages.append(msg)
-                round_open = False
         return self
 
     @override
@@ -209,18 +215,17 @@ class PresetData(StoreSerializable):
                 if isinstance(msg, ChatMessageData) and msg.role in {"user", "assistant"} and not msg.tool_calls
             ]
             cleaned_messages = []
-            round_open = False
+            open_users = 0  # 计数版轮次不变量，见 _init_from_dict
             for msg in filtered_messages:
                 role = msg.get("role", "") if isinstance(msg, dict) else ""
                 if role == "user":
-                    round_open = True
+                    open_users += 1
                     cleaned_messages.append(msg)
-                elif role == "assistant" and round_open:
+                elif role == "assistant" and open_users > 0:
+                    open_users -= 1
                     if _is_model_request_error_text(str(msg.get("text", "") or "")):
-                        round_open = False
                         continue
                     cleaned_messages.append(msg)
-                    round_open = False
             rtn["prompt_messages"] = cleaned_messages
         return rtn
 

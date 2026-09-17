@@ -57,8 +57,11 @@ class Chat(ChatMemoryMixin, ChatSummaryMixin, ChatHistoryMixin, ChatPromptMixin)
         self.change_presettings(preset_key)
 
     def get_active_profile(self) -> str:
-        """获取当前会话的 profile 名，为空时返回全局默认"""
-        return self._chat_data.active_profile or config.OPENAI_ACTIVE_PROFILE or ""
+        """获取当前会话实际生效的 profile 名。
+
+        会话自己选的（rg model）→ OPENAI_PROFILES.default 指针 → 第一个真实 profile，
+        返回的恒定是真实 profile 名（不会是指针键），空配置时返回 ""。"""
+        return config.resolve_profile_name(self._chat_data.active_profile)
 
     def set_active_profile(self, profile_name: str) -> None:
         """设置当前会话的 profile"""
@@ -74,20 +77,22 @@ class Chat(ChatMemoryMixin, ChatSummaryMixin, ChatHistoryMixin, ChatPromptMixin)
         self._chat_data.unlock_content_limit = value
 
     def apply_profile(self) -> bool:
-        """如果当前会话的 profile 与 TextGenerator 不同，切换并返回 True"""
+        """如果当前会话的 profile 与 TextGenerator 不同，切换并返回 True。
+
+        只跟随本会话的 profile，不改写全局默认指针——全局默认是配置文件的
+        `default` 指针说了算，任何群消息与 rg model 都不会把它带跑。"""
         from .openai_func import TextGenerator
         target = self.get_active_profile()
-        profiles = config.OPENAI_PROFILES
-        if not target or not profiles or target not in profiles:
+        profile = config.get_profile(target)
+        if not target or not profile:
             return False
         tg = TextGenerator.instance
         # 检查当前是否已经是目标 profile（通过比较 model 名判断）
         current_model = tg.config.get("model", "")
-        target_model = profiles[target].get("model", "")
+        target_model = profile.get("model", "")
         if current_model == target_model:
             return False
-        tg.switch_profile(target, profiles[target])
-        config.OPENAI_ACTIVE_PROFILE = target
+        tg.switch_profile(target, profile)
         if config.DEBUG_LEVEL > 0:
             logger.info(f"[会话: {self.chat_key}] 自动切换 profile: {target} ({target_model})")
         return True
@@ -322,12 +327,6 @@ class Chat(ChatMemoryMixin, ChatSummaryMixin, ChatHistoryMixin, ChatPromptMixin)
         url = str(url).strip()
         return url.startswith(("http://", "https://", "data:image/", "file:///"))
 
-    @staticmethod
-    def _image_is_fresh(timestamp: float) -> bool:
-        """检查图片是否在有效期内（使用配置的过期时间）"""
-        if not timestamp:
-            return False
-        fresh_seconds = max(1, config.MULTIMODAL_IMAGE_FRESH_MINUTES) * 60
-        return time.time() - float(timestamp) <= fresh_seconds
+    # 图片有效期判定统一在 ChatPromptMixin._image_expiry_cutoff（30 分钟量化），此处不再单独实现
 
     # endregion

@@ -1,11 +1,14 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
 import time
+import uuid
 from collections import OrderedDict, deque
 from contextvars import ContextVar
-from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlsplit
 
 from tiktoken import Encoding, encoding_for_model
 
@@ -23,11 +26,65 @@ _DRAW_ONLY_TOOLS = {"generate_anima_image", "danbooru_search"}
 
 _CURRENT_CHAT_KEY: ContextVar[str] = ContextVar("naturel_gpt_current_chat_key", default="")
 _CURRENT_TRIGGER_USERID: ContextVar[str] = ContextVar("naturel_gpt_current_trigger_userid", default="")
-# 视觉工具专用快照：触发消息的原始图片 URL 列表（供 vision 工具把 [图片N] 映射回真实 URL）
+# 视觉工具专用快照：本次请求可见图片表 {显示编号: 原始URL}，由 chat_prompt 的图片策略生成，
+# 覆盖历史 / context_only / 触发消息（供 vision、anime_trace 把 [图片N] 映射回真实 URL）
 # 用 default=None + getter 兜底，避免 list/dict 可变默认值跨上下文共享
-_CURRENT_TRIGGER_IMAGES: ContextVar[Optional[List[str]]] = ContextVar("naturel_gpt_current_trigger_images", default=None)
+_VISIBLE_IMAGES: ContextVar[Optional[Dict[int, str]]] = ContextVar("naturel_gpt_visible_images", default=None)
 # 视觉工具专用快照：视觉模型配置 {model, base_url, api_key, max_tokens, proxy, use_socket_proxy, timeout}
 _CURRENT_VISION_CONFIG: ContextVar[Optional[Dict[str, Any]]] = ContextVar("naturel_gpt_current_vision_config", default=None)
+
+# 进程级兜底会话 ID：chat_key 不可用时（如启动期健康检查）保持本进程内稳定
+_OPENCODE_FALLBACK_SESSION = uuid.uuid4().hex
+
+# ---- 多 API Key 轮换策略 ----
+# 铁律：恒定从**第一顺位 key** 开始用。只有当失败明确归因于该 key 自身（鉴权失败 / 额度耗尽 /
+# 限流）时才顺延到下一个 key，并把失败的 key 打进冷却；冷却到期自动回到第一顺位。
+# 参数错误（400）、超时、上下文超限、图片被拒等与 key 无关，换 key 也救不回来——以前对任何
+# 异常都推进索引且成功不回退，导致一次偶发失败就把该 profile 的流量永久钉在第二个 key 上。
+KEY_FAILURE_COOLDOWN_SECONDS = 300  # 单个 key 失败后的冷却时长（秒）
+_KEY_ERROR_STATUS_CODES = ("http 401", "http 402", "http 403", "http 429")
+_KEY_ERROR_MARKERS = (
+    "invalid api key", "invalid_api_key", "incorrect api key", "api key is invalid",
+    "unauthorized", "authentication error", "authentication_error",
+    "no permission", "permission denied", "insufficient_quota", "insufficient balance",
+    "exceeded your current quota", "you exceeded your quota", "quota exceeded",
+    "rate limit", "rate_limit", "too many requests", "billing", "out of credit",
+    "账号余额", "余额不足", "欠费", "配额", "限流",
+)
+
+
+def _is_key_level_error(err_text: Optional[str]) -> bool:
+    """错误是否归因于当前 API key（鉴权 / 额度 / 限流）——只有这类错误才值得换 key。"""
+    if not err_text:
+        return False
+    text = str(err_text).lower()
+    if any(code in text for code in _KEY_ERROR_STATUS_CODES):
+        return True
+    return any(marker in text for marker in _KEY_ERROR_MARKERS)
+
+
+def _build_provider_headers(base_url: str) -> Dict[str, str]:
+    """Console Go（opencode.ai）要求客户端每个对话带稳定 x-opencode-session 头，
+    并用自定义 User-Agent 标识客户端（https://opencode.ai/docs/go/）。
+    会话 ID 由 chat_key 确定性派生（md5），同一群聊跨重启稳定，利于服务端路由与提示缓存。
+    其他 provider 返回空 dict，不加任何额外头。
+    """
+    headers: Dict[str, str] = {}
+    try:
+        host = urlsplit(base_url).netloc.lower()
+    except Exception:
+        return headers
+    if "opencode.ai" not in host:
+        return headers
+    headers["User-Agent"] = "ATRI-NaturelGPT/1.0 (QQ chatbot)"
+    chat_key = _CURRENT_CHAT_KEY.get()
+    if chat_key:
+        session_id = hashlib.md5(chat_key.encode("utf-8")).hexdigest()[:24]
+    else:
+        session_id = _OPENCODE_FALLBACK_SESSION
+    headers["x-opencode-session"] = f"atri-{session_id}"
+    return headers
+
 
 _TOTAL_TOOL_LIMIT_TEXT = f"工具调用次数已达上限（{MAX_TOTAL_TOOL_CALLS}次）。停止继续调用工具，基于已有工具结果直接回答当前用户。"
 _SEARCH_TOOL_LIMIT_TEXT = f"搜索工具调用次数已达上限（{MAX_SEARCH_TOOL_CALLS}次），请基于已有搜索结果回复，不要再调用搜索工具。"
@@ -39,30 +96,77 @@ _FORCE_DRAW_HINT_TEXT = (
     "当前用户明确要求作画。你必须通过 tool_calls 调用 generate_anima_image 工具完成作画，"
     "禁止只在文字里说「画了」「在画了」「等图吧」而不实际调用工具；任务编号只能由工具返回，禁止编造。"
 )
+# 轮数上限的最后一轮：除 tool_choice="none" 外再明说一句。DeepSeek 系模型在 tool_choice="none"
+# 下仍会"想"调工具，服务端不再解析，原生 DSML 标记就原样落进 content（群里出现一串
+# <｜DSML｜calls>…）；明确告知"不能再调了、直接说结果"能显著降低这种泄漏。
+_ROUND_LIMIT_TEXT = (
+    "工具调用轮数已达上限，本轮不能再调用任何工具。请基于已有工具结果直接用文字回复当前用户；"
+    "若还有没查到的内容，直接说明查到哪一步、缺什么即可，不要再输出任何工具调用标记。"
+)
+# 正文里泄漏工具调用标记后的重试提示（本轮禁止调工具 / 允许调工具 两种情况）
+_MARKUP_LEAK_NO_TOOLS_TEXT = (
+    "你刚才把工具调用标记直接写进了回复正文，这是无效的，也不会被执行。"
+    "本轮不能调用工具，请只用自然语言回复用户，说明已查到的结果和还缺的信息。"
+)
+_MARKUP_LEAK_WITH_TOOLS_TEXT = (
+    "你刚才把工具调用写进了回复正文而不是通过 tool_calls 接口，这样不会被执行。"
+    "需要调用工具就使用 tool_calls；否则请只用自然语言回复。"
+)
 _INTERNAL_CONTROL_PATTERNS = (
     re.compile(r"单轮?工具调用次数已达上限（?\d+次）?[。，,]?\s*请基于已有结果回复[。.]?"),
     re.compile(r"工具调用次数已达上限（?\d+次）?[。，,]?\s*停止继续调用工具，基于已有工具结果直接回答当前用户[。.]?"),
     re.compile(r"博查搜索工具调用次数已达上限（?\d+次）?[。，,]?\s*请基于已有搜索结果回复，不要再调用搜索工具[。.]?"),
     re.compile(r"搜索工具调用次数已达上限（?\d+次）?[。，,]?\s*请基于已有搜索结果回复，不要再调用搜索工具[。.]?"),
+    # assistant 空 content 的 API 占位符（见 _completion_kwargs）：模型看到自己"说过"它就会照抄，
+    # 一旦混进正文会随中间轮文本合并进回复与历史，之后越滚越多
+    re.compile(r"\[无内容\]"),
 )
 _MODEL_REQUEST_ERROR_PREFIX = "请求大模型时发生错误:"
 
-# 工具调用 XML 泄漏检测（模型可能在 content 中输出 <function_calls> 或 <tool_call> 格式）
+# 工具调用标记泄漏检测：模型把工具调用写进了 content 而非 tool_calls。
+# 1) Anthropic/通用 XML：<function_calls>…</function_calls>、<tool_call>…</tool_call>
+# 2) DeepSeek 原生 DSML：<｜DSML｜calls> <｜DSML｜invoke name="x"> <｜DSML｜parameter …>…</｜DSML｜calls>
+#    竖线为全角 U+FF5C，实际泄漏样例里会重复并带空格（<｜｜DSML｜｜ calls>），正则一律宽松匹配
+# 3) DeepSeek 旧版：<｜tool▁calls▁begin｜>…<｜tool▁calls▁end｜>（▁ 为 U+2581）
 _TOOL_CALL_XML_RE = re.compile(
     r'<(?:function_calls|tool_call)[\s>].*?</(?:function_calls|tool_call)>',
+    re.DOTALL,
+)
+_DSML_TAG_RE = re.compile(r'</?\s*[｜|]+\s*DSML\s*[｜|]+[^>]*>')
+_DSML_BLOCK_RE = re.compile(
+    r'<\s*[｜|]+\s*DSML\s*[｜|]+\s*(calls|invoke)\b[^>]*>.*?'
+    r'(?:</\s*[｜|]+\s*DSML\s*[｜|]+\s*\1\s*>|\Z)',
+    re.DOTALL,
+)
+_DS_LEGACY_TAG_RE = re.compile(r'<[｜|]\s*tool[▁_ ][^｜|>]*[｜|]>')
+_DS_LEGACY_BLOCK_RE = re.compile(
+    r'<[｜|]\s*tool[▁_ ]calls[▁_ ]begin\s*[｜|]>.*?(?:<[｜|]\s*tool[▁_ ]calls[▁_ ]end\s*[｜|]>|\Z)',
     re.DOTALL,
 )
 
 
 def contains_tool_call_xml(content: str) -> bool:
-    """检测文本中是否包含工具调用 XML 标签（模型在 content 中输出 tool_calls 格式）。"""
-    return bool(_TOOL_CALL_XML_RE.search(content))
+    """检测文本中是否包含工具调用标记（XML / DeepSeek DSML / DeepSeek 旧版 tool 标记）。"""
+    if not content:
+        return False
+    return bool(
+        _TOOL_CALL_XML_RE.search(content)
+        or _DSML_TAG_RE.search(content)
+        or _DS_LEGACY_TAG_RE.search(content)
+    )
 
 
 def strip_tool_call_xml(content: str) -> str:
-    """移除文本中的工具调用 XML 标签及其残留。"""
+    """移除文本中的工具调用标记（整块、未闭合的截断块、零散标签）及其残留。"""
+    if not content:
+        return content
     content = _TOOL_CALL_XML_RE.sub('', content)
-    content = re.sub(r'<(?:invoke|parameter)[^>]*>', '', content)
+    # DSML / 旧版标记：先整块删到底（未闭合的块删到文本末尾），再清零散标签
+    content = _DSML_BLOCK_RE.sub('', content)
+    content = _DSML_TAG_RE.sub('', content)
+    content = _DS_LEGACY_BLOCK_RE.sub('', content)
+    content = _DS_LEGACY_TAG_RE.sub('', content)
+    content = re.sub(r'</?(?:invoke|parameter)[^>]*>', '', content)
     return _normalize_draw_cleanup(content)
 
 
@@ -105,10 +209,33 @@ def _next_image_index(messages: List[Dict[str, Any]]) -> int:
     return max_n + 1
 
 
+# 尾部触发标记的文本头（chat_prompt 在触发消息前注入的 ephemeral system，不落库）
+TRIGGER_MARKER_PREFIX = "[当前触发]"
+
+
+def _drop_stale_trigger_marker(messages: List[Dict[str, Any]]) -> None:
+    """循环邮箱插入新消息前，去掉原触发消息前的 [当前触发] 标记行：它指向的消息已经答过，
+    留着会把"只回应那条、其余只作背景"的指令错套到新插入的消息上。同一条 system 里合并的
+    [记忆提醒] 等其他行保留；只剩标记行时整条移除。"""
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if m.get("role") != "system":
+            continue
+        content = m.get("content")
+        if not isinstance(content, str) or not content.startswith(TRIGGER_MARKER_PREFIX):
+            continue
+        rest = "\n".join(line for line in content.split("\n") if not line.startswith(TRIGGER_MARKER_PREFIX)).strip()
+        if rest:
+            messages[i] = {**m, "content": rest}
+        else:
+            del messages[i]
+
+
 def _user_text_already_in_messages(messages: List[Dict[str, Any]], text: str) -> bool:
-    """检查与该文本完全一致的 user 消息是否已在 messages 中。
+    """检查与该文本完全一致的 user 消息（或合并批次消息中的某一行）是否已在 messages 中。
     用于循环邮箱 entry 去重：entry 的消息在任务进入循环前已落库时，
-    可能已被本轮 prompt 快照纳入，重复插入会让模型看到两条相同消息。"""
+    可能已被本轮 prompt 快照纳入，重复插入会让模型看到两条相同消息。
+    邮箱批次合并为一条多行 user 消息后，按行比对。"""
     target = text.strip()
     if not target:
         return False
@@ -116,13 +243,19 @@ def _user_text_already_in_messages(messages: List[Dict[str, Any]], text: str) ->
         if m.get("role") != "user":
             continue
         content = m.get("content")
-        if isinstance(content, str) and content.strip() == target:
-            return True
-        if isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text" \
-                        and str(item.get("text") or "").strip() == target:
-                    return True
+        if isinstance(content, str):
+            texts = [content]
+        elif isinstance(content, list):
+            texts = [
+                str(item.get("text") or "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+        else:
+            continue
+        for t in texts:
+            if t.strip() == target or any(line.strip() == target for line in t.split("\n")):
+                return True
     return False
 
 
@@ -133,10 +266,13 @@ def sanitize_internal_control_text(content: str) -> str:
     content = content.replace(_TOTAL_TOOL_LIMIT_TEXT, "")
     content = content.replace(_SEARCH_TOOL_LIMIT_TEXT, "")
     content = content.replace(_TOOL_LOOP_TIMEOUT_TEXT, "")
+    content = content.replace(_ROUND_LIMIT_TEXT, "")
+    content = content.replace(_MARKUP_LEAK_NO_TOOLS_TEXT, "")
+    content = content.replace(_MARKUP_LEAK_WITH_TOOLS_TEXT, "")
     for pattern in _INTERNAL_CONTROL_PATTERNS:
         content = pattern.sub("", content)
-    # 过滤 LLM 输出的工具调用 XML 标签（模型可能在 content 中输出 function_calls 或 tool_call 格式）
-    content = _TOOL_CALL_XML_RE.sub('', content)
+    # 过滤 LLM 输出的工具调用标记（XML / DSML / 旧版 tool 标记）
+    content = strip_tool_call_xml(content)
     return _normalize_draw_cleanup(content)
 
 
@@ -189,6 +325,27 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
+def _format_stream_error(err: Any) -> str:
+    """把 SSE body 内的 error 对象格式化为异常文本。
+
+    部分网关（如 opencode zen）在 HTTP 200 的流里以 `data: {"error":{...}}` 下发上游错误，
+    例如 `Streaming response failed: [400] At most 4 image(s) may be provided in one prompt.`。
+    状态码优先取 error 自带字段，取不到则从 message 里的 [NNN] 提取，统一拼成 `HTTP <code>`，
+    使上层按错误文本分流的判定（is_ctx_error / _is_image_limit_error 等）能够命中。
+    """
+    if isinstance(err, dict):
+        message = str(err.get("message") or err.get("msg") or err)
+        code = err.get("code") or err.get("status") or err.get("status_code")
+    else:
+        message = str(err)
+        code = None
+    if code is None:
+        matched = re.search(r"\[(\d{3})\]", message)
+        if matched:
+            code = matched.group(1)
+    return f"流式响应错误 HTTP {code}: {message}" if code else f"流式响应错误: {message}"
+
+
 def _message_to_dict(message: Any) -> Dict[str, Any]:
     if isinstance(message, dict):
         d = dict(message)
@@ -230,8 +387,9 @@ def _message_to_dict(message: Any) -> Dict[str, Any]:
 class TextGenerator(Singleton["TextGenerator"]):
     def init(self, api_keys: list, config: dict, proxy=None, base_url="", extra_prompt: str = ""):
         self.api_keys = api_keys or [""]
-        self.key_index = 0
-        self._profile_key_indices: Dict[str, int] = {}  # profile 稳定标识 → 当前 key 索引（request_profile 快照路径的多 key 轮询）
+        # key 冷却表：scope（profile 名 / "__singleton__"）→ {key 索引: 冷却截止 monotonic 时间}。
+        # 不用「粘性索引」——索引一旦前移成功也不回退，会把流量永久钉在备用 key 上。
+        self._key_cooldowns: Dict[str, Dict[int, float]] = {}
         self.config = config
         self.proxy = proxy
         self.base_url = base_url
@@ -246,6 +404,8 @@ class TextGenerator(Singleton["TextGenerator"]):
         # matcher 在请求结束后可读到的完整状态：含邮箱插入的新触发消息、assistant tool_calls、tool 响应）
         self._last_loop_messages_by_chat: Dict[str, List[Dict[str, Any]]] = {}
         self._last_stream_usage: Optional[Dict[str, Any]] = None  # 最近一次流式请求的 usage 信息
+
+    _SINGLETON_KEY_SCOPE = "__singleton__"  # 无 profile 快照的兼容路径使用的 key 冷却作用域
 
     @property
     def _current_chat_key(self) -> str:
@@ -264,13 +424,33 @@ class TextGenerator(Singleton["TextGenerator"]):
         _CURRENT_TRIGGER_USERID.set(str(value or ""))
 
     @property
-    def _current_trigger_images(self) -> List[str]:
-        """当前触发消息的图片 URL 列表快照（供 vision 工具读取，ContextVar 天然并发安全）。"""
-        return list(_CURRENT_TRIGGER_IMAGES.get() or [])
+    def _key_cooldowns(self) -> Dict[str, Dict[int, float]]:
+        """key 冷却表：scope（profile 稳定标识 / "__singleton__"）→ {key 索引: 冷却截止 monotonic 时间}。
+        懒初始化，避免 init() 之外的代码路径（测试、启动期健康检查）拿到空属性。"""
+        store = getattr(self, "_key_cooldown_store", None)
+        if store is None:
+            store = {}
+            self._key_cooldown_store = store
+        return store
 
-    @_current_trigger_images.setter
-    def _current_trigger_images(self, value: List[str]) -> None:
-        _CURRENT_TRIGGER_IMAGES.set(list(value or []))
+    @_key_cooldowns.setter
+    def _key_cooldowns(self, value: Dict[str, Dict[int, float]]) -> None:
+        self._key_cooldown_store = value or {}
+
+    @property
+    def _visible_images(self) -> Dict[int, str]:
+        """本次请求可见图片表 {显示编号: 原始URL}（供 vision / anime_trace 读取，ContextVar 天然并发安全）。"""
+        return dict(_VISIBLE_IMAGES.get() or {})
+
+    @_visible_images.setter
+    def _visible_images(self, value: Dict[int, str]) -> None:
+        table: Dict[int, str] = {}
+        for k, v in (value or {}).items():
+            try:
+                table[int(k)] = str(v)
+            except (TypeError, ValueError):
+                continue
+        _VISIBLE_IMAGES.set(table)
 
     @property
     def _current_vision_config(self) -> Dict[str, Any]:
@@ -301,39 +481,53 @@ class TextGenerator(Singleton["TextGenerator"]):
         """检查指定会话的循环邮箱是否有待处理输入"""
         return bool(getattr(self, "_loop_mailbox", None) and self._loop_mailbox.get(chat_key))
 
-    async def _build_loop_user_message(
+    async def _build_loop_batch_message(
         self,
-        entry: Dict[str, Any],
+        entries: List[Dict[str, Any]],
         img_index: int,
         multimodal_enabled: bool = True,
-    ) -> Tuple[Dict[str, Any], int]:
-        """把循环邮箱 entry 组装成 user 消息：[图片N] 从 img_index 续编；
-        含图片时经 image_cache 转 data URI 组装 multipart content。返回 (message, 下一张图片编号)。"""
-        text = str(entry.get("text") or "").strip()
-        images = [str(u) for u in (entry.get("image_urls") or []) if u]
-        if images:
-            found = len(_IMG_MARKER_RE.findall(text))
-            text = _IMG_MARKER_RE.sub(lambda m: f"[图片{int(m.group(1)) + img_index - 1}]", text)
-            # 文本中的占位符比图片少（异常数据/纯图片消息）：追加缺失的标记
-            for i in range(found, len(images)):
-                text = f"{text} [图片{img_index + i}]".strip()
-            img_index += len(images)
-        if not text:
-            text = "[图片]"
+    ) -> Tuple[Dict[str, Any], int, Dict[int, str]]:
+        """把一个打断点取空的全部邮箱 entries 合并为一条 user 消息：各行 [HH:MM] sender: 正文
+        按到达顺序换行拼接；[图片N] 从 img_index 起对整批连续续编，image 部件按行顺序追加
+        （含图片时经 image_cache 转 data URI 组装 multipart content）。
+        返回 (message, 下一张图片编号, {编号: 原始URL})，编号表供并入 _visible_images。"""
+        lines: List[str] = []
+        all_images: List[str] = []
+        numbered: Dict[int, str] = {}
+        for entry in entries:
+            text = str(entry.get("text") or "").strip()
+            images = [str(u) for u in (entry.get("image_urls") or []) if u]
+            if images:
+                base = img_index
+                found = len(_IMG_MARKER_RE.findall(text))
+                text = _IMG_MARKER_RE.sub(lambda m: f"[图片{int(m.group(1)) + base - 1}]", text)
+                # 文本中的占位符比图片少（异常数据/纯图片消息）：追加缺失的标记
+                for i in range(found, len(images)):
+                    text = f"{text} [图片{base + i}]".strip()
+                for i, url in enumerate(images):
+                    numbered[base + i] = url
+                img_index += len(images)
+                all_images.extend(images)
+            if text:
+                lines.append(text)
+        text = "\n".join(lines) or "[图片]"
         message: Dict[str, Any] = {"role": "user", "content": text}
-        if images and multimodal_enabled:
+        if all_images and multimodal_enabled:
             from . import image_cache
-            resolved = await image_cache.resolve_urls(images)
+            resolved = await image_cache.resolve_urls(all_images)
             if resolved:
                 message["content"] = [{"type": "text", "text": text}] + [
                     {"type": "image_url", "image_url": {"url": url}} for url in resolved
                 ]
-        return message, img_index
+        return message, img_index, numbered
 
     def switch_profile(self, profile_name: str, profile: Dict[str, Any]) -> str:
         """切换 OpenAI 配置 profile，返回切换结果描述"""
         self.api_keys = profile.get("api_keys", [""]) or [""]
-        self.key_index = 0
+        # 显式切换 profile（如 rg model）时清掉该 profile 的 key 冷却，
+        # 让新配置乖乖从第一顺位 key 开始试
+        self._reset_key_cooldowns(str(profile_name or self._profile_key_id(profile)))
+        self._reset_key_cooldowns(self._profile_key_id(profile))
         self.base_url = profile.get("base_url", "")
         self.use_socket_proxy = profile.get("use_socket_proxy", False)
         self.proxy = profile.get("proxy") or None
@@ -355,31 +549,59 @@ class TextGenerator(Singleton["TextGenerator"]):
         proxy_info = f"socks:{self.proxy}" if self.use_socket_proxy and self.proxy else ("直连" if not self.proxy else self.proxy)
         return f"模型: {self.config['model']} | mini: {self.config['model_mini']} | base_url: {self.base_url or '默认'} | 代理: {proxy_info}"
 
-    def _current_key(self) -> str:
-        return self.api_keys[self.key_index % len(self.api_keys)]
-
-    def _rotate_key(self) -> None:
-        self.key_index = (self.key_index + 1) % len(self.api_keys)
-
     @staticmethod
     def _profile_key_id(profile: Dict[str, Any]) -> str:
-        """profile 快照的稳定标识，用于 per-profile 的 key 轮换索引"""
+        """profile 快照的稳定标识，用于 per-profile 的 key 冷却表"""
         name = profile.get("name")
         if name:
             return str(name)
         return f"{profile.get('base_url', '')}|{profile.get('model', '')}"
 
-    def _profile_current_key(self, profile: Dict[str, Any], api_keys: List[str]) -> str:
-        """按 profile 的轮换索引取当前 key"""
-        index = self._profile_key_indices.get(self._profile_key_id(profile), 0)
-        return api_keys[index % len(api_keys)]
+    def _prune_key_cooldowns(self, scope: str) -> Dict[int, float]:
+        """清理 scope 下已到期的冷却记录，返回仍在冷却中的 {key 索引: 截止时间}"""
+        cooldowns = self._key_cooldowns.get(scope)
+        if not cooldowns:
+            return {}
+        now = time.monotonic()
+        for index in [i for i, until in cooldowns.items() if until <= now]:
+            cooldowns.pop(index, None)
+        return cooldowns
 
-    def _rotate_profile_key(self, profile: Dict[str, Any], keys_count: int) -> None:
-        """推进 profile 的 key 轮换索引（profile 快照路径请求失败时调用）"""
-        if keys_count <= 1:
-            return
-        profile_id = self._profile_key_id(profile)
-        self._profile_key_indices[profile_id] = (self._profile_key_indices.get(profile_id, 0) + 1) % keys_count
+    def _key_plan(self, scope: str, api_keys: List[str], tried: Optional[Set[int]] = None) -> Tuple[str, int]:
+        """选定本次请求使用的 key，返回 (key, 索引)。
+
+        选择顺序**恒定从第一顺位开始**：跳过仍在冷却中的 key 和本次请求内已经试过的 key。
+        全部不可用时退回第一顺位（宁可复用也不要无 key 可用）。"""
+        if not api_keys:
+            return "", 0
+        count = len(api_keys)
+        if count == 1:
+            return api_keys[0], 0
+        cooldowns = self._prune_key_cooldowns(scope)
+        tried = tried or set()
+        for index in range(count):
+            if index in cooldowns or index in tried:
+                continue
+            if index != 0:
+                logger.info(
+                    f"API key 顺延使用第 {index + 1}/{count} 个 | scope: {scope} | "
+                    f"前序 key 冷却中或本次请求内已失败"
+                )
+            return api_keys[index], index
+        return api_keys[0], 0
+
+    def _mark_key_failed(self, scope: str, index: int) -> None:
+        """把失败的 key 打进冷却：后续请求自动顺延，冷却到期自动回到第一顺位。"""
+        self._key_cooldowns.setdefault(scope, {})[int(index)] = time.monotonic() + KEY_FAILURE_COOLDOWN_SECONDS
+
+    def _reset_key_cooldowns(self, scope: str) -> None:
+        """清空 scope 的冷却记录（profile 被显式切换/重载时调用，重新从第一顺位开始）"""
+        self._key_cooldowns.pop(scope, None)
+
+    def _current_key(self) -> str:
+        """无 profile 快照的兼容路径取 key：同 _key_plan，恒定优先第一顺位"""
+        key, _ = self._key_plan(self._SINGLETON_KEY_SCOPE, list(self.api_keys or [""]))
+        return key
 
     def _request_state(self, profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if profile:
@@ -397,8 +619,11 @@ class TextGenerator(Singleton["TextGenerator"]):
                 "enable_stream": profile.get("enable_stream", self.config.get("enable_stream", True)),
                 "reasoning_effort": profile.get("reasoning_effort"),
             }
+            api_key, api_key_index = self._key_plan(self._profile_key_id(profile), api_keys)
             return {
-                "api_key": self._profile_current_key(profile, api_keys),
+                "api_key": api_key,
+                "api_key_index": api_key_index,
+                "key_scope": self._profile_key_id(profile),
                 "config": request_config,
                 "base_url": profile.get("base_url", ""),
                 "proxy": profile.get("proxy") or None,
@@ -406,8 +631,11 @@ class TextGenerator(Singleton["TextGenerator"]):
                 "multimodal": profile.get("multimodal", True),
                 "keep_reasoning": bool(profile.get("keep_reasoning", False)),
             }
+        api_key, api_key_index = self._key_plan(self._SINGLETON_KEY_SCOPE, list(self.api_keys or [""]))
         return {
-            "api_key": self._current_key(),
+            "api_key": api_key,
+            "api_key_index": api_key_index,
+            "key_scope": self._SINGLETON_KEY_SCOPE,
             "config": dict(self.config),
             "base_url": self.base_url,
             "proxy": self.proxy,
@@ -430,10 +658,14 @@ class TextGenerator(Singleton["TextGenerator"]):
         if not vision_model:
             return {}
         api_keys = request_profile.get("model_vision_api_keys") or request_profile.get("api_keys") or [""]
+        # 视觉模型可用独立的 key 列表（model_vision_api_keys），故用独立冷却作用域：
+        # 主模型 key 的冷却状态不应该影响视觉模型选 key
+        vision_scope = f"{self._profile_key_id(request_profile)}#vision"
+        vision_key, _ = self._key_plan(vision_scope, list(api_keys))
         return {
             "model": vision_model,
             "base_url": request_profile.get("model_vision_base_url") or request_profile.get("base_url", "") or "",
-            "api_key": self._profile_current_key(request_profile, api_keys) if api_keys else "",
+            "api_key": vision_key,
             "max_tokens": request_profile.get("model_vision_max_tokens", 1024),
             "timeout": request_profile.get("timeout", 60),
             "proxy": request_profile.get("proxy"),
@@ -587,6 +819,7 @@ class TextGenerator(Singleton["TextGenerator"]):
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
         }
+        headers.update(_build_provider_headers(base_url))
 
         # 构建请求体
         body: Dict[str, Any] = {
@@ -645,6 +878,7 @@ class TextGenerator(Singleton["TextGenerator"]):
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
         }
+        headers.update(_build_provider_headers(base_url))
 
         body: Dict[str, Any] = {
             "model": model,
@@ -722,6 +956,12 @@ class TextGenerator(Singleton["TextGenerator"]):
         tool_call_notified = False  # 本轮是否已通知过工具调用（每个流式轮只通知一次）
 
         async for chunk in self._stream_iter_openai(kwargs):
+            # provider 以 HTTP 200 在流内下发上游错误（该 chunk 既无 choices 也无 usage）：
+            # 若继续静默跳过，本轮会以空内容“成功”返回，上层拿不到任何错误、也不会重试，
+            # 表现为机器人一声不吭。抬成异常交由 stream_response 的 except 统一处理。
+            stream_error = _get(chunk, "error")
+            if stream_error:
+                raise RuntimeError(_format_stream_error(stream_error))
             choices = _get(chunk, "choices", [])
             if not choices:
                 # 空 choices 可能是携带 usage 的最终 chunk
@@ -871,15 +1111,18 @@ class TextGenerator(Singleton["TextGenerator"]):
             self._last_loop_messages_by_chat[request_chat_key] = messages
         request_trigger_userid = self._current_trigger_userid
         request_state = self._request_state(request_profile)
+        # 本次请求内已试过的 key 索引：key 级失败时顺延到下一个 key 重试，避免一个坏 key
+        # 直接把整条回复判死（顺延顺序仍是第一顺位优先）
+        _tried_key_indices: Set[int] = {int(request_state.get("api_key_index", 0))}
         # 跨轮持久化历史中的 reasoning 默认剥离（profile keep_reasoning=true 才保留，
         # 兼容不接受该字段的 provider）；本循环内 append 的 assistant 消息在此之后产生，
         # 思考链在同一 user turn 的工具循环内天然保留，保证多步工具任务连贯。
         if not request_state.get("keep_reasoning", False):
             for _m in messages:
                 _m.pop("reasoning_content", None)
-        # 视觉工具快照：触发图片 URL 列表 + 视觉模型配置，按本轮 profile 钉死，避免多群并发串数据。
-        # trigger_images 由 matcher 在调用 stream_response 前写入；这里重新置位以绑定到本次请求的上下文。
-        self._current_trigger_images = list(self._current_trigger_images or [])
+        # 视觉工具快照：本次请求可见图片表 + 视觉模型配置，按本轮 profile 钉死，避免多群并发串数据。
+        # visible_images 由 matcher 在调用 stream_response 前写入；这里重新置位以绑定到本次请求的上下文。
+        self._visible_images = dict(self._visible_images or {})
         self._current_vision_config = self._build_vision_config(request_profile, request_state)
         self.last_tool_outputs = []
         if request_chat_key:
@@ -903,6 +1146,9 @@ class TextGenerator(Singleton["TextGenerator"]):
         _force_draw_hint_injected = False  # force 模式的尾部强制画图提示是否已注入（仅一次）
         _reasoning_stripped = False  # keep_reasoning=true 但 provider 400 拒绝 reasoning_content 后置 True，剥离重试一次
         internal_control_injected = False  # 是否向模型注入过内部控制提示
+        _round_limit_injected = False  # 轮数上限提示是否已注入（同一最后一轮内的各种 continue 重试不重复追加）
+        _markup_leak_retries = 0  # 正文泄漏工具调用标记（DSML/XML）后的重试次数（≤1）
+        _drop_tools_this_round = False  # 泄漏重试轮：整段去掉 tools（一次性标志，读取后即清零）
 
         # 检测用户消息中是否包含画图相关关键词
         _DRAWING_KEYWORDS = ("画", "draw", "改图", "重画", "来一张", "整一张")
@@ -956,13 +1202,13 @@ class TextGenerator(Singleton["TextGenerator"]):
             return "\n\n".join(_all_reply_texts) if _all_reply_texts else (fallback or "")
 
         async def _insert_mailbox_entries(reply_completed: bool, round_content: str = "", round_reasoning: str = "") -> bool:
-            """轮边界批量消费循环邮箱：一次性取空，把新触发消息作为多条独立 user 消息插入 messages。
+            """轮边界批量消费循环邮箱：一次性取空，把新触发消息合并为一条多行 user 消息插入 messages。
             返回 True 表示已插入、循环应继续（round_idx 与 loop_start 已重置）。
             终端阶段（_allow_terminal_tools/_terminal_wrapup_pending）不接收插入，
             残留 entry 由 matcher 任务收尾时作为新触发重新处理。
             reply_completed=True 表示上一轮产出了最终文本（无 tool_calls，回复已完成）；
             False 表示上一轮以 tool_calls 结束（被插入打断的触发尚未完成回复）。"""
-            nonlocal round_idx, loop_start, intermediate_texts, tool_messages, _entries_for_next_reply
+            nonlocal round_idx, loop_start, intermediate_texts, tool_messages, _entries_for_next_reply, _round_limit_injected
             if not request_chat_key or not hasattr(self, "_loop_mailbox"):
                 return False
             if _allow_terminal_tools or _terminal_wrapup_pending:
@@ -988,6 +1234,8 @@ class TextGenerator(Singleton["TextGenerator"]):
                 entries.append(entry)
             if not entries:
                 return False
+            # 原触发消息的 [当前触发] 标记已经完成使命（那条已答/正在答），去掉以免错套到新消息上
+            _drop_stale_trigger_marker(messages)
             if reply_completed:
                 # 刚产出的本轮回复作为 assistant 消息入列（仅本轮 content；
                 # 中间轮文本已在之前的 assistant(tool_calls) 消息里），模型完整看到自己说过的话
@@ -996,31 +1244,41 @@ class TextGenerator(Singleton["TextGenerator"]):
                     assistant_reply["reasoning_content"] = round_reasoning
                 messages.append(assistant_reply)
             count = len(entries)
-            # 未处理标记（ephemeral system：不落历史、不进 tool_messages、不进返回的 tool_messages 列表）
+            # 未处理标记（ephemeral system：不落历史、不进 tool_messages、不进返回的 tool_messages 列表）。
+            # 要求逐条分别回应、各自成段、点名对象——多条新消息合并为下一条 user 消息，
+            # 避免"一并回应"把不同人的话题揉进一段。
             if reply_completed:
-                notice = f"[新消息提醒] 以下 {count} 条是尚未处理的新消息，请一并回应"
+                notice = (
+                    f"[新消息提醒] 你上一条回复之后新到 {count} 条消息，见下一条。"
+                    "请逐条分别回应：每条各自成段、开头点名对象，不要把不同人的话题并进同一句；"
+                    "与新消息无关的旧上下文不要牵扯。"
+                )
             else:
-                notice = f"[新消息提醒] 你上一条消息的回复尚未完成，请继续完成它；以下 {count} 条新消息也均未处理，请一并回应"
+                notice = (
+                    "[新消息提醒] 你上一条消息的回复尚未完成，请先完成它并单独成段；"
+                    f"之后对下一条中的 {count} 条新消息逐条分别回应，每条各自成段、开头点名对象。"
+                )
             messages.append({"role": "system", "content": notice})
             multimodal_enabled = bool(getattr(plugin_config, "MULTIMODAL_ENABLE", True)) if plugin_config else True
+            # 整批合并为一条 user 消息；图片编号从当前 messages 最大 [图片N] 续编，并入可见图片表
             img_index = _next_image_index(messages)
-            trigger_images = list(self._current_trigger_images)
+            batch_msg, img_index, numbered = await self._build_loop_batch_message(entries, img_index, multimodal_enabled)
+            messages.append(batch_msg)
+            if numbered:
+                visible = dict(self._visible_images)
+                visible.update(numbered)
+                self._visible_images = visible
+            # 触发者上下文更新为批次中最新的发言者（记忆工具 user 维度归属最新触发者）
             for entry in entries:
-                user_msg, img_index = await self._build_loop_user_message(entry, img_index, multimodal_enabled)
-                messages.append(user_msg)
-                entry_images = [str(u) for u in (entry.get("image_urls") or []) if u]
-                if entry_images:
-                    trigger_images.extend(entry_images)
-                # 触发者上下文更新为最新发言者（记忆工具 user 维度归属最新触发者）
                 if entry.get("userid"):
                     self._current_trigger_userid = str(entry["userid"])
-            self._current_trigger_images = trigger_images
             # 新输入到来：重置轮数与循环计时（终端标志此时必为 False），继续循环。
             # per-reply 累积（中间文本/工具消息）仅在刚完成的回复已经 on_reply_complete 落库
             # （reply_completed=True）时清零；工具轮被插入打断（False）时工具段与中间文本
             # 尚未落库，必须保留给最终完成回复的回调一并落库，否则历史丢失整个工具调用段。
             round_idx = 0
             loop_start = time.monotonic()
+            _round_limit_injected = False  # 新输入重开轮数，再到最后一轮时要重新提示
             if reply_completed:
                 intermediate_texts = []
                 tool_messages = []
@@ -1074,11 +1332,25 @@ class TextGenerator(Singleton["TextGenerator"]):
                     round_tool_choice = "none"
                 else:
                     round_tool_choice = None
+                # 本轮是否禁止调工具（泄漏处理据此分流）；泄漏重试轮整段去掉 tools——
+                # 宁可这一轮缓存前缀失效，也不能让同一段标记再漏一次
+                _no_tools_round = _drop_tools_this_round or round_tool_choice == "none"
+                if _drop_tools_this_round:
+                    _drop_tools_this_round = False
+                    current_tools = None
+                    round_tool_choice = ""
 
-                # 最后一轮前，若有中间文本，注入提醒避免最终回复重复（终端工具轮不注入）
-                if is_last_round and not _allow_terminal_tools and intermediate_texts:
-                    hint = "你在工具调用阶段已说过以下内容，请在最终回复中不要重复，只补充新信息：\n" + "\n".join(intermediate_texts)
+                # 轮数上限的最后一轮（终端工具轮不注入）：明确告诉模型不能再调工具、直接出文本——
+                # 只靠 tool_choice="none" 不够，DeepSeek 系仍会把想调的工具以原生标记写进 content。
+                # 顺带列出中间轮已说过的话避免重复。置 internal_control_injected 让本轮走缓冲输出，
+                # 万一仍泄漏也能在发出前拦下。只注入一次，本轮内的各种 continue 重试不重复追加。
+                if is_last_round and not _allow_terminal_tools and not _round_limit_injected:
+                    _round_limit_injected = True
+                    hint = _ROUND_LIMIT_TEXT
+                    if intermediate_texts:
+                        hint += "\n你在工具调用阶段已说过以下内容，最终回复中不要重复，只补充新信息：\n" + "\n".join(intermediate_texts)
                     messages.append({"role": "system", "content": hint})
+                    internal_control_injected = True
 
                 # 中间轮用缓冲回调，不输出给用户；最后一轮用真实回调
                 buf_text: List[str] = []
@@ -1118,9 +1390,34 @@ class TextGenerator(Singleton["TextGenerator"]):
                 async def _flush_control_stream_buffer() -> None:
                     if not on_text or not control_stream_buf:
                         return
-                    safe_text = sanitize_draw_reply_text("".join(control_stream_buf), allow_task_ids=has_anima_call)
+                    safe_text = sanitize_internal_control_text("".join(control_stream_buf))
+                    safe_text = sanitize_draw_reply_text(safe_text, allow_task_ids=has_anima_call)
                     if safe_text:
                         await on_text(safe_text)
+
+                async def _handle_markup_leak(round_text: str) -> Optional[str]:
+                    """文本收尾轮的正文里混入工具调用标记（DSML/XML）时的处理。
+                    首次：丢弃本轮文本，注入提示后重试一轮（本轮本就禁止调工具 → 重试轮连 tools 都不带）；
+                    再次：不再重试，剥掉标记后按文本收尾。返回 None 表示调用方应 continue 重试。"""
+                    nonlocal _markup_leak_retries, _drop_tools_this_round, internal_control_injected
+                    if not contains_tool_call_xml(round_text):
+                        return round_text
+                    if _markup_leak_retries < 1:
+                        _markup_leak_retries += 1
+                        if _no_tools_round:
+                            _drop_tools_this_round = True
+                            notice = _MARKUP_LEAK_NO_TOOLS_TEXT
+                            mode = "本轮禁止调工具，重试轮去掉 tools"
+                        else:
+                            notice = _MARKUP_LEAK_WITH_TOOLS_TEXT
+                            mode = "本轮允许调工具"
+                        messages.append({"role": "system", "content": notice})
+                        internal_control_injected = True
+                        logger.warning(f"[工具标记泄漏] 正文混入工具调用标记（{mode}），丢弃本轮文本并重试: {round_text[:120]!r}")
+                        return None
+                    stripped = strip_tool_call_xml(round_text)
+                    logger.warning(f"[工具标记泄漏] 重试后仍泄漏，已剥离标记按文本收尾: {round_text[:120]!r}")
+                    return stripped
 
                 if (request_state.get("config") or {}).get("enable_stream", True):
                     content, tool_calls, reasoning_content = await self._stream_once(
@@ -1164,6 +1461,11 @@ class TextGenerator(Singleton["TextGenerator"]):
                                     m["content"] = "\n".join(text_parts) if text_parts else "[图片已省略]"
                             logger.warning("工具轮返回空内容，已剥离图片并重试")
                             continue
+                        # 正文混入工具调用标记：首次丢弃重试，再次剥离后收尾
+                        _clean_content = await _handle_markup_leak(content)
+                        if _clean_content is None:
+                            continue
+                        content = _clean_content
                         if control_stream_buf is not None:
                             await _flush_control_stream_buffer()
                         merged_reply = _merge_intermediate(content)
@@ -1261,6 +1563,11 @@ class TextGenerator(Singleton["TextGenerator"]):
                             tool_calls = _valid_tool_calls
                     if not tool_calls:
                         final_reasoning_content = message_dict.get("reasoning_content", "")
+                        # 正文混入工具调用标记：首次丢弃重试，再次剥离后收尾
+                        _clean_content = await _handle_markup_leak(content)
+                        if _clean_content is None:
+                            continue
+                        content = _clean_content
                         safe_content = sanitize_draw_reply_text(content, allow_task_ids=has_anima_call)
                         if on_text and safe_content:
                             await on_text(safe_content)
@@ -1470,11 +1777,35 @@ class TextGenerator(Singleton["TextGenerator"]):
                     logger.warning(f"工具轮请求失败，已剥离图片并重试: {e!r}")
                     continue
                 logger.warning(f"LLM 请求失败: {e!r}")
-                if request_profile:
-                    # profile 快照路径：推进该 profile 自己的 key 轮换索引，下次请求换 key
-                    self._rotate_profile_key(request_profile, len(request_profile.get("api_keys") or [""]))
-                else:
-                    self._rotate_key()
+                # key 级失败（鉴权 401/403、额度 402、限流 429 …）：把失败的 key 打进冷却，
+                # 并在本次请求内顺延到下一个 key 重试——第一顺位优先，全部试过才放弃。
+                # 其他错误（400 参数、超时、上下文超限、图片被拒）与 key 无关，换 key 也救不回来，
+                # 以前对任何异常都推进索引，才出现「一次偶发失败就把流量永久钉在第二个 key」。
+                if _is_key_level_error(err_text):
+                    key_scope = request_state.get("key_scope") or (
+                        self._profile_key_id(request_profile) if request_profile else self._SINGLETON_KEY_SCOPE
+                    )
+                    key_list = list(
+                        (request_profile.get("api_keys") if request_profile else self.api_keys) or [""]
+                    )
+                    if len(key_list) > 1:
+                        failed_index = int(request_state.get("api_key_index", 0))
+                        self._mark_key_failed(key_scope, failed_index)
+                        _tried_key_indices.add(failed_index)
+                        next_key, next_index = self._key_plan(key_scope, key_list, _tried_key_indices)
+                        if next_index not in _tried_key_indices:
+                            _tried_key_indices.add(next_index)
+                            request_state = dict(request_state)
+                            request_state["api_key"] = next_key
+                            request_state["api_key_index"] = next_index
+                            logger.warning(
+                                f"当前 key 不可用（{err_text[:120]}），本次请求改用第 {next_index + 1}/"
+                                f"{len(key_list)} 个 key 重试 | scope: {key_scope}"
+                            )
+                            continue
+                        logger.warning(
+                            f"{len(key_list)} 个 key 均不可用，放弃本次请求 | scope: {key_scope}"
+                        )
                 return f"请求大模型时发生错误: {e!r}", False, tool_messages, ""
         return "", False, tool_messages, ""
 

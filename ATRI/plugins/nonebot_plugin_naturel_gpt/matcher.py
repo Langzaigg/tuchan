@@ -85,6 +85,10 @@ def _get_recent_context_buffer(chat_key: str) -> Deque[Dict[str, Any]]:
     return buf
 
 
+# 消息文本中的图片占位符 [图片N]（消息内本地编号；渲染层统一改写为全局显示编号）
+_IMG_MARKER_RE = re.compile(r"\[图片(\d+)\]")
+
+
 def _push_recent_context_buffer(
     chat_key: str,
     sender: str,
@@ -114,52 +118,65 @@ def _push_recent_context_buffer(
         )
 
 
-def _flush_recent_context_buffer(chat_key: str, trigger_sender: str = "") -> Tuple[str, List[str]]:
-    """清空入口层非触发缓冲，返回 (合并文本, 图片URL列表)。
-    仅保留最后一条消息和触发者本人的图片，忽略其他人的图片。"""
+def _flush_recent_context_buffer(chat_key: str, trigger_sender: str = "") -> Tuple[str, List[str], List[Dict[str, Any]]]:
+    """清空入口层非触发缓冲，返回 (合并文本, 图片URL列表, 图片元数据列表)。
+    - 时间衰减：距 flush 时刻超过 CONTEXT_BUFFER_MAX_AGE_MINUTES 的条目丢弃，但至少保留最后
+      CONTEXT_BUFFER_MIN_LINES 条（早已翻篇的话题不再贴在触发消息旁边）。
+    - 图片全部保留（过期由渲染层按张统一判定），块内按出现顺序本地编号 [图片1..k]；
+      image_meta 与 images 平行，记录每张图的 sender / timestamp，供渲染层按张过期。
+    trigger_sender 参数保留兼容，不再影响留图。"""
     buf = _recent_context_buffers.pop(chat_key, None)
     if not buf:
-        return "", []
+        return "", [], []
+
+    items = list(buf)
+    now = time.time()
+    try:
+        max_age = float(getattr(config, "CONTEXT_BUFFER_MAX_AGE_MINUTES", 15) or 0) * 60
+    except (TypeError, ValueError):
+        max_age = 15 * 60
+    try:
+        min_lines = max(0, int(getattr(config, "CONTEXT_BUFFER_MIN_LINES", 3) or 0))
+    except (TypeError, ValueError):
+        min_lines = 3
+    if max_age > 0 and len(items) > min_lines:
+        age_cutoff = now - max_age
+        fresh = [it for it in items if float(it.get("timestamp") or now) >= age_cutoff]
+        if len(fresh) < min_lines:
+            fresh = items[-min_lines:] if min_lines > 0 else []
+        items = fresh
 
     parts: List[str] = []
     images: List[str] = []
+    image_meta: List[Dict[str, Any]] = []
     img_counter = 0
-    last_item = buf[-1] if buf else None
 
-    for item in buf:
+    for item in items:
         item_images = list(item.get("images") or [])
         text = str(item.get("text") or "").strip()
         if not text and item_images:
             text = " ".join(f"[图片{i + 1}]" for i in range(len(item_images)))
+        item_ts = float(item.get("timestamp") or now)
+        sender = item.get("sender") or "anonymous"
 
-        # 仅保留最后一条消息或触发者本人的图片
-        keep_images = (
-            item is last_item
-            or (trigger_sender and item.get("sender") == trigger_sender)
-        )
-
-        if keep_images and item_images:
+        if item_images:
+            # 块内连续编号：一次性把本条的 [图片k] 整体平移 offset（逐个 replace 会与已改写的编号互相覆盖）
+            offset = img_counter
+            found = {int(m) for m in _IMG_MARKER_RE.findall(text)}
+            text = _IMG_MARKER_RE.sub(lambda m: f"[图片{int(m.group(1)) + offset}]", text)
             for i in range(len(item_images)):
-                img_counter += 1
-                marker = f"[图片{i + 1}]"
-                replacement = f"[图片{img_counter}]"
-                if marker in text:
-                    text = text.replace(marker, replacement, 1)
-                else:
-                    text = f"{text} {replacement}".strip()
+                if (i + 1) not in found:
+                    text = f"{text} [图片{offset + i + 1}]".strip()
+                image_meta.append({"sender": sender, "timestamp": item_ts})
+            img_counter += len(item_images)
             images.extend(item_images)
-        elif item_images:
-            # 不保留图片时，移除文本中的图片标记
-            for i in range(len(item_images)):
-                marker = f"[图片{i + 1}]"
-                text = text.replace(marker, "").strip()
 
         if not text:
             continue
-        ts = time.strftime('%H:%M', time.localtime(float(item.get("timestamp") or time.time())))
-        parts.append(f"[{ts}] {item.get('sender') or 'anonymous'}: {text}")
+        ts = time.strftime('%H:%M', time.localtime(item_ts))
+        parts.append(f"[{ts}] {sender}: {text}")
 
-    return "\n".join(parts), images
+    return "\n".join(parts), images, image_meta
 
 
 def _format_loop_entry_text(recorded_msg: Optional[ChatMessageData], sender_name: str, raw_text: str) -> str:
@@ -582,6 +599,26 @@ def _is_image_download_error(text: Optional[str]) -> bool:
     )
 
 
+def _is_image_limit_error(text: Optional[str]) -> bool:
+    """provider 因图片数量/尺寸超限拒绝请求。
+
+    如 deepseek-flash 每次最多 4 张：
+    "At most 4 image(s) may be provided in one prompt. (parameter=image)"。
+    与下载失败不同，重传或转 base64 都救不回来，只能剥离图片重试。"""
+    if not text:
+        return False
+    lower_text = text.lower()
+    if "image" not in lower_text and "图片" not in lower_text:
+        return False
+    return (
+        "at most" in lower_text
+        or "too many" in lower_text
+        or "max_images" in lower_text
+        or "exceed" in lower_text
+        or "超过" in lower_text
+    )
+
+
 def _is_empty_content_error(text: Optional[str]) -> bool:
     if not text:
         return False
@@ -681,7 +718,7 @@ def _count_prompt_text_and_images(prompt: List[Dict[str, Any]], tg: TextGenerato
 def _snapshot_request_profile(chat: Chat) -> Dict[str, Any]:
     """固定本轮请求使用的 profile，避免多群并发切换 TextGenerator 单例状态。"""
     active_profile = chat.get_active_profile()
-    profile = dict(config.OPENAI_PROFILES.get(active_profile, {}) or {})
+    profile = config.get_profile(active_profile)
     if profile:
         profile["name"] = active_profile  # 稳定标识，供 per-profile 多 key 轮换索引用
         profile["api_keys"] = list(profile.get("api_keys", config.OPENAI_API_KEYS) or [""])
@@ -1162,7 +1199,7 @@ async def do_msg_response(
 
     # 将缓冲区的非触发消息合并为一条 context_only 消息注入（append-only，不清除旧 context_only）。
     # 放在节流之后，确保触发消息附近新出现的非触发群聊也能进入本轮 prompt。
-    buffered_context, buffered_images = _flush_recent_context_buffer(chat_key, trigger_sender=sender_name)
+    buffered_context, buffered_images, buffered_meta = _flush_recent_context_buffer(chat_key, trigger_sender=sender_name)
 
     if buffered_context:
         await chat.update_chat_history_row(
@@ -1170,12 +1207,13 @@ async def do_msg_response(
             msg=f"[群聊上下文-非触发消息]\n{buffered_context}",
             images=buffered_images,
             context_only=True,
+            image_meta=buffered_meta,
         )
         if config.DEBUG_LEVEL > 0:
             logger.info(
                 f"[上下文缓冲] 已注入 context_only: 图片={len(buffered_images)}"
             )
-    # context 图片由 _apply_image_gating 注入到 context_only 消息中，不再合并到触发消息
+    # context_only 块的图片就地保留在该块内（渲染层统一过期 / 编号），不合并到触发消息
 
     sta_time:float = time.time()
 
@@ -1203,11 +1241,9 @@ async def do_msg_response(
     tg = TextGenerator.instance
     tg._current_chat_key = chat_key  # 设置当前会话key供工具使用
     tg._current_trigger_userid = trigger_userid  # 设置当前用户id供工具使用
-    # 触发消息图片URL快照，供 vision 工具把 [图片N] 映射回真实URL。
-    # 视觉 profile 下 get_chat_prompt_template 已把整个上下文图片全局重编号写入 chat._vision_context_images，
-    # 优先用它（覆盖历史/context_only 图片）；否则回退触发消息本身的 image_urls。
-    _vision_imgs = getattr(chat, "_vision_context_images", None)
-    tg._current_trigger_images = list(_vision_imgs) if _vision_imgs else list(image_urls or [])
+    # 本次请求可见图片表 {显示编号: 原始URL}，由 get_chat_prompt_template 的图片策略生成
+    #（覆盖历史 / context_only / 触发消息，编号与模型看到的 [图片N] 一致），供 vision / anime_trace 取图。
+    tg._visible_images = dict(getattr(chat, "_visible_images", {}) or {})
     request_profile = _snapshot_request_profile(chat)
     text_tokens, prompt_image_count = _count_prompt_text_and_images(prompt_template, tg)
     logger.info(
@@ -1245,6 +1281,7 @@ async def do_msg_response(
     _thinking_mode = bool(request_profile.get("thinking", True))  # 该 profile 是否为思考模式（默认开启）
     _saw_reasoning = False      # 本次是否收到过 reasoning_content（模型走了正常思考通道）
     _skip_think_buffer_mode = False  # 模型跳过思考标签、content 可能混入思考时，收完再发避免泄漏
+    _tool_rounds = 0  # 本回复内已发生的工具轮数（每轮 tool_calls +1）：分段上限按轮放宽，中间轮文本各算一轮
     _tool_called = False        # 本次请求是否发生过工具调用（用于过滤"整条被括号包围"的噪音分段）
     # 漫画自动画图兜底的去重状态：同一触发内每个完成的回复在 _on_reply_complete 各检查一次；
     # 尾部仅当"没有任何回复被检查过"或"最近一次回复检查后又有新工具调用"（最终回复为空的工具轮）才补查，
@@ -1253,9 +1290,13 @@ async def do_msg_response(
     _manga_tool_dirty = False
 
     async def _on_tool_call(tool_calls: List[Dict[str, Any]]) -> None:
-        nonlocal _tool_called, _manga_tool_dirty
+        nonlocal _tool_called, _manga_tool_dirty, sent_segments, _tool_rounds
         _tool_called = True
         _manga_tool_dirty = True
+        # 轮边界：本轮 tool_calls 之前的文本是一段完整的中间轮发言，分段计数按轮重置，
+        # 否则 REPLY_MAX_SEGMENTS 会被多轮工具文本合计吃满，尾段被压成一条长消息
+        sent_segments = 0
+        _tool_rounds += 1
 
     def _maybe_manga_autodraw(draw_reqs: List[str], tool_msgs) -> None:
         """漫画模式自动画图检查（每个回复/每次尾部补查至多执行一次）：
@@ -1364,21 +1405,47 @@ async def do_msg_response(
             await send_segment(segment)
 
     async def on_reasoning_chunk(chunk: str) -> None:
-        nonlocal _saw_reasoning
+        nonlocal _saw_reasoning, _skip_think_buffer_mode, stream_buffer
         _saw_reasoning = True  # 记录模型走了正常思考通道，content 即纯回复，无需收完再发兜底
+        if _skip_think_buffer_mode:
+            # 首段 content 到来时尚未见到 reasoning（常见于工具轮：首轮 tool_calls 不带 reasoning_content）
+            # 而进入了"收完再发"；现在思考通道出现，content 即纯回复，退出缓冲并把已缓冲文本按正常分段发出，
+            # 否则整个多轮回复会在收尾时被压成一条长消息
+            _skip_think_buffer_mode = False
+            if config.NG_ENABLE_MSG_SPLIT:
+                while sent_segments < max(1, config.REPLY_MAX_SEGMENTS) - 1 and "\n\n" in stream_buffer:
+                    segment, stream_buffer = stream_buffer.split("\n\n", 1)
+                    await send_segment(segment)
         if config.LLM_SHOW_REASONING:
             await on_text_chunk(chunk)
 
+    async def _send_buffer_segmented(text: str) -> None:
+        """把一段残余文本按 \\n\\n 拆成多条消息发送：在剩余分段预算内各自发送，超出部分合并为最后一段。
+        预算 = REPLY_MAX_SEGMENTS + 本回复的工具轮数 - 已发送段数（中间轮文本各算一轮）。
+        用于"收完再发"缓冲与回复收尾的残余缓冲，避免整段回复被压成一条长消息。"""
+        if not config.NG_ENABLE_MSG_SPLIT:
+            await send_segment(text)
+            return
+        pieces = [p for p in text.split("\n\n") if p.strip()]
+        if not pieces:
+            return
+        budget = max(1, config.REPLY_MAX_SEGMENTS) + _tool_rounds - sent_segments
+        while len(pieces) > 1 and budget > 1:
+            await send_segment(pieces.pop(0))
+            budget -= 1
+        await send_segment("\n\n".join(pieces))
+
     async def _flush_reply_stream_buffer() -> None:
-        """发送当前回复未分段发送的残余缓冲，并重置 per-reply 流式状态。"""
-        nonlocal stream_buffer, sent_segments, _tool_called, _skip_think_buffer_mode, _saw_reasoning
-        if stream_buffer:
-            await send_segment(stream_buffer)
+        """发送当前回复未分段发送的残余缓冲（按 \\n\\n 分段、受分段预算约束），并重置 per-reply 流式状态。"""
+        nonlocal stream_buffer, sent_segments, _tool_called, _skip_think_buffer_mode, _saw_reasoning, _tool_rounds
+        if stream_buffer.strip():
+            await _send_buffer_segmented(stream_buffer)
         stream_buffer = ""
         sent_segments = 0
         _tool_called = False
         _skip_think_buffer_mode = False
         _saw_reasoning = False
+        _tool_rounds = 0
 
     async def _on_reply_complete(reply_text: str, reply_tool_messages: List[Dict[str, Any]],
                                  reply_entries: Optional[List[Dict[str, Any]]] = None) -> None:
@@ -1427,7 +1494,21 @@ async def do_msg_response(
         # 记录 Bot 回复，is_bot_reply=True 表示同时更新精简窗口和全量窗口（require_summary=True 触发滑窗/摘要）
         await chat.update_chat_history_row(sender=chat.preset_key, msg=text, require_summary=True, record_time=False, is_bot_reply=True)
         chat.update_send_time()
-        await chat.update_chat_history_row_for_user(sender=chat.preset_key, msg=text, userid=trigger_userid, username=sender_name, require_summary=True)
+        # 用户维度历史：邮箱批次回复归属到批次内各 entry 的用户（而非原始触发者），
+        # 避免把回 B 的话记进 A 的印象历史
+        if reply_entries:
+            _seen_uids: Set[str] = set()
+            for _e in reply_entries:
+                _uid = str(_e.get("userid") or "")
+                if not _uid or _uid in _seen_uids:
+                    continue
+                _seen_uids.add(_uid)
+                await chat.update_chat_history_row_for_user(
+                    sender=chat.preset_key, msg=text, userid=_uid,
+                    username=str(_e.get("sender") or ""), require_summary=True,
+                )
+        else:
+            await chat.update_chat_history_row_for_user(sender=chat.preset_key, msg=text, userid=trigger_userid, username=sender_name, require_summary=True)
         PersistentDataManager.instance.save_to_file()
         if config.DEBUG_LEVEL > 0: logger.info(f"对话响应完成 | 耗时: {time.time() - sta_time}s")
         # 回复完成日志（按回复计）：合并缓存命中和 token 统计
@@ -1473,6 +1554,13 @@ async def do_msg_response(
                 on_tool_call=_on_tool_call,
                 on_reply_complete=_on_reply_complete,
             )
+
+            # 成功但产出为空：provider 静默失败（流内错误被吞、全思考无正文等）也会走到这里，
+            # 按失败处理以便落 error log 并进入下方重试路径。已完成过回复或已执行过工具时不改判——
+            # 那些文本已发出、工具副作用（如画图）已产生，重试只会重复发送和二次触发。
+            if success and not (raw_res or "").strip() and not tool_messages and _manga_replies_checked == 0:
+                logger.warning("模型返回空响应（success 但无任何内容），按失败处理并尝试重试")
+                success = False
 
             # 每次失败都保存完整的未脱敏 error log（即使后续会重试）
             if not success:
@@ -1530,14 +1618,16 @@ async def do_msg_response(
             if not _prompt_contains_images(prompt_template):
                 break
             # 仅在图片相关 400 错误时重试（非图片 400 如工具调用格式错误，剥离图片无意义）
-            if not _is_image_download_error(raw_res):
+            _img_limit_hit = _is_image_limit_error(raw_res)
+            if not _is_image_download_error(raw_res) and not _img_limit_hit:
                 break
             if _retry >= MAX_RETRIES:
                 logger.warning(f"已达到最大重试次数 ({MAX_RETRIES})，停止重试")
                 break
 
             # 直传图片 URL 被 provider 拉取失败：先原位转 base64 重试一次，仍失败再走无图剥离
-            if not _passthrough_retried:
+            # 图片数量/尺寸超限与拉取无关，转 base64 救不回来，直接走下面的无图剥离
+            if not _passthrough_retried and not _img_limit_hit:
                 _pt_urls = _collect_passthrough_image_urls(prompt_template)
                 if _pt_urls:
                     _passthrough_retried = True
@@ -1549,8 +1639,10 @@ async def do_msg_response(
                     continue
 
             logger.warning(f"含图片上下文请求返回 400 (第 {_retry + 1} 次)，回退到无图片上下文重试...")
-            chat.cleanup_after_bad_request(keep_history=5)
-            PersistentDataManager.instance.save_to_file(must_save=True)
+            # 图片数量超限时上下文本身没问题，剥图即可解决，不做会丢历史的清理
+            if not _img_limit_hit:
+                chat.cleanup_after_bad_request(keep_history=5)
+                PersistentDataManager.instance.save_to_file(must_save=True)
             raw_parts.clear()
             stream_buffer = ""
             sent_segments = 0

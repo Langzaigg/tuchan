@@ -124,15 +124,19 @@ class StatsManager:
         completion_tokens = int(usage.get("completion_tokens") or 0)
         total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
 
-        cached = 0
+        # 三种写法描述的是同一个量（命中缓存的 prompt token 数），provider 常常同时返回
+        # 两种（DeepSeek 同时给 prompt_cache_hit_tokens 和 prompt_tokens_details.cached_tokens），
+        # 因此取最大值而不是相加，否则命中率会翻倍到 100% 以上。
+        candidates = []
         # OpenAI 风格
         ptd = usage.get("prompt_tokens_details")
         if isinstance(ptd, dict):
-            cached += int(ptd.get("cached_tokens") or 0)
+            candidates.append(int(ptd.get("cached_tokens") or 0))
         # Anthropic 风格（部分兼容层映射到 prompt_tokens_details，这里兜底）
-        cached += int(usage.get("cache_read_input_tokens") or 0)
+        candidates.append(int(usage.get("cache_read_input_tokens") or 0))
         # DeepSeek 风格
-        cached += int(usage.get("prompt_cache_hit_tokens") or 0)
+        candidates.append(int(usage.get("prompt_cache_hit_tokens") or 0))
+        cached = min(max(candidates), prompt_tokens) if prompt_tokens else max(candidates)
 
         with _LOCK:
             entry = self._get_day()["models"][model_name]

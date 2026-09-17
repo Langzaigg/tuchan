@@ -164,6 +164,7 @@ data/exports/
 data/fortune/
 data/source/
 _temp_*.py
+_temp_*/
 export_group_chat.py
 test_llm_request.py
 *.lnk

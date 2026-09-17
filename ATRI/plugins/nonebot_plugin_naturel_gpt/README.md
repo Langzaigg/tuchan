@@ -151,32 +151,35 @@ CHAT_MAX_SUMMARY_TOKENS: 800
 
 ### 🔀 多 OpenAI 配置（可选）
 
-插件支持多组配置，通过 `OPENAI_PROFILES` 管理：
+插件支持多组配置，通过 `OPENAI_PROFILES` 管理。每个 profile 是一份完整的模型配置，另有 `default` 指针指定默认用哪一份：
 
 ```yaml
-OPENAI_ACTIVE_PROFILE: default
 OPENAI_PROFILES:
-  default:
-    OPENAI_API_KEYS:
+  default: ds            # 默认指针：值是下面某个 profile 的名字，改这里即换默认模型
+  ds:
+    api_keys:
       - sk-xxx
-    OPENAI_BASE_URL: https://api.openai.com/v1
-    CHAT_MODEL: gpt-4o
-    CHAT_MODEL_MINI: gpt-4o-mini
+    base_url: https://api.openai.com/v1
+    model: gpt-4o
+    model_mini: gpt-4o-mini
     extra_prompt: ''
   kimi:
-    OPENAI_API_KEYS:
+    api_keys:
       - sk-yyy
-    OPENAI_BASE_URL: https://api.moonshot.cn/v1
-    CHAT_MODEL: kimi-k2
+    base_url: https://api.moonshot.cn/v1
+    model: kimi-k2
     extra_prompt: '你是 Kimi，请保持简洁。'
 ```
 
-- `OPENAI_ACTIVE_PROFILE`：默认激活的 profile。
-- 每个会话可独立设置 active_profile，运行时自动切换。
+- `default`（`OPENAI_PROFILES` 内的指针键）：值为 profile 名，指向默认使用的模型配置。它不是模型配置本身，`rg model` 列表与切换都不会把它当成可选配置。
+- 每个会话可独立设置 active_profile，运行时自动切换。**全局默认只由配置文件的 `default` 指针决定**：`rg model <名字>` 只改当前会话（回复里也会提示这点），自动跟随（`apply_profile`）同样不改指针。
+- 配置解析顺序：会话自选 → `default` 指针 → 旧字段 `OPENAI_ACTIVE_PROFILE` → 第一个 profile。指针指向的名字不存在时自动往后回落。
+- 旧字段 `OPENAI_ACTIVE_PROFILE` 保留兼容（仅回落用），新配置写 `default` 指针即可。
+- `api_keys`：一个 profile 可填多个 key，**恒定优先使用第一个**。只有出现 key 自身的问题（401/403 鉴权失败、402 额度耗尽、429 限流）才顺延到下一个 key，并把失败的 key 冷却 5 分钟；冷却到期自动回到第一个 key。参数错误、超时等与 key 无关的错误不会换 key。
 - `extra_prompt`：模型专用追加提示词，会注入到 System 2 末尾，用于特定模型调优。
 - `no_think`：`true` 时在响应规则中注入 `/no_think` 指令，用于显式关闭模型思考（默认 `false`）。
 - `keep_reasoning`：`true` 时跨轮持久化历史中的 `reasoning_content` 随请求发送（默认 `false`，provider 400 拒绝时自动剥离重试一次）；同一轮工具循环内的思考链始终保留。
-- 旧版扁平键（如 `OPENAI_API_KEYS`、`CHAT_MODEL`）会自动迁移为 `default` profile。
+- 旧版扁平键（如 `OPENAI_API_KEYS`、`CHAT_MODEL`）会自动迁移为 `main` profile，并生成 `default: main` 指针。
 
 ### ⚡ 流式响应
 
@@ -215,15 +218,15 @@ REPLY_MAX_SEGMENTS: 5
 
 ```yaml
 MULTIMODAL_ENABLE: true
-MULTIMODAL_HISTORY_LENGTH: 4
-MULTIMODAL_MAX_MESSAGES_WITH_IMAGES: 2
+MULTIMODAL_MAX_IMAGES: 8
+MULTIMODAL_IMAGE_FRESH_MINUTES: 60
 ```
 
 - 插件会读取 OneBot v11 `image` 消息段中的图片 URL。
-- 图片会作为 OpenAI-compatible 的 `image_url` 内容传给模型。
-- `MULTIMODAL_HISTORY_LENGTH` 控制图片可进入上下文的聊天记录视野长度。
-- `MULTIMODAL_MAX_MESSAGES_WITH_IMAGES` 控制最多保留几条带图片的消息，并且始终从最近输入开始保留。
-- 如果 `MULTIMODAL_MAX_MESSAGES_WITH_IMAGES` 设置为 `0`，不会保留历史图片消息。
+- 图片会作为 OpenAI-compatible 的 `image_url` 内容传给模型，并就地保留在发出它的那条消息里（含群聊上下文块），每轮原样重发以命中前缀缓存。
+- `MULTIMODAL_IMAGE_FRESH_MINUTES` 是统一有效期；过期按 30 分钟量化，整点和半点批量退场并重新编号，过期图片在文本中显示为 `[图片已过期]`。
+- `MULTIMODAL_MAX_IMAGES` 是上下文中可见图片总数上限，超限按最旧剥离到一半；触发消息自身的图片始终可见。
+- 模型看到的 `[图片N]` 是本次请求的显示编号，vision / anime_trace 工具按同一编号取图。
 
 注意：
 
@@ -359,7 +362,7 @@ NAS_GAME_SYNC_RECORDS_PATH: ''  # 同步服务记录文件，为空则不读取
 
 ```yaml
 # 在 OPENAI_PROFILES 的对应 profile 中配置：
-model_vision: mimo            # 视觉模型名
+model_vision: deepseek-flash  # 视觉模型名（默认值即为多模态的 deepseek-flash）
 model_vision_base_url: ''     # 可选，默认复用 profile 的 base_url
 model_vision_api_keys: []     # 可选，默认复用 profile 的 api_keys
 model_vision_max_tokens: 0    # 可选

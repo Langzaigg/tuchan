@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -10,6 +11,19 @@ from .logger import logger
 from .config import config
 from .openai_func import TextGenerator
 from .persistent_data_manager import ChatMessageData, PersistentDataManager, PresetData
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.S)
+
+
+def _clean_llm_text(text: str) -> str:
+    """清理摘要/印象等后台任务的模型输出：去掉 <think>...</think> 块；若只剩下孤立的 </think>
+    （开头标签被 provider 吞掉、思考内容直接混在 content 前部），只保留最后一个 </think> 之后的部分。
+    印象文本会原样注入 prompt，混入思考会污染上下文（实测出现过“...</think>（用户要求作画...）”）。"""
+    text = str(text or "")
+    text = _THINK_BLOCK_RE.sub("", text)
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1]
+    return text.strip()
 
 # 摘要压缩失败后的冷却时间（秒），避免持续触发无效请求
 _COMPRESS_COOLDOWN_SECONDS = 120
@@ -95,10 +109,12 @@ class ChatSummaryMixin:
 
     def _snapshot_request_profile(self) -> Dict[str, Any]:
         """固定后台摘要/印象任务使用的当前会话 profile。"""
-        active_profile = self.get_active_profile() if hasattr(self, "get_active_profile") else config.OPENAI_ACTIVE_PROFILE
-        profile = dict(config.OPENAI_PROFILES.get(active_profile, {}) or {})
+        active_profile = self.get_active_profile() if hasattr(self, "get_active_profile") else config.get_default_profile_name()
+        profile = config.get_profile(active_profile)
         if profile:
-            profile["name"] = active_profile  # 稳定标识，供 per-profile 多 key 轮换索引用
+            # 归一化为真实 profile 名（get_active_profile 已解析指针，这里兜底 chat_key 缺失等情况）
+            active_profile = config.resolve_profile_name(active_profile)
+            profile["name"] = active_profile  # 稳定标识，供 per-profile 多 key 冷却索引用
             profile["api_keys"] = list(profile.get("api_keys", config.OPENAI_API_KEYS) or [""])
             profile["enable_stream"] = config.LLM_ENABLE_STREAM
             return profile
@@ -253,6 +269,7 @@ class ChatSummaryMixin:
         try:
             res, success = await tg.get_response(prompt, type='summarize', request_profile=request_profile)
             summary_response = res or ""
+            res = _clean_llm_text(res) if success else res
             if success and res and res.strip():
                 new_summary = res.strip()[:max_chars]
                 if not new_summary.startswith("[搜索工具摘要]"):
@@ -479,6 +496,7 @@ class ChatSummaryMixin:
                 try:
                     res, success = await tg.get_response(prompt, type='summarize', request_profile=request_profile)
                     summary_response = res or ""
+                    res = _clean_llm_text(res) if success else res
                     if success and res and res.strip():
                         new_summary = res.strip()
                         break
@@ -608,6 +626,7 @@ class ChatSummaryMixin:
                 try:
                     imp_res, imp_success = await tg.get_response(imp_prompt, type='summarize', request_profile=request_profile)
                     imp_response = imp_res or ""
+                    imp_res = _clean_llm_text(imp_res) if imp_success else imp_res
                     if imp_success and imp_res and imp_res.strip():
                         imp_text = imp_res.strip()
                         # 硬截断：超出软目标 2 倍时才截断

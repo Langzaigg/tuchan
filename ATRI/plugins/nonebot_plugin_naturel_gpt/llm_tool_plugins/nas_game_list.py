@@ -289,20 +289,24 @@ def _format_brands(index: Dict) -> str:
 
 def _format_games(brand_name: str, index: Dict) -> str:
     brands = index.get("brands", [])
-    for b in brands:
-        if b["name"] == brand_name:
+    entries = _resolve_brand_entries(index, brand_name)
+    if entries:
+        lines: List[str] = []
+        total = 0
+        for b in entries:
             games = b.get("games", [])
-            if not games:
-                return f"会社「{brand_name}」下暂无游戏"
-            lines = [f"会社「{brand_name}」共有 {len(games)} 个游戏:"]
+            total += len(games)
+            lines.append(f"会社「{b['name']}」共有 {len(games)} 个游戏:")
             for g in games:
                 type_tag = "/" if g.get("type") == "dir" else ""
                 mtime_str = time.strftime("%Y-%m-%d", time.localtime(g.get("mtime", 0)))
                 lines.append(f"- {g['name']}{type_tag}（{mtime_str}）")
-            result = "\n".join(lines)
-            if len(result) > 6000:
-                result = result[:6000] + "\n...（结果过长已截断，可用 search 搜具体游戏）"
-            return result
+        if not total:
+            return f"会社「{brand_name}」下暂无游戏"
+        result = "\n".join(lines)
+        if len(result) > 6000:
+            result = result[:6000] + "\n...（结果过长已截断，可用 search 搜具体游戏）"
+        return result
 
     close_matches = [b["name"] for b in brands if brand_name.lower() in b["name"].lower()]
     if close_matches:
@@ -311,6 +315,90 @@ def _format_games(brand_name: str, index: Dict) -> str:
     all_brands = "、".join(b["name"] for b in brands[:10])
     hint = f" 可用会社: {all_brands}" if all_brands else ""
     return f"未找到会社「{brand_name}」。{hint}"
+
+
+# 中文圈常用会社昵称 → 目录/文件名里会出现的原名（只收无歧义的常见叫法）。
+# 群里点游戏基本都用昵称，没有这张表模型要先猜再搜，一个昵称能白烧两轮工具调用。
+_BRAND_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "音符社": ("ensemble",),
+    "柚子社": ("ゆずソフト", "yuzusoft"),
+    "八月社": ("AUGUST",),
+    "键社": ("KEY",),
+    "鍵社": ("KEY",),
+    "方糖社": ("Lump of Sugar",),
+    "紫社": ("Purple software",),
+    "漩涡社": ("Whirlpool",),
+    "中二社": ("minori",),
+    "马戏团": ("Circus",),
+    "马戏团社": ("Circus",),
+    "猫猫社": ("ねこねこソフト",),
+    "脐社": ("Navel",),
+    "钩子社": ("HOOKSOFT",),
+    "颜艺社": ("ASa Project",),
+    "真红社": ("FAVORITE",),
+    "真紅社": ("FAVORITE",),
+    "爱丽丝社": ("ALICESOFT",),
+    "型月": ("TYPE-MOON",),
+    "戏画": ("戯画",),
+    "竹子社": ("Atelier Kaguya", "アトリエかぐや"),
+    "蜂巢社": ("Alcot",),
+    "前翼社": ("FrontWing",),
+    "尼特罗": ("Nitro+",),
+}
+
+# 文件名的 [日期][会社][标签] 前缀与压缩包扩展名，宽松匹配时去掉
+_NAME_PREFIX_RE = re.compile(r'^(?:\s*\[[^\]]*\]\s*)+')
+_NAME_EXT_RE = re.compile(r'\.(?:zip|rar|7z|iso|exe|arc|tar|gz|bin|img)$', re.I)
+
+
+def _norm_game_name(name: str) -> str:
+    """去掉 [日期][会社][标签] 前缀、扩展名和空白，小写化，用于宽松比对。"""
+    name = _NAME_PREFIX_RE.sub("", name)
+    name = _NAME_EXT_RE.sub("", name)
+    return re.sub(r"\s+", "", name).lower()
+
+
+def _resolve_brand_entries(index: Dict, brand: str) -> List[Dict]:
+    """会社名解析：精确 → 忽略大小写 → 子串 → 中文昵称别名（别名再走前三步）。返回全部命中条目。"""
+    brands = index.get("brands", [])
+
+    def _lookup(name: str) -> List[Dict]:
+        exact = [b for b in brands if b["name"] == name]
+        if exact:
+            return exact
+        low = name.lower()
+        ci = [b for b in brands if b["name"].lower() == low]
+        if ci:
+            return ci
+        return [b for b in brands if low in b["name"].lower()]
+
+    hits = _lookup(brand)
+    if not hits:
+        for alias in _BRAND_ALIASES.get(brand.strip(), ()):
+            hits = _lookup(alias)
+            if hits:
+                break
+    return hits
+
+
+def _match_games(brand_entries: List[Dict], game: str) -> List[Tuple[str, Dict]]:
+    """游戏名匹配：精确文件名 → 去前缀/扩展名后精确 → 归一化子串 → LIKE 通配。
+    模型给的通常是「宿りし乙女の誓いと魔法」这种裸名，而文件叫
+    「[250725][ensemble][GPT] 宿りし乙女の誓いと魔法.zip」，只做精确匹配会白跑一轮。"""
+    all_games = [(b["name"], g) for b in brand_entries for g in b.get("games", [])]
+    exact = [(bn, g) for bn, g in all_games if g["name"] == game]
+    if exact:
+        return exact
+    key = _norm_game_name(game)
+    if not key:
+        return []
+    norm_exact = [(bn, g) for bn, g in all_games if _norm_game_name(g["name"]) == key]
+    if norm_exact:
+        return norm_exact
+    sub = [(bn, g) for bn, g in all_games if key in _norm_game_name(g["name"])]
+    if sub:
+        return sub
+    return [(bn, g) for bn, g in all_games if _match_like(g["name"], game)]
 
 
 def _match_like(name: str, pattern: str) -> bool:
@@ -324,10 +412,13 @@ def _match_like(name: str, pattern: str) -> bool:
 
 
 def _search_games(keyword: str, index: Dict) -> str:
+    # 昵称展开：search 音符社 → 同时按 ensemble 匹配；关键词命中游戏名或会社名都算
+    keywords = [keyword] + list(_BRAND_ALIASES.get(keyword.strip(), ()))
     matches: List[Tuple[str, Dict]] = []
     for brand in index.get("brands", []):
+        brand_hit = any(_match_like(brand["name"], kw) for kw in keywords)
         for game in brand.get("games", []):
-            if _match_like(game["name"], keyword):
+            if brand_hit or any(_match_like(game["name"], kw) for kw in keywords):
                 matches.append((brand["name"], game))
 
     if not matches:
@@ -362,32 +453,50 @@ def _format_recent_updates(index: Dict, top_n: int = 10) -> str:
 
 
 def _get_download_url(config, index: Dict, brand: str = "", game: str = "", path: str = "") -> str:
-    if path:
-        rel_path = path.replace("\\", "/")
-    elif brand and game:
-        brands = index.get("brands", [])
-        found = None
-        for b in brands:
-            if b["name"] == brand:
-                for g in b.get("games", []):
-                    if g["name"] == game:
-                        found = g
-                        break
-                break
-        if not found:
-            return f"未找到游戏「{game}」（会社: {brand}）"
-        rel_path = found["path"]
-    else:
-        return "请提供 会社名+游戏名 或直接提供游戏路径"
-
     base_url = getattr(config, "NAS_GAME_BASE_URL", "")
     if not base_url:
         return "NAS_GAME_BASE_URL 未配置，无法生成下载链接"
     base_url = base_url.rstrip("/")
-    rel_path = rel_path.lstrip("/")
 
-    download_url = f"{base_url}/{rel_path}"
-    return f"下载链接（请单独一行展示给用户）:\n{download_url}"
+    def _link(rel_path: str) -> str:
+        return f"{base_url}/{rel_path.replace(chr(92), '/').lstrip('/')}"
+
+    if path:
+        return f"下载链接（请单独一行展示给用户）:\n{_link(path)}"
+    if not (brand and game):
+        return "请提供 会社名+游戏名 或直接提供游戏路径"
+
+    brand_entries = _resolve_brand_entries(index, brand)
+    if not brand_entries:
+        return f"未找到会社「{brand}」，可用 search 按游戏名关键词直接搜（keyword 参数）"
+    matches = _match_games(brand_entries, game)
+    if not matches:
+        # 会社内没有：跨会社兜底一次，会社写错也不用再跑一轮
+        matches = _match_games(index.get("brands", []), game)
+    if not matches:
+        return (
+            f"未找到游戏「{game}」（会社: {brand}），"
+            "可用 list_games 查看该会社的完整文件名，或用 search 搜关键词"
+        )
+    seen = set()
+    uniq: List[Tuple[str, Dict]] = []
+    for bn, g in matches:
+        if g["path"] in seen:
+            continue
+        seen.add(g["path"])
+        uniq.append((bn, g))
+    if len(uniq) == 1:
+        return f"下载链接（请单独一行展示给用户）:\n{_link(uniq[0][1]['path'])}"
+    if len(uniq) <= 3:
+        # 同一游戏常有 原版/汉化/GPT 几个包，一次全给，省得再点一轮
+        lines = [f"匹配到 {len(uniq)} 个文件，下载链接（每个链接单独一行展示给用户）:"]
+        for bn, g in uniq:
+            lines.append(f"- [{bn}] {g['name']}\n  {_link(g['path'])}")
+        return "\n".join(lines)
+    lines = [f"「{game}」匹配到 {len(uniq)} 个文件，请用 path 参数指定其中一个:"]
+    for bn, g in uniq[:20]:
+        lines.append(f"- [{bn}] {g['name']}  path={g['path']}")
+    return "\n".join(lines)
 
 
 async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
@@ -472,11 +581,12 @@ schema = {
     "function": {
         "name": "nas_game_list",
         "description": (
-            "查询 NAS 上的 Galgame 合集目录。使用流程：\n"
-            "1. 先用 list_brands 查看有哪些会社（品牌/开发商）\n"
-            "2. 根据用户需求，用 list_games 查看某会社的游戏列表，或用 search 直接搜游戏\n"
-            "3. 用 get_download 获取下载链接，返回时将链接放在单独一行以便用户复制\n"
-            "不要虚构或猜测任何游戏信息，严格根据工具返回的数据回复。"
+            "查询 NAS 上的 Galgame 合集目录。用法：\n"
+            "- 找某个游戏：直接 search（keyword 写游戏名的一部分即可，日文/中文都行），结果自带 path，可直接用于 get_download\n"
+            "- 找某会社的作品：直接 list_games（brand 支持原名或常见中文昵称，如 音符社=ensemble、柚子社=ゆずソフト），"
+            "不必先 list_brands\n"
+            "- get_download 的 game 只写游戏名即可，不用带 [日期][会社] 前缀和扩展名；同名多个包会一次返回全部链接\n"
+            "- 返回链接时放在单独一行以便用户复制；不要虚构或猜测任何游戏信息，严格根据工具返回的数据回复。"
         ),
         "parameters": {
             "type": "object",
@@ -492,11 +602,11 @@ schema = {
                 },
                 "brand": {
                     "type": "string",
-                    "description": "会社名，用于 list_games 和 get_download",
+                    "description": "会社名，用于 list_games 和 get_download；支持原名或常见中文昵称（音符社/柚子社/八月社/键社/方糖社 等）",
                 },
                 "game": {
                     "type": "string",
-                    "description": "游戏名，用于 get_download（需配合 brand）",
+                    "description": "游戏名，用于 get_download（需配合 brand）；可只写名字本身，不需要 [日期][会社] 前缀和扩展名",
                 },
                 "keyword": {
                     "type": "string",

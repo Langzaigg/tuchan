@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional
 from nonebot.config import Config as NBConfig
 from pydantic import BaseModel, Extra
 from nonebot import get_driver
@@ -35,10 +35,59 @@ class Config(BaseModel, extra=Extra.ignore):
     """请求OpenAI的代理服务器（旧格式兼容，有 OPENAI_PROFILES 时可省略）"""
     OPENAI_BASE_URL: str = 'https://api.openai.com/v1'
     """请求OpenAI的基础URL（旧格式兼容，有 OPENAI_PROFILES 时可省略）"""
-    OPENAI_PROFILES: Dict[str, Dict[str, Any]] = {}
-    """多组 OpenAI 配置，每组包含 api_keys/base_url/proxy/timeout/model/extra_prompt 等"""
+    OPENAI_PROFILES: Dict[str, Any] = {}
+    """多组 OpenAI 配置：键=profile 名，值=模型配置 dict；另有 `default: <profile 名>` 作默认指针"""
     OPENAI_ACTIVE_PROFILE: str = ""
-    """当前激活的配置名；为空时使用第一个 profile"""
+    """（旧字段）默认配置名；现在优先读 OPENAI_PROFILES 的 `default` 指针，本字段仅作兼容回落"""
+
+    # ---- OPENAI_PROFILES 默认配置指针 ----
+    # OPENAI_PROFILES 的键是 profile 名，值有两种形态：
+    #   1. dict —— 真实模型配置（api_keys/base_url/model/...）；
+    #   2. str  —— 仅 DEFAULT_PROFILE_KEY 这一个键，值是**默认模型配置的名字**（指针）。
+    # 指针取代了过去「一个名叫 default 的独立模型配置」的写法：默认模型只维护一份，
+    # 想换默认就改指针的值。指针对 dict 形态的 `default`（老配置）保持兼容。
+    # ⚠️ 下面这些 helper 必须是 Config 的方法：各模块里 `config` 拿到的是 Config 实例
+    # （`from .config import config`），不是 config 模块，写成模块级函数调用会 AttributeError。
+    DEFAULT_PROFILE_KEY: ClassVar[str] = "default"
+    """OPENAI_PROFILES 内的默认指针键：值为真实 profile 名，指向默认使用的模型配置。"""
+
+    def get_profile_names(self) -> List[str]:
+        """全部真实 profile 名（跳过 default 指针这类非 dict 值）"""
+        return [name for name, value in (self.OPENAI_PROFILES or {}).items() if isinstance(value, dict)]
+
+    def get_default_profile_name(self) -> str:
+        """解析默认 profile 名：default 指针 → 旧字段 OPENAI_ACTIVE_PROFILE → 第一个真实 profile。
+
+        指针值无效（指向不存在的 profile，或指向自己）时自动往后回落，取不到返回空串。"""
+        names = self.get_profile_names()
+        pointer = (self.OPENAI_PROFILES or {}).get(self.DEFAULT_PROFILE_KEY)
+        if isinstance(pointer, str) and pointer in names:
+            return pointer
+        legacy = self.OPENAI_ACTIVE_PROFILE or ""
+        if legacy in names:
+            return legacy
+        return names[0] if names else ""
+
+    def resolve_profile_name(self, name: str = "") -> str:
+        """把会话里存的 profile 名解析成真实 profile 名。
+
+        空值 / 存的是指针键名（如历史数据里的 "default"）/ 配置已改名删名的旧名字，
+        一律回落到默认 profile。"""
+        names = self.get_profile_names()
+        candidate = str(name or "").strip()
+        if candidate in names:
+            return candidate
+        if candidate and candidate != self.DEFAULT_PROFILE_KEY:
+            logger.warning(f"profile '{candidate}' 不存在，回落到默认 profile")
+        return self.get_default_profile_name()
+
+    def get_profile(self, name: str = "") -> Dict[str, Any]:
+        """按名字取真实 profile 配置（指针名/失效名会自动解析）；无可用配置返回空 dict。
+
+        注意：返回值恒为 dict，调用方不需要再判断 OPENAI_PROFILES 里存的是不是指针。"""
+        value = (self.OPENAI_PROFILES or {}).get(self.resolve_profile_name(name))
+        return dict(value) if isinstance(value, dict) else {}
+
     REPLY_THROTTLE_TIME: int
     """回复间隔节流时间"""
     PRESETS: Dict[str, PresetConfig] = {}
@@ -158,13 +207,17 @@ class Config(BaseModel, extra=Extra.ignore):
 
     MULTIMODAL_ENABLE: bool
     """是否允许接收图片作为多模态输入"""
-    MULTIMODAL_MAX_MESSAGES_WITH_IMAGES: int
-    """最多保留几条消息中的图片"""
+    MULTIMODAL_MAX_IMAGES: int
+    """上下文中可见图片总数上限（触发消息自身图片不参与剥离）；超限按最旧优先剥离到一半（滞后回收，减少前缀缓存失效）"""
     MULTIMODAL_IMAGE_FRESH_MINUTES: int
-    """图片有效期（分钟），超过此时间的图片不再作为上下文"""
+    """图片有效期（分钟），统一适用于历史 / 群聊上下文 / 触发消息；过期判定按 30 分钟量化，整点和半点批量退场并重编号"""
 
     CONTEXT_BUFFER_SIZE: int
     """旧版非触发消息缓冲区大小（兼容字段；主路径窗口由 CONTEXT_WINDOW_SIZE 和 CONTEXT_COMPRESS_THRESHOLD_RATIO 计算）"""
+    CONTEXT_BUFFER_MAX_AGE_MINUTES: int
+    """非触发消息缓冲的时间衰减（分钟）：flush 时丢弃更早的条目，但至少保留 CONTEXT_BUFFER_MIN_LINES 条；0 表示不衰减"""
+    CONTEXT_BUFFER_MIN_LINES: int
+    """非触发消息缓冲时间衰减后至少保留的条数（保证话题连续性）"""
 
     TAVILY_API_KEY: List[str]
     """Tavily 搜索 API Key 列表，启动时自动选用额度剩余最多的 key"""
@@ -226,8 +279,8 @@ CONFIG_TEMPLATE = {
     "OPENAI_TIMEOUT": 60,   # OpenAI 请求超时时间（旧格式兼容）
     'OPENAI_PROXY_SERVER': '',  # 请求OpenAI的代理服务器（旧格式兼容）
     'OPENAI_BASE_URL': 'https://api.openai.com/v1',  # 请求OpenAI的基础URL（旧格式兼容）
-    'OPENAI_PROFILES': {},  # 多组 OpenAI 配置；为空时自动从旧格式扁平键创建 default profile
-    'OPENAI_ACTIVE_PROFILE': '',  # 当前激活的配置名；为空时使用第一个 profile
+    'OPENAI_PROFILES': {},  # 多组模型配置：键=profile 名，值=配置 dict；`default: <profile 名>` 为默认指针
+    'OPENAI_ACTIVE_PROFILE': '',  # （旧字段）默认配置名；已由 OPENAI_PROFILES 的 default 指针取代，仅兼容回落
     "REPLY_THROTTLE_TIME": 3,   # 回复间隔节流时间
     "PRESETS": {},
     "DEFAULT_PERSONA": "",
@@ -292,10 +345,12 @@ CONFIG_TEMPLATE = {
     'NG_ENABLE_AWAKE_IDENTITIES': True, # 是否允许自动唤醒其它人格
 
     'MULTIMODAL_ENABLE': True,
-    'MULTIMODAL_MAX_MESSAGES_WITH_IMAGES': 3,
-    'MULTIMODAL_IMAGE_FRESH_MINUTES': 120,
+    'MULTIMODAL_MAX_IMAGES': 8,  # 上下文可见图片总数上限，超限按最旧剥离到一半（滞后回收）
+    'MULTIMODAL_IMAGE_FRESH_MINUTES': 60,  # 图片统一有效期（分钟），按 30 分钟量化批量过期
 
     'CONTEXT_BUFFER_SIZE': 10,
+    'CONTEXT_BUFFER_MAX_AGE_MINUTES': 15,  # 非触发消息缓冲时间衰减（分钟）
+    'CONTEXT_BUFFER_MIN_LINES': 3,  # 时间衰减后至少保留的条数
 
     'TAVILY_API_KEY': [],
     'BOCHA_API_KEY': '',
@@ -428,10 +483,12 @@ def _load_config_obj_from_file()->Config:
                     "bot_self_introl": "你是一个自然参与群聊的聊天助手。回复要简短、直接、像真实人类一样。",
                 }
 
-            # 向后兼容：如果没有 OPENAI_PROFILES，从旧格式扁平键自动创建 default profile
+            # 向后兼容：如果没有 OPENAI_PROFILES，从旧格式扁平键自动创建 main profile，
+            # 并用 default 指针指向它（指针形态取代了过去名叫 default 的独立配置）
             if not config_obj_from_file.get("OPENAI_PROFILES"):
                 config_obj_from_file["OPENAI_PROFILES"] = {
-                    "default": {
+                    Config.DEFAULT_PROFILE_KEY: "main",
+                    "main": {
                         "api_keys": config_obj_from_file.get("OPENAI_API_KEYS", []),
                         "base_url": config_obj_from_file.get("OPENAI_BASE_URL", ""),
                         "proxy": config_obj_from_file.get("OPENAI_PROXY_SERVER", ""),
@@ -446,7 +503,7 @@ def _load_config_obj_from_file()->Config:
                         "presence_penalty": config_obj_from_file.get("CHAT_PRESENCE_PENALTY"),
                         "extra_prompt": "",
                         # 视觉工具：纯文本主模型可委托视觉模型理解图片（仅文档化默认值，读取处用 .get 兜底）
-                        "model_vision": "mimo",
+                        "model_vision": "deepseek-flash",
                         # 关闭思考：true 时响应规则注入 /no_think 指令（仅文档化默认值，读取处用 .get 兜底）
                         "no_think": False,
                         # 跨轮历史携带 reasoning_content：true 时持久化历史中的思考字段随请求发送
@@ -473,7 +530,7 @@ def _load_config_obj_from_file()->Config:
                         ),
                     },
                 }
-                config_obj_from_file["OPENAI_ACTIVE_PROFILE"] = "default"
+                config_obj_from_file["OPENAI_ACTIVE_PROFILE"] = ""  # 默认由 default 指针决定，旧字段留空
         except Exception as e:
             logger.error(f"Naturel GPT 配置文件读取失败，请检查配置文件填写是否符合yml文件格式规范，错误信息：{e}")
             raise e

@@ -15,7 +15,7 @@ def get_tool_schemas(config, chat_key: str = "") -> List[Dict[str, Any]]:
             from .chat_manager import ChatManager
             _chat = ChatManager.instance.get_or_create_chat(chat_key=chat_key)
             _prof_name = _chat.get_active_profile()
-            _chat_profile = config.OPENAI_PROFILES.get(_prof_name, {}) or {}
+            _chat_profile = config.get_profile(_prof_name)
         except Exception:
             _chat_profile = {}
 
