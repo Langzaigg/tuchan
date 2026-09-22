@@ -225,7 +225,8 @@ MULTIMODAL_IMAGE_FRESH_MINUTES: 60
 - 插件会读取 OneBot v11 `image` 消息段中的图片 URL。
 - 图片会作为 OpenAI-compatible 的 `image_url` 内容传给模型，并就地保留在发出它的那条消息里（含群聊上下文块），每轮原样重发以命中前缀缓存。
 - `MULTIMODAL_IMAGE_FRESH_MINUTES` 是统一有效期；过期按 30 分钟量化，整点和半点批量退场并重新编号，过期图片在文本中显示为 `[图片已过期]`。
-- `MULTIMODAL_MAX_IMAGES` 是上下文中可见图片总数上限，超限按最旧剥离到一半；触发消息自身的图片始终可见。
+- `MULTIMODAL_MAX_IMAGES` 是上下文中可见图片总数上限（默认 4），超限时只保留当前触发消息中的图片。
+- 别人的消息带出的图片另有条数上限：只取最近 2 条消息里的图（更早的不带；最近两条都没带图就不带），触发消息自身图片不受此限。
 - 模型看到的 `[图片N]` 是本次请求的显示编号，vision / anime_trace 工具按同一编号取图。
 
 注意：
@@ -327,7 +328,7 @@ BANGUMI_ACCESS_TOKEN: ''
 
 #### anime_trace
 
-用途：调用 AnimeTrace 开放 API 以图识角色，`image_index` 引用当前对话中的图片。依赖 `MULTIMODAL_ENABLE: true`，无需额外配置。
+用途：调用 AnimeTrace 开放 API 以图识角色，`image_index` 引用当前对话中的图片。依赖 `MULTIMODAL_ENABLE: true`，无需额外配置。提交前会用 `image_cache.shrink_data_uri()` 把图压到接口的单字段上限（1024KB）以内（AnimeTrace 走 multipart，超限会报 `Part exceeded maximum size of 1024KB.`）。
 
 #### generate_anima_image（anima_generate.py）
 

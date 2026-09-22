@@ -208,7 +208,7 @@ class Config(BaseModel, extra=Extra.ignore):
     MULTIMODAL_ENABLE: bool
     """是否允许接收图片作为多模态输入"""
     MULTIMODAL_MAX_IMAGES: int
-    """上下文中可见图片总数上限（触发消息自身图片不参与剥离）；超限按最旧优先剥离到一半（滞后回收，减少前缀缓存失效）"""
+    """上下文中可见图片总数上限；超限时只保留当前触发消息中的图片（历史图全部回收，触发图按最旧优先裁到上限）"""
     MULTIMODAL_IMAGE_FRESH_MINUTES: int
     """图片有效期（分钟），统一适用于历史 / 群聊上下文 / 触发消息；过期判定按 30 分钟量化，整点和半点批量退场并重编号"""
 
@@ -345,7 +345,7 @@ CONFIG_TEMPLATE = {
     'NG_ENABLE_AWAKE_IDENTITIES': True, # 是否允许自动唤醒其它人格
 
     'MULTIMODAL_ENABLE': True,
-    'MULTIMODAL_MAX_IMAGES': 8,  # 上下文可见图片总数上限，超限按最旧剥离到一半（滞后回收）
+    'MULTIMODAL_MAX_IMAGES': 4,  # 可见图片总数上限，超限时只保留当前触发消息中的图片（历史图全部回收）
     'MULTIMODAL_IMAGE_FRESH_MINUTES': 60,  # 图片统一有效期（分钟），按 30 分钟量化批量过期
 
     'CONTEXT_BUFFER_SIZE': 10,

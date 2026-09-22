@@ -36,6 +36,106 @@ _CURRENT_VISION_CONFIG: ContextVar[Optional[Dict[str, Any]]] = ContextVar("natur
 # 进程级兜底会话 ID：chat_key 不可用时（如启动期健康检查）保持本进程内稳定
 _OPENCODE_FALLBACK_SESSION = uuid.uuid4().hex
 
+_USER_AGENT = "ATRI-NaturelGPT/1.0 (QQ chatbot)"
+
+
+def _build_provider_headers(base_url: str) -> Dict[str, str]:
+    """构造 provider 专属请求头。
+
+    1) **恒定带自定义 User-Agent**：httpx 默认 UA（`python-httpx/x.y`）会被部分网关的 WAF
+       直接 403 —— 实测 `api.commandcode.ai`（Cloudflare）返回 `error code: 1010`，
+       换成任意自定义 UA 即放行。对标准 OpenAI-compatible 接口无副作用。
+    2) **opencode.ai（Console Go）** 额外要求每个对话带稳定 `x-opencode-session` 头
+       （https://opencode.ai/docs/go/）：会话 ID 由 chat_key 确定性派生（md5），
+       同一群聊跨重启稳定，利于服务端路由与提示缓存；无 chat_key 用进程级 uuid 兜底。
+       其他 provider 不加这个头（当前生产配置已不再使用 opencode，逻辑保留备用）。
+    """
+    headers: Dict[str, str] = {"User-Agent": _USER_AGENT}
+    try:
+        host = urlsplit(base_url).netloc.lower()
+    except Exception:
+        return headers
+    if "opencode.ai" not in host:
+        return headers
+    chat_key = _CURRENT_CHAT_KEY.get()
+    if chat_key:
+        session_id = hashlib.md5(chat_key.encode("utf-8")).hexdigest()[:24]
+    else:
+        session_id = _OPENCODE_FALLBACK_SESSION
+    headers["x-opencode-session"] = f"atri-{session_id}"
+    return headers
+
+
+# ---- 上游瞬时故障（值得原样重发同一轮）----
+# 网关 5xx / Cloudflare Worker 资源超限 / 连接被断开等：provider 侧抖动，与请求内容无关。
+# 实测 api.commandcode.ai 会返回 503 "Worker exceeded resource limits | Cloudflare" 整页 HTML。
+_TRANSIENT_UPSTREAM_STATUS_MARKERS = (
+    "http 500", "http 502", "http 503", "http 504", "http 505",
+    "http 520", "http 521", "http 522", "http 523", "http 524",
+    "http 525", "http 526", "http 527", "http 530",
+)
+_TRANSIENT_UPSTREAM_TEXT_MARKERS = (
+    "worker exceeded resource limits",
+    "internal server error",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "gateway time-out",
+    "server disconnected without sending a response",  # httpx RemoteProtocolError
+    "connection reset",
+    "connection aborted",
+    "temporarily unavailable",
+    "readtimeout",
+    "connecttimeout",
+    "connecterror",
+    "overloaded",
+)
+# 同一轮请求的瞬时错误重试退避（共 len() 次）：先等一下看是否抖过去，第二次拉长到 5s
+_TRANSIENT_RETRY_DELAYS = (1.5, 5.0)
+
+# 内容审查拦截的降级阶梯（见 stream_response 的 except 分支）：
+#   ① 保留图片，改走**本群 profile 的 `model_mini`（摘要模型）**重试本轮——审查按上游/路由生效，
+#      mini 模型通常落在另一条通道上，换过去就有机会放行（不写死模型名，随各群 profile 走）；
+#   ② 图片被拦且仍不放行 → 剥离图片、**换回原模型**再试一次；
+#   ③ 仍被拦 → 放弃（matcher 侧只落 error log + 控制台，不入群、不清上下文）。
+
+# 内容审查拦截特征：阿里云 DashScope/百炼 的内容合规（DataInspectionFailed），
+# 聚合网关把请求路由到阿里系模型时会出现；OpenAI 系叫 content_filter / flagged。
+_CONTENT_REVIEW_MARKERS = (
+    "data_inspection_failed",
+    "datainspectionfailed",
+    "inappropriate content",
+    "content_filter",
+    "content filter",
+    "flagged",
+    "content_policy",
+)
+
+
+def is_content_review_error(text: Optional[str]) -> bool:
+    """是否为上游内容审查拦截（非请求参数问题，重发仍可能通过）。"""
+    if not text:
+        return False
+    lower_text = str(text).lower()
+    return any(marker in lower_text for marker in _CONTENT_REVIEW_MARKERS)
+
+
+def is_transient_upstream_error(text: Optional[str]) -> bool:
+    """判断是否为上游瞬时故障（值得原样重发同一轮请求）。
+
+    刻意与另外两类错开：① key 级错误（401/402/403/429）——换 key 才有意义；
+    ② 请求本身的问题（400 参数错、上下文超限、图片被拒）——重试只会再失败一次。
+    整体超时（"流式响应超过总时间上限"）也不算：那说明模型确实慢，重试等于再等一遍。
+    """
+    if not text:
+        return False
+    if "总时间上限" in text:
+        return False
+    lower_text = str(text).lower()
+    if any(marker in lower_text for marker in _TRANSIENT_UPSTREAM_STATUS_MARKERS):
+        return True
+    return any(marker in lower_text for marker in _TRANSIENT_UPSTREAM_TEXT_MARKERS)
+
 # ---- 多 API Key 轮换策略 ----
 # 铁律：恒定从**第一顺位 key** 开始用。只有当失败明确归因于该 key 自身（鉴权失败 / 额度耗尽 /
 # 限流）时才顺延到下一个 key，并把失败的 key 打进冷却；冷却到期自动回到第一顺位。
@@ -61,29 +161,6 @@ def _is_key_level_error(err_text: Optional[str]) -> bool:
     if any(code in text for code in _KEY_ERROR_STATUS_CODES):
         return True
     return any(marker in text for marker in _KEY_ERROR_MARKERS)
-
-
-def _build_provider_headers(base_url: str) -> Dict[str, str]:
-    """Console Go（opencode.ai）要求客户端每个对话带稳定 x-opencode-session 头，
-    并用自定义 User-Agent 标识客户端（https://opencode.ai/docs/go/）。
-    会话 ID 由 chat_key 确定性派生（md5），同一群聊跨重启稳定，利于服务端路由与提示缓存。
-    其他 provider 返回空 dict，不加任何额外头。
-    """
-    headers: Dict[str, str] = {}
-    try:
-        host = urlsplit(base_url).netloc.lower()
-    except Exception:
-        return headers
-    if "opencode.ai" not in host:
-        return headers
-    headers["User-Agent"] = "ATRI-NaturelGPT/1.0 (QQ chatbot)"
-    chat_key = _CURRENT_CHAT_KEY.get()
-    if chat_key:
-        session_id = hashlib.md5(chat_key.encode("utf-8")).hexdigest()[:24]
-    else:
-        session_id = _OPENCODE_FALLBACK_SESSION
-    headers["x-opencode-session"] = f"atri-{session_id}"
-    return headers
 
 
 _TOTAL_TOOL_LIMIT_TEXT = f"工具调用次数已达上限（{MAX_TOTAL_TOOL_CALLS}次）。停止继续调用工具，基于已有工具结果直接回答当前用户。"
@@ -305,6 +382,47 @@ def sanitize_draw_reply_text(content: str, allow_task_ids: bool = True) -> str:
     content = _clean_placeholder_echo(content)
     content = sanitize_internal_control_text(content)
     return content.strip()
+
+
+# ---- 群聊回复的 Markdown 后处理 ----
+# 规则层只写「不用 Markdown」压不住部分模型（尤其代码向模型爱出加粗清单），
+# 在发送/落库收口处统一把 Markdown 语法降级为纯文本；ENABLE_MSG_TO_IMG 时不调用（该模式允许 Markdown）。
+_MD_BOLD_RE = re.compile(r'\*\*(.+?)\*\*|__(.+?)__', re.S)
+_MD_HEADER_RE = re.compile(r'^\s{0,3}#{1,6}\s+', re.M)
+_MD_BULLET_RE = re.compile(r'^\s*[-*+]\s+', re.M)  # 要求标记后有空白，"-40度"、"——" 不受影响
+_MD_NUMBERED_RE = re.compile(r'^\s*\d{1,2}[.、)]\s+', re.M)  # 要求数字+分隔符后有空白，"1.5"、"2026.9" 不受影响
+_MD_INLINE_CODE_RE = re.compile(r'`([^`\n]+?)`')
+_MD_QUOTE_RE = re.compile(r'^\s{0,3}>\s?', re.M)
+
+
+def strip_chat_markdown(content: str) -> str:
+    """把回复文本中的 Markdown 语法降级为纯文本（加粗/斜体标记、标题、清单符号、行内代码反引号、引用符）。
+    只去语法不去内容；用于群聊纯文本发送路径，保证模型偶发的清单体/加粗不原样进群。"""
+    if not content:
+        return content
+    content = _MD_BOLD_RE.sub(lambda m: m.group(1) or m.group(2) or "", content)
+    content = _MD_HEADER_RE.sub("", content)
+    content = _MD_BULLET_RE.sub("", content)
+    content = _MD_NUMBERED_RE.sub("", content)
+    content = _MD_INLINE_CODE_RE.sub(lambda m: m.group(1), content)
+    content = _MD_QUOTE_RE.sub("", content)
+    return content
+
+
+def build_mailbox_notice(count: int, reply_completed: bool) -> str:
+    """循环邮箱插入新消息时的 ephemeral 提醒（不落历史）。
+    点名要求「在句子里自然称呼对方」：若写成「开头点名对象」，模型会执行成「名字：」前缀的
+    聊天记录格式（历史消息本就是 [HH:MM] 名字: 内容 样式，模型有样学样）。提取为模块级函数便于离线测试复用。"""
+    if reply_completed:
+        return (
+            f"[新消息提醒] 你上一条回复之后新到 {count} 条消息，见下一条。"
+            "请逐条分别回应：每条各自成段，在句子里自然称呼对方来表明在回应谁（不要用「名字：」开头）；"
+            "不要把不同人的话题并进同一句；与新消息无关的旧上下文不要牵扯。"
+        )
+    return (
+        "[新消息提醒] 你上一条消息的回复尚未完成，请先完成它并单独成段；"
+        f"之后对下一条中的 {count} 条新消息逐条分别回应，每条各自成段，在句子里自然称呼对方（不要用「名字：」开头）。"
+    )
 
 enc_cache: Dict[str, Encoding] = {}
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -536,7 +654,7 @@ class TextGenerator(Singleton["TextGenerator"]):
         self.config = {
             "model": profile.get("model", ""),
             "model_mini": profile.get("model_mini", ""),
-            "max_tokens": profile.get("max_tokens", 4096),
+            "max_tokens": profile.get("max_tokens"),
             "temperature": profile.get("temperature"),
             "top_p": profile.get("top_p"),
             "frequency_penalty": profile.get("frequency_penalty"),
@@ -609,7 +727,7 @@ class TextGenerator(Singleton["TextGenerator"]):
             request_config = {
                 "model": profile.get("model", ""),
                 "model_mini": profile.get("model_mini", ""),
-                "max_tokens": profile.get("max_tokens", 4096),
+                "max_tokens": profile.get("max_tokens"),
                 "temperature": profile.get("temperature"),
                 "top_p": profile.get("top_p"),
                 "frequency_penalty": profile.get("frequency_penalty"),
@@ -722,7 +840,12 @@ class TextGenerator(Singleton["TextGenerator"]):
             "api_key": state.get("api_key", ""),
         }
         if type not in {"summarize", "impression"}:
-            kwargs["max_tokens"] = request_config.get("max_tokens", 1024)
+            # max_tokens 只在 profile 显式配置时才发：思考类模型会把额度耗在思考上（reasoning 也计入），
+            # 一旦撞上限就 finish_reason=length、content 为空/半截，表现为「莫名不回复」。
+            # 不配就交给 provider 自己的默认上限，不要在这里兜底一个 1024/4096。
+            max_tokens = request_config.get("max_tokens")
+            if max_tokens:
+                kwargs["max_tokens"] = max_tokens
         for optional_key in ("temperature", "top_p", "frequency_penalty", "presence_penalty"):
             value = request_config.get(optional_key)
             if value is not None:
@@ -1149,6 +1272,15 @@ class TextGenerator(Singleton["TextGenerator"]):
         _round_limit_injected = False  # 轮数上限提示是否已注入（同一最后一轮内的各种 continue 重试不重复追加）
         _markup_leak_retries = 0  # 正文泄漏工具调用标记（DSML/XML）后的重试次数（≤1）
         _drop_tools_this_round = False  # 泄漏重试轮：整段去掉 tools（一次性标志，读取后即清零）
+        _transient_retries = 0  # 上游瞬时故障（5xx/连接断开）已重试次数，上限 len(_TRANSIENT_RETRY_DELAYS)
+        # 上游内容审查拦截：阶梯用尽后置 True，本轮不再重试（同时给下面的「疑似 ctx 错误 → 剥图
+        # 重试」分支加闸，避免白折腾一次）
+        _content_review_blocked = False
+        _review_model_switched = False  # 审查阶梯是否已用过「① 保留图片 + 换 model_mini」这一步
+        _review_original_model = ""  # 审查发生前的原模型名（② 剥图后换回它重试）
+        # 本轮是否已产生对外副作用（已流出文字 / 已执行工具 / 已落库）：有副作用就不能重试本轮，
+        # 否则重复发消息、重复跑画图。用 dict 存放，嵌套函数里无需 nonlocal 声明即可置位。
+        _round_fx = {"text": False, "tools": False}
 
         # 检测用户消息中是否包含画图相关关键词
         _DRAWING_KEYWORDS = ("画", "draw", "改图", "重画", "来一张", "整一张")
@@ -1170,8 +1302,11 @@ class TextGenerator(Singleton["TextGenerator"]):
             # danbooru_search 只服务于画图时的作画标签确定，随画图工具一起进出，避免闲聊轮白占工具位
             tool_schemas = [s for s in tool_schemas if s.get("function", {}).get("name") not in _DRAW_ONLY_TOOLS]
         # force 模式 + 画图关键词：尾部注入强制画图提示（不用 tool_choice——主流 provider
-        # 在思考模式下均不兼容强制指定，会 400；提示词强制 + matcher 伪造编号拦截兜底）
-        _force_draw_request = (_draw_mode == "force" and _has_draw_request)
+        # 在思考模式下均不兼容强制指定，会 400；提示词强制 + matcher 伪造编号拦截兜底）。
+        # 仅限 type == "chat"：摘要/印象也走本函数（chat_summary.get_response），它们不带 tools，
+        # 注入画图提示纯属污染 prompt 白烧 token。且 request_chat_key 是实例态（上一次群聊留下的
+        # key），后台任务会顺带继承那个群的 force 模式——曾在 force 群连刷多行同类日志。
+        _force_draw_request = (type == "chat" and _draw_mode == "force" and _has_draw_request)
 
         _image_stripped = False  # 工具调用后续轮是否已剥离图片
 
@@ -1192,6 +1327,7 @@ class TextGenerator(Singleton["TextGenerator"]):
             nonlocal _entries_for_next_reply
             if not merged_text or not merged_text.strip():
                 return
+            _round_fx["text"] = True  # 已落库 → 本轮不可再重试
             _all_reply_texts.append(merged_text)
             if on_reply_complete:
                 await on_reply_complete(merged_text, list(tool_messages), list(_entries_for_next_reply) or None)
@@ -1245,20 +1381,9 @@ class TextGenerator(Singleton["TextGenerator"]):
                 messages.append(assistant_reply)
             count = len(entries)
             # 未处理标记（ephemeral system：不落历史、不进 tool_messages、不进返回的 tool_messages 列表）。
-            # 要求逐条分别回应、各自成段、点名对象——多条新消息合并为下一条 user 消息，
+            # 要求逐条分别回应、各自成段、句中自然称呼点名——多条新消息合并为下一条 user 消息，
             # 避免"一并回应"把不同人的话题揉进一段。
-            if reply_completed:
-                notice = (
-                    f"[新消息提醒] 你上一条回复之后新到 {count} 条消息，见下一条。"
-                    "请逐条分别回应：每条各自成段、开头点名对象，不要把不同人的话题并进同一句；"
-                    "与新消息无关的旧上下文不要牵扯。"
-                )
-            else:
-                notice = (
-                    "[新消息提醒] 你上一条消息的回复尚未完成，请先完成它并单独成段；"
-                    f"之后对下一条中的 {count} 条新消息逐条分别回应，每条各自成段、开头点名对象。"
-                )
-            messages.append({"role": "system", "content": notice})
+            messages.append({"role": "system", "content": build_mailbox_notice(count, reply_completed)})
             multimodal_enabled = bool(getattr(plugin_config, "MULTIMODAL_ENABLE", True)) if plugin_config else True
             # 整批合并为一条 user 消息；图片编号从当前 messages 最大 [图片N] 续编，并入可见图片表
             img_index = _next_image_index(messages)
@@ -1319,7 +1444,10 @@ class TextGenerator(Singleton["TextGenerator"]):
                     _tail_msg = messages[-1] if messages else {}
                     if not (_tail_msg.get("role") == "assistant" and _tail_msg.get("tool_calls")):
                         messages.append({"role": "system", "content": _FORCE_DRAW_HINT_TEXT})
-                        logger.info("force 模式：已在尾部注入强制画图提示（不使用 tool_choice）")
+                        logger.info(
+                            f"force 模式：已在尾部注入强制画图提示（不使用 tool_choice） | "
+                            f"type={type} | 会话: {request_chat_key or 'unknown'}"
+                        )
 
                 # 最后一轮 tools 数组保持全量不变，改传 tool_choice="none" 强制模型直接回复（保住缓存前缀）；
                 # 终端阶段（_allow_terminal_tools）同样保持全量 tools，非终端调用在执行侧过滤
@@ -1393,6 +1521,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                     safe_text = sanitize_internal_control_text("".join(control_stream_buf))
                     safe_text = sanitize_draw_reply_text(safe_text, allow_task_ids=has_anima_call)
                     if safe_text:
+                        _round_fx["text"] = True  # 已流出文字 → 本轮不可再重试
                         await on_text(safe_text)
 
                 async def _handle_markup_leak(round_text: str) -> Optional[str]:
@@ -1419,9 +1548,27 @@ class TextGenerator(Singleton["TextGenerator"]):
                     logger.warning(f"[工具标记泄漏] 重试后仍泄漏，已剥离标记按文本收尾: {round_text[:120]!r}")
                     return stripped
 
+                # 每轮请求前重置副作用标记：本轮一旦流出去文字或跑过工具，瞬时错误就不再重试
+                _round_fx["text"] = False
+                _round_fx["tools"] = False
+                # 流式回调包一层：文字一旦真正转发出去就置位（决定这一轮能不能安全重发）。
+                # 内部控制轮走的是缓冲回调（还没对外发），不算副作用。
+                _track_text_output = effective_on_text is round_on_text
+                if effective_on_text:
+                    _inner_stream_on_text = effective_on_text
+
+                    async def _tracked_stream_on_text(chunk: str) -> None:
+                        if _track_text_output:
+                            _round_fx["text"] = True
+                        await _inner_stream_on_text(chunk)
+
+                    _stream_on_text = _tracked_stream_on_text
+                else:
+                    _stream_on_text = None
+
                 if (request_state.get("config") or {}).get("enable_stream", True):
                     content, tool_calls, reasoning_content = await self._stream_once(
-                        messages, type, current_tools, effective_on_text, round_on_reasoning, request_state, on_tool_call, tool_choice=round_tool_choice
+                        messages, type, current_tools, _stream_on_text, round_on_reasoning, request_state, on_tool_call, tool_choice=round_tool_choice
                     )
                     # 过滤参数 JSON 不完整的 tool_calls（流式截断导致），让模型重试
                     if tool_calls:
@@ -1694,6 +1841,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                 self._current_chat_key = request_chat_key
                 self._current_trigger_userid = request_trigger_userid
                 await self._execute_tool_calls(messages, tool_calls, plugin_config)
+                _round_fx["tools"] = True  # 工具已执行（画图等有副作用）→ 本轮不可再重试
                 # 收集tool消息
                 for msg in messages:
                     if msg.get("role") == "tool" and msg not in tool_messages:
@@ -1733,7 +1881,63 @@ class TextGenerator(Singleton["TextGenerator"]):
                 # 工具轮边界：批量插入循环邮箱中的新触发消息（回复未完成版标记；终端阶段内部跳过）
                 await _insert_mailbox_entries(reply_completed=False)
             except Exception as e:
-                err_text = str(e).lower()
+                # ⚠️ 必须带上异常类名：httpx 的 ConnectError('') / ReadTimeout('') / ConnectTimeout('')
+                # 的 str(e) 是**空串**（日志里看到的是 repr，含类名），只用 str(e) 会让所有
+                # 基于错误文本的分类（瞬时故障、key 级、上下文超限…）全部落空——实测 ConnectError
+                # 就是这么漏过重试的。统一拼成 "connecterror: " 这种形式再判定。
+                # ⚠️ 这里只能用 `e.__class__.__name__`：本函数形参就叫 `type`（type: str = "chat"），
+                # 函数体内 `type` 是那个字符串，写 `type(e)` 会直接 TypeError 把整个请求打挂。
+                err_text = f"{e.__class__.__name__}: {e}".lower()
+                # 上游内容审查拦截（阿里系 DataInspectionFailed；实测走聚合网关时会被路由到阿里系模型上）。
+                # 处置阶梯（保留原有可重试前提：本轮还没流出文字、没执行过工具）：
+                #   ① **保留图片**，改走本群 profile 的 `model_mini`（摘要模型）重试本轮 —— 换条上游通道；
+                #   ② 图片被拦且仍不放行 → **剥离图片 + 换回原模型**重试本轮；
+                #   ③ 仍被拦 → 放弃：不再重试，按失败上报（matcher 只落 error log + 控制台，不入群、不清上下文）。
+                # 三步都用完不会回环：`_review_model_switched` / `_image_stripped` 各自只置位一次。
+                if is_content_review_error(err_text) and not _round_fx["text"] and not _round_fx["tools"]:
+                    _is_image_block = "image data" in err_text
+                    _cfg = request_state.get("config") if isinstance(request_state.get("config"), dict) else {}
+                    _cur_model = _cfg.get("model") or ""
+                    if not _review_original_model:
+                        _review_original_model = _cur_model
+                    _mini_model = _cfg.get("model_mini") or ""
+                    # ① 保留图片，换本群摘要模型（model_mini）重试本轮
+                    if not _review_model_switched and _mini_model and _mini_model != _cur_model:
+                        _review_model_switched = True
+                        _cfg["model"] = _mini_model
+                        logger.warning(
+                            f"请求被上游内容审查拦截，本轮改用摘要模型 {_mini_model} 重试"
+                            f"（保留图片，原模型 {_cur_model}）: {str(e)[:160]}"
+                        )
+                        continue
+                    # ② 图片被拦：剥离图片并换回原模型重试（messages 里确实有图才走这一步）
+                    _has_img_in_msgs = any(
+                        isinstance(_m.get("content"), list)
+                        and any(isinstance(c, dict) and c.get("type") == "image_url" for c in _m["content"])
+                        for _m in messages
+                    )
+                    if _is_image_block and _has_img_in_msgs and not _image_stripped:
+                        _image_stripped = True
+                        _stripped_msgs = 0
+                        for _m in messages:
+                            if isinstance(_m.get("content"), list):
+                                _texts = [
+                                    c.get("text", "") for c in _m["content"]
+                                    if isinstance(c, dict) and c.get("type") == "text"
+                                ]
+                                if any(isinstance(c, dict) and c.get("type") == "image_url" for c in _m["content"]):
+                                    _stripped_msgs += 1
+                                    _m["content"] = "\n".join(_texts) if _texts else "[图片已省略]"
+                        if _review_original_model and _cur_model != _review_original_model:
+                            _cfg["model"] = _review_original_model
+                        logger.warning(
+                            f"图片审查未放行，已剥离 {_stripped_msgs} 条消息中的图片，"
+                            f"换回原模型（{_review_original_model or _cur_model}）重试本轮: {str(e)[:160]}"
+                        )
+                        continue
+                    # ③ 阶梯用尽：按失败上报（不重试、不入群、不清理上下文）
+                    _content_review_blocked = True
+                    logger.warning(f"内容审查拦截未化解，按失败上报（不重试、不在群里提示）: {str(e)[:200]}")
                 # keep_reasoning=true 但 provider 不接受 reasoning_content（400）：
                 # 剥离全部 reasoning 后重试一次
                 if (
@@ -1768,7 +1972,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                     or "status code: 400" in err_text
                     or "bad request" in err_text
                 )
-                if is_ctx_error and round_idx > 0 and not _image_stripped:
+                if is_ctx_error and round_idx > 0 and not _image_stripped and not _content_review_blocked:
                     _image_stripped = True
                     for m in messages:
                         if isinstance(m.get("content"), list):
@@ -1777,6 +1981,26 @@ class TextGenerator(Singleton["TextGenerator"]):
                     logger.warning(f"工具轮请求失败，已剥离图片并重试: {e!r}")
                     continue
                 logger.warning(f"LLM 请求失败: {e!r}")
+                # 上游瞬时故障（网关 5xx / Cloudflare Worker 资源超限 / 连接被断开）：provider 侧抖动，
+                # 同一轮原样重发即可（messages 未被改动，工具与文本都还没产出）。
+                # 退避 1.5s → 5s；**本轮一旦已有副作用（文字已流出 / 工具已执行 / 已落库）就不重试**，
+                # 否则会重复发消息、重复跑画图。用完次数仍失败才按常规错误上报。
+                if (
+                    is_transient_upstream_error(err_text)
+                    and _transient_retries < len(_TRANSIENT_RETRY_DELAYS)
+                    and not _round_fx["text"]
+                    and not _round_fx["tools"]
+                ):
+                    _delay = _TRANSIENT_RETRY_DELAYS[_transient_retries]
+                    _transient_retries += 1
+                    logger.warning(
+                        f"上游瞬时错误（网关 5xx/资源超限/连接断开），{_delay:.1f}s 后重试本轮"
+                        f"（{_transient_retries}/{len(_TRANSIENT_RETRY_DELAYS)}）: {str(e)[:160]}"
+                    )
+                    await asyncio.sleep(_delay)
+                    # 等待时间不计入工具循环耗时预算（那是 provider 抖动，不是我们磨蹭）
+                    loop_start += _delay
+                    continue
                 # key 级失败（鉴权 401/403、额度 402、限流 429 …）：把失败的 key 打进冷却，
                 # 并在本次请求内顺延到下一个 key 重试——第一顺位优先，全部试过才放弃。
                 # 其他错误（400 参数、超时、上下文超限、图片被拒）与 key 无关，换 key 也救不回来，

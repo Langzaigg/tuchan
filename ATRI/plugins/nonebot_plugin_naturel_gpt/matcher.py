@@ -24,8 +24,10 @@ from .chat_manager import ChatManager
 from .openai_func import (
     TextGenerator,
     is_model_request_error_text,
+    is_content_review_error,
     sanitize_draw_reply_text,
     sanitize_internal_control_text,
+    strip_chat_markdown,
     contains_tool_call_xml,
     strip_tool_call_xml,
 )
@@ -588,6 +590,11 @@ def _is_probably_image_bad_request(text: Optional[str]) -> bool:
 
 
 def _is_image_download_error(text: Optional[str]) -> bool:
+    """provider 拉不到图 / 收到的图它不认（格式不受支持）。
+
+    后半类（unsupported image）走同一条兜底链路：先把直传 URL 标记为不可用并转 base64
+    （转完会经 image_cache 规范化成 JPEG/PNG/GIF/WEBP），仍失败再剥图重试，
+    否则整条请求会以 400 直接失败、用户什么回复都收不到。"""
     if not text:
         return False
     lower_text = text.lower()
@@ -596,6 +603,10 @@ def _is_image_download_error(text: Optional[str]) -> bool:
         or "cannot download image" in lower_text
         or "text` is not set" in lower_text  # Xiaomi proxy 图片处理失败
         or "download url data" in lower_text
+        or "unsupported image" in lower_text
+        or "not a valid image" in lower_text
+        or "does not represent a valid image" in lower_text
+        or "unsupported media type" in lower_text
     )
 
 
@@ -848,12 +859,25 @@ def _save_error_log(chat_key: str, prompt: List[Dict[str, Any]], response: str,
         logger.warning(f"保存 error 日志失败: {e!r}")
 
 
+# 思考标签：正常形态是 <think>…</think> 成对出现（此前的实现只认这一种）。但部分模型/网关会把
+# 思考合并进 content 且只留下**孤立标签**——实测 Kimi-K3 经聚合网关回复里蹦出一个孤立的 </think>，
+# 且真实正文在标签两侧（"…行，给你画。</think>画好了。…"），成对正则匹配不到，标签就原样发进群。
+# 故另备一条孤立标签正则：**只删标签本身、保留前后正文**（不能把闭标签前的内容当思考丢掉，那是真回复）。
+_THINK_PAIR_RE = re.compile(r'<\s*(?:think|thinking)\s*>([\s\S]*?)<\s*/\s*(?:think|thinking)\s*>', re.I)
+_THINK_TAG_RE = re.compile(r'<\s*/?\s*(?:think|thinking)\s*>', re.I)
+
+
 def _strip_think_tags(text: str) -> Tuple[str, str]:
-    """提取 <think>...</think> 内容作为思考内容，返回 (清理后文本, 思考内容)"""
-    import re
-    thinks = re.findall(r'<think>([\s\S]*?)</think>', text)
-    cleaned = re.sub(r'<think>[\s\S]*?</think>', '', text).strip()
-    reasoning = "\n".join(thinks).strip() if thinks else ""
+    """提取 <think>...</think> 内容作为思考内容，返回 (清理后文本, 思考内容)。
+
+    成对块的内容计入 reasoning；**孤立的开/闭标签只从正文里剔除、不计入思考内容**。
+    所有对外发送与落库的文本都会经这里（`send_segment` / `_on_reply_complete` / 非流式路径），
+    所以这里是思考标签唯一的兜底关口。"""
+    if not text:
+        return "", ""
+    thinks = [m.group(1) for m in _THINK_PAIR_RE.finditer(text)]
+    cleaned = _THINK_TAG_RE.sub('', _THINK_PAIR_RE.sub('', text)).strip()
+    reasoning = "\n".join(t.strip() for t in thinks).strip() if thinks else ""
     return cleaned, reasoning
 
 
@@ -1015,7 +1039,8 @@ async def do_msg_response(
                     return
 
             # 唤醒词检测（支持当前激活角色名，仅在句首出现时无条件唤醒）
-            text_head = incoming_text.lower().lstrip()
+            # 多模态消息会把图片编成 [图片N] 插在文本前（如 [图片1][图片2]兔酱…），剥掉占位后再判句首
+            text_head = _IMG_MARKER_RE.sub("", incoming_text).lower().lstrip()
             wake_prefix = False
             if chat.preset_key.lower() and text_head.startswith(chat.preset_key.lower()):
                 wake_prefix = True
@@ -1289,6 +1314,28 @@ async def do_msg_response(
     _manga_replies_checked = 0
     _manga_tool_dirty = False
 
+    # 近期上下文中的发送者昵称集合：用于剥离回复开头的「名字：」说话人前缀
+    _speaker_names: Set[str] = set()
+    try:
+        for _item in (chat.chat_preset.prompt_messages or [])[-30:]:
+            _s = (getattr(_item, "sender", "") or "").strip()
+            if _s:
+                _speaker_names.add(_s)
+    except Exception:
+        pass
+
+    def _strip_speaker_prefix(text: str) -> str:
+        """剥离回复开头的「名字：」说话人前缀（模型模仿聊天记录 [HH:MM] 名字: 内容 格式的产物）。
+        仅当前缀与近期发送者昵称互为子串（≥2 字）时剥离，避免误伤正常的冒号句。"""
+        m = re.match(r'^\s*([^\s：:，,。.、!！?？（）()【】\[\]]{2,16})[：:]\s*(\S.*)$', text, re.S)
+        if not m:
+            return text
+        name = m.group(1)
+        for s in _speaker_names:
+            if name in s or (len(s) >= 2 and s in name):
+                return m.group(2).strip()
+        return text
+
     async def _on_tool_call(tool_calls: List[Dict[str, Any]]) -> None:
         nonlocal _tool_called, _manga_tool_dirty, sent_segments, _tool_rounds
         _tool_called = True
@@ -1333,6 +1380,9 @@ async def do_msg_response(
         reply_text = sanitize_internal_control_text(reply_text)
         reply_text = sanitize_draw_reply_text(reply_text, allow_task_ids=True)
         reply_text, _ = _strip_think_tags(reply_text)
+        if not config.ENABLE_MSG_TO_IMG:
+            reply_text = strip_chat_markdown(reply_text)
+        reply_text = _strip_speaker_prefix(reply_text)
         if not reply_text:
             return
         if re.match(r'^[^\u4e00-\u9fa5\w]{1}$', reply_text):
@@ -1457,6 +1507,9 @@ async def do_msg_response(
         text = sanitize_internal_control_text(reply_text or "")
         text = sanitize_draw_reply_text(text, allow_task_ids=True)
         text, _ = _strip_think_tags(text)
+        if not config.ENABLE_MSG_TO_IMG:
+            text = strip_chat_markdown(text)
+        text = _strip_speaker_prefix(text)
         text = text.strip()
         if not text:
             return
@@ -1543,17 +1596,24 @@ async def do_msg_response(
         _empty_retried = False
         _passthrough_retried = False  # 直传图片转 base64 的回退是否已用过（仅一次）
         for _retry in range(1 + MAX_RETRIES):
-            raw_res, success, tool_messages, reasoning_content = await tg.stream_response(
-                prompt=prompt_template,
-                type='chat',
-                custom={'bot_name': chat.preset_key, 'sender_name': sender_name},
-                plugin_config=config,
-                request_profile=request_profile,
-                on_text=on_text_chunk,
-                on_reasoning=on_reasoning_chunk,
-                on_tool_call=_on_tool_call,
-                on_reply_complete=_on_reply_complete,
-            )
+            try:
+                raw_res, success, tool_messages, reasoning_content = await tg.stream_response(
+                    prompt=prompt_template,
+                    type='chat',
+                    custom={'bot_name': chat.preset_key, 'sender_name': sender_name},
+                    plugin_config=config,
+                    request_profile=request_profile,
+                    on_text=on_text_chunk,
+                    on_reasoning=on_reasoning_chunk,
+                    on_tool_call=_on_tool_call,
+                    on_reply_complete=_on_reply_complete,
+                )
+            except Exception as e:
+                # 兜底：stream_response 内部一旦自己抛异常（例如错误处理分支里写错），
+                # 异常会一路冒到 nonebot，群里既没回复也没有失败提示。这里降级为「请求失败」，
+                # 交给下面既有的 error log / 重试 / 群里提示路径处理。
+                logger.warning(f"stream_response 抛出异常，按请求失败处理: {e!r}")
+                raw_res, success, tool_messages, reasoning_content = f"请求大模型时发生错误: {e!r}", False, [], ""
 
             # 成功但产出为空：provider 静默失败（流内错误被吞、全思考无正文等）也会走到这里，
             # 按失败处理以便落 error log 并进入下方重试路径。已完成过回复或已执行过工具时不改判——
@@ -1728,6 +1788,9 @@ async def do_msg_response(
                 raw_res_for_save = sanitize_internal_control_text(raw_res_for_save)
                 raw_res_for_save = sanitize_draw_reply_text(raw_res_for_save, allow_task_ids=True)
                 raw_res_for_save, _ = _strip_think_tags(raw_res_for_save)
+                if not config.ENABLE_MSG_TO_IMG:
+                    raw_res_for_save = strip_chat_markdown(raw_res_for_save)
+                raw_res_for_save = _strip_speaker_prefix(raw_res_for_save)
                 if is_model_request_error_text(raw_res_for_save):
                     raw_res_for_save = ""
                 # 思考泄漏兜底（失败路径）：避免思考内容随部分回复进入对话历史
@@ -1755,6 +1818,13 @@ async def do_msg_response(
                 failure_cost,
                 success,
             )
+            # 上游内容审查拦截（DataInspectionFailed）：既不是上下文/参数问题，也不该惊动群里——
+            # 不做上下文清理、不发任何系统提示，只在控制台与该会话的 error log 里留痕
+            # （error log 已在上面的 _save_debug_log 落好）。必须放在 400 分支之前，
+            # 否则会被当成「请求上下文异常」清掉近期历史。
+            if is_content_review_error(raw_res):
+                logger.warning("请求被上游内容审查拦截，已记录 error log（不在群里提示）")
+                return
             if _is_bad_request_error(raw_res):
                 logger.warning("检测到 400 Bad Request，清理图片上下文和近期历史...")
                 chat.cleanup_after_bad_request(keep_history=5)

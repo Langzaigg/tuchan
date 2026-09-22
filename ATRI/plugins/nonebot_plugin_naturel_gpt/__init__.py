@@ -138,7 +138,7 @@ if _profile:
     _init_config = {
         'model': _profile.get("model", config.CHAT_MODEL),
         'model_mini': _profile.get("model_mini", config.CHAT_MODEL_MINI),
-        'max_tokens': _profile.get("max_tokens", config.REPLY_MAX_TOKENS),
+        'max_tokens': _profile.get("max_tokens"),
         'temperature': _profile.get("temperature"),
         'top_p': _profile.get("top_p"),
         'frequency_penalty': _profile.get("frequency_penalty"),

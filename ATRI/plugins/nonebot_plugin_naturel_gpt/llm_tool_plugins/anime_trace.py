@@ -173,8 +173,19 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
     if not resolved:
         return "图片无法下载（可能已过期），请让用户重新发送。", []
     data_uri = resolved[0]
+    # 2.1) 提交前压到接口的单字段上限以内：AnimeTrace 走 multipart，单个字段限 1024KB，
+    #      base64 又会让体积涨约 1/3，所以一张 ~800KB 的图必然被拒（实测报
+    #      "Part exceeded maximum size of 1024KB."）。压不动则按原图提交，让下面的 413/业务码兜底。
+    shrunk = image_cache.shrink_data_uri(data_uri)
+    if shrunk:
+        data_uri = shrunk
     # data:image/jpeg;base64,xxxx → 纯 base64
     b64 = data_uri.split(",", 1)[1] if "," in data_uri else data_uri
+    if len(b64) > image_cache._UPLOAD_PART_LIMIT_BYTES:
+        logger.warning(
+            f"[anime_trace] 图片过大，base64 {len(b64) / 1024:.0f}KB 超过接口单字段上限，放弃提交"
+        )
+        return "这张图太大，识别接口收不下（先压缩或截小一点再发）。", []
 
     # 3) 查询可用模型并提交识别（multipart/form-data，is_multi=1 返回多候选，ai_detect=1 附带 AI 图检测）
     model = await _pick_model()
@@ -193,8 +204,11 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
 
     if resp.status_code != 200:
         logger.warning(f"[anime_trace] HTTP {resp.status_code}: {resp.text[:200]}")
-        # 413 对应 17701 图片过大
-        hint = "图片大小过大" if resp.status_code == 413 else f"HTTP {resp.status_code}"
+        # 413 对应 17701 图片过大；FastAPI/Starlette 超限时回 400 "Part exceeded maximum size of 1024KB."
+        if resp.status_code == 413 or "exceeded maximum size" in resp.text:
+            hint = "图片大小超过接口上限"
+        else:
+            hint = f"HTTP {resp.status_code}"
         return f"识别失败：{hint}。", []
 
     try:

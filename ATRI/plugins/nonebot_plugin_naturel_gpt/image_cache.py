@@ -7,6 +7,7 @@
 
 import asyncio
 import base64
+import io
 import ipaddress
 import time
 from typing import Dict, List, Optional, Set, Tuple
@@ -17,13 +18,26 @@ import httpx
 from .logger import logger
 from .config import config
 
-# 单张图片大小上限（10MB）
+# 单张图片大小上限（10MB）：缩放后仍超过则跳过（原为下载后直接判超限，现改为先缩放再判）
 _MAX_SINGLE_IMAGE_BYTES = 10 * 1024 * 1024
 # 缓存总大小上限（200MB）：图片就地保留在上下文中直到过期（统一 1 小时有效期），
 # 缓存需覆盖一小时内的图片，被 LRU 挤出后重下载若遇 QQ rkey 过期会拿不到（该图退化为 [图片已过期]）
 _MAX_CACHE_TOTAL_BYTES = 200 * 1024 * 1024
 # 下载超时（秒）
 _DOWNLOAD_TIMEOUT = 15.0
+
+# 超过该体积的图片先缩放再送模型（8MB）：原图 base64 塞进请求体太大会让网关侧
+# （Cloudflare Worker）资源超限直接 503，token 也白烧。阈值以下原样送，不动画质。
+_IMAGE_DOWNSCALE_THRESHOLD_BYTES = 8 * 1024 * 1024
+# 缩放目标：最长边像素 + JPEG 质量（仅超阈值图片会重编码）
+_IMAGE_DOWNSCALE_MAX_SIDE = 1536
+_IMAGE_DOWNSCALE_JPEG_QUALITY = 85
+
+# 上游（如 DeepSeek）只认这几种图片格式：
+# "You have uploaded an unsupported image. ... valid and has one of the following formats: webp, png, jpeg, and gif."
+# 其余格式（bmp/tiff/avif/heic/ico…）以及 Content-Type 与实际字节不一致时，统一重编码为 JPEG。
+_ACCEPTED_IMAGE_FORMATS = {"JPEG", "PNG", "GIF", "WEBP"}
+_PIL_FORMAT_TO_MIME = {"JPEG": "image/jpeg", "PNG": "image/png", "GIF": "image/gif", "WEBP": "image/webp"}
 
 # QQ 系图片域名：带 rkey 时效或要求 Referer，API 侧无法直接拉取，必须 base64
 _QQ_IMAGE_DOMAIN_KEYWORDS = ("qpic.cn", "qlogo.cn", "gtimg.cn", "qq.com")
@@ -74,8 +88,164 @@ def _evict_lru(needed: int = 0) -> None:
         _cache_total_bytes -= size
 
 
+def _mime_from_content_type(ct: str) -> str:
+    """按响应头的 content-type 推断 data URI 的 mime（非图片一律按 jpeg）"""
+    if not ct.startswith("image/"):
+        return "image/jpeg"
+    if "png" in ct:
+        return "image/png"
+    if "webp" in ct:
+        return "image/webp"
+    if "gif" in ct:
+        return "image/gif"
+    return "image/jpeg"
+
+
+def _downscale_image(content: bytes) -> Optional[Tuple[bytes, str]]:
+    """把超大图片压成适合送模型的 JPEG，返回 (bytes, mime)；不适用/失败返回 None。
+
+    只做体积优化，不追求无损：长边缩到 `_IMAGE_DOWNSCALE_MAX_SIDE`，再按
+    `_IMAGE_DOWNSCALE_JPEG_QUALITY` 重编码（PNG 截图转 JPEG 通常能小一个数量级）。
+    原图带透明通道时铺白底，避免 JPEG 把透明区变成黑块。
+    任何异常（格式不支持、PIL 缺失）都返回 None，由调用方按原图继续——绝不因为缩放失败丢图。
+    """
+    try:
+        from PIL import Image
+    except Exception as e:
+        logger.warning(f"[图片缓存] 无法导入 PIL，跳过缩放，按原图发送: {e!r}")
+        return None
+    try:
+        with Image.open(io.BytesIO(content)) as im:
+            im.load()
+            width, height = im.size
+            scale = _IMAGE_DOWNSCALE_MAX_SIDE / float(max(width, height))
+            if scale < 1.0:
+                im = im.resize(
+                    (max(1, int(width * scale)), max(1, int(height * scale))),
+                    Image.LANCZOS,
+                )
+            if im.mode in ("RGBA", "LA", "P"):
+                im = im.convert("RGBA")
+                canvas = Image.new("RGB", im.size, (255, 255, 255))
+                canvas.paste(im, mask=im.split()[-1])
+                im = canvas
+            else:
+                im = im.convert("RGB")
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=_IMAGE_DOWNSCALE_JPEG_QUALITY, optimize=True)
+        return buf.getvalue(), "image/jpeg"
+    except Exception as e:
+        logger.warning(f"[图片缓存] 图片缩放失败，按原图发送: {e!r}")
+        return None
+
+
+# 第三方上传接口对单个 multipart 字段的体积上限（实测 AnimeTrace / FastAPI 为 1024KB，
+# 报错 "Part exceeded maximum size of 1024KB."）。base64 长度按此预算卡，留出余量。
+_UPLOAD_PART_LIMIT_BYTES = 1024 * 1024
+_UPLOAD_BASE64_BUDGET_BYTES = 900 * 1024
+# 压缩逐级降档：(长边上限, JPEG 质量)，先降质量保尺寸，压不下去再缩图
+_UPLOAD_SHRINK_STEPS = (
+    (1536, 85), (1536, 75), (1280, 75), (1280, 65),
+    (1024, 70), (1024, 60), (896, 60), (768, 55), (640, 50), (512, 45),
+)
+
+
+def shrink_data_uri(data_uri: str, budget_bytes: int = _UPLOAD_BASE64_BUDGET_BYTES) -> Optional[str]:
+    """把 data URI 压到 base64 长度 ≤ budget_bytes，返回新的 data URI；已达标则原样返回。
+
+    用于把图片提交给有单字段体积上限的第三方接口（AnimeTrace 的 multipart 字段限 1024KB）。
+    base64 会让体积涨约 1/3，所以一张 800KB 的图提交时必然超限。
+    逐档降长边 + 降 JPEG 质量直到达标；透明通道铺白底（JPEG 不支持透明）。
+    压不下去 / PIL 不可用 / 不是 data URI 时返回 None，由调用方自行决定是否原样提交。
+    """
+    if not data_uri or not data_uri.startswith("data:image/"):
+        return None
+    _, _, b64 = data_uri.partition(",")
+    if not b64 or len(b64) <= budget_bytes:
+        return data_uri
+    try:
+        from PIL import Image
+    except Exception as e:
+        logger.warning(f"[图片缓存] 无法导入 PIL，跳过上传前压缩: {e!r}")
+        return None
+    try:
+        raw = base64.b64decode(b64)
+    except Exception as e:
+        logger.warning(f"[图片缓存] 上传前压缩：base64 解码失败: {e!r}")
+        return None
+    try:
+        with Image.open(io.BytesIO(raw)) as im:
+            im.load()
+            base = im.convert("RGBA") if im.mode in ("RGBA", "LA", "P") else im.convert("RGB")
+            for max_side, quality in _UPLOAD_SHRINK_STEPS:
+                width, height = base.size
+                scale = max_side / float(max(width, height))
+                if scale < 1.0:
+                    work = base.resize(
+                        (max(1, int(width * scale)), max(1, int(height * scale))),
+                        Image.LANCZOS,
+                    )
+                else:
+                    work = base
+                if work.mode == "RGBA":
+                    canvas = Image.new("RGB", work.size, (255, 255, 255))
+                    canvas.paste(work, mask=work.split()[-1])
+                    work = canvas
+                buf = io.BytesIO()
+                work.save(buf, format="JPEG", quality=quality, optimize=True)
+                out_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                if len(out_b64) <= budget_bytes:
+                    logger.info(
+                        f"[图片缓存] 上传前压缩 {len(b64) / 1024:.0f}KB → {len(out_b64) / 1024:.0f}KB base64"
+                        f"（长边 ≤{max_side} / q{quality}）"
+                    )
+                    return f"data:image/jpeg;base64,{out_b64}"
+        logger.warning(f"[图片缓存] 上传前压缩到极限仍超预算（{len(b64) / 1024:.0f}KB base64）")
+        return None
+    except Exception as e:
+        logger.warning(f"[图片缓存] 上传前压缩失败: {e!r}")
+        return None
+
+
+def _sniff_image_format(content: bytes) -> Optional[str]:
+    """用 PIL 嗅探图片真实格式（不信任 Content-Type）；识别不出返回 None。"""
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        with Image.open(io.BytesIO(content)) as im:
+            return im.format
+    except Exception:
+        return None
+
+
+def _normalize_image_for_api(content: bytes) -> Optional[Tuple[bytes, str]]:
+    """把图片整理成「体积合适 + 上游认识的格式」，返回 (bytes, mime)；识别不了返回 None。
+
+    - 真实格式属于 `_ACCEPTED_IMAGE_FORMATS` 且未超阈值 → 原样返回，但 mime 按**真实格式**修正。
+      QQ 图片下载的 Content-Type 常是 `application/octet-stream`，旧实现一律标成 `image/jpeg`，
+      字节与声明的类型对不上就会被上游整条请求拒掉（实测 DeepSeek：
+      "You have uploaded an unsupported image … webp, png, jpeg, and gif"）。
+    - 格式不被接受（bmp/tiff/avif/heic/ico…）或体积超阈值 → 重编码为 JPEG（透明铺白底，超尺寸先缩放）。
+    - 连 PIL 都打不开（损坏/非图片）→ 返回 None，调用方跳过这张图：
+      宁可少一张图，也不让整个请求 400 挂掉。
+    """
+    fmt = _sniff_image_format(content)
+    if fmt is None:
+        return None
+    if fmt in _ACCEPTED_IMAGE_FORMATS and len(content) <= _IMAGE_DOWNSCALE_THRESHOLD_BYTES:
+        return content, _PIL_FORMAT_TO_MIME[fmt]
+    scaled = _downscale_image(content)
+    if scaled:
+        return scaled
+    if fmt in _ACCEPTED_IMAGE_FORMATS:  # 重编码失败但格式本身可用 → 退回原图 + 真实 mime
+        return content, _PIL_FORMAT_TO_MIME[fmt]
+    return None
+
+
 async def _download_as_data_uri(url: str) -> Optional[str]:
-    """下载远程图片并转为 data URI"""
+    """下载远程图片并转为 data URI；超大图/非主流格式先规范化再转"""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -86,22 +256,20 @@ async def _download_as_data_uri(url: str) -> Optional[str]:
         async with httpx.AsyncClient(timeout=_DOWNLOAD_TIMEOUT, follow_redirects=True, headers=headers) as client:
             resp = await client.get(url)
             resp.raise_for_status()
-            content = resp.content
+            raw = resp.content
+            declared_mime = _mime_from_content_type(resp.headers.get("content-type", ""))
+            normalized = _normalize_image_for_api(raw)
+            if normalized is None:
+                logger.warning(f"[图片缓存] 图片无法识别或格式不受支持，跳过（声明类型 {declared_mime}）: {url[:80]}")
+                return None
+            content, mime = normalized
+            if content is not raw:
+                logger.info(
+                    f"[图片缓存] 图片已规范化 {len(raw) / 1024:.0f}KB → {len(content) / 1024:.0f}KB（{mime}）: {url[:80]}"
+                )
             if len(content) > _MAX_SINGLE_IMAGE_BYTES:
                 logger.warning(f"[图片缓存] 图片过大 ({len(content)} bytes)，跳过: {url[:80]}")
                 return None
-            ct = resp.headers.get("content-type", "")
-            # 先检查是否是图片类型，非图片类型默认为 jpeg
-            if not ct.startswith("image/"):
-                mime = "image/jpeg"
-            elif "png" in ct:
-                mime = "image/png"
-            elif "webp" in ct:
-                mime = "image/webp"
-            elif "gif" in ct:
-                mime = "image/gif"
-            else:
-                mime = "image/jpeg"
             b64 = base64.b64encode(content).decode("ascii")
             return f"data:{mime};base64,{b64}"
     except Exception as e:
