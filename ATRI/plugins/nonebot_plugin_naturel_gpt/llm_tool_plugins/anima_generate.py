@@ -200,6 +200,30 @@ def get_chat_mode(chat_key: str) -> str:
     return chat_data.draw_mode
 
 
+# 画图关键词（auto 模式的「激活」判定；与 matcher / openai_func 的 _DRAWING_KEYWORDS 同一组）
+DRAW_KEYWORDS = ("画", "draw", "改图", "重画", "来一张", "整一张")
+
+
+def is_draw_active(chat_key: str, text: str = "") -> bool:
+    """本条消息画图功能是否实际启用：画图工具已注册（服务在线）且工具调用开启，
+    漫画模式 / force / on 恒启用，auto 模式要求消息含画图关键词（激活状态），off 不启用。
+    人设库带出等只服务于画图的功能以此为开关。"""
+    if not config.LLM_ENABLE_TOOLS:
+        return False
+    from . import is_anima_tool_enabled
+    if not is_anima_tool_enabled():
+        return False
+    if get_manga_mode(chat_key):
+        return True
+    mode = get_chat_mode(chat_key)
+    if mode in ("force", "on"):
+        return True
+    if mode == "auto":
+        lowered = (text or "").lower()
+        return any(kw in lowered for kw in DRAW_KEYWORDS)
+    return False
+
+
 def is_chat_enabled(chat_key: str) -> bool:
     """画图是否启用（force/on/auto 都算启用，仅 off 为关闭）"""
     return get_chat_mode(chat_key) != "off"
@@ -361,7 +385,26 @@ async def manga_idle_draw(chat_key: str, chat, config, bot=None, pending_request
             history_lines.append(f"{sender}: {text}")
         if history_lines:
             history_text = "[最近对话]\n" + "\n".join(history_lines)
-        
+
+        # 人设库：最近对话里被提到的角色（含群友自己的名字）带上外观/画图标签；
+        # 这份 prompt 独立构建、不含上下文里已带出的人设块，所以扫最近消息而非只扫触发句；bot 自己的人设不带
+        persona_text = ""
+        try:
+            from . import anima_characters
+            characters = await anima_characters.get_characters()
+            if characters:
+                if not get_chat_unlock_content_limit(chat_key):
+                    characters = [c for c in characters if not c.get("nsfw")]
+                characters = anima_characters.exclude_names(characters, chat._bot_self_names())
+                mention_text = "\n".join(
+                    f"{m.sender or ''}\n{m.text or ''}" for m in recent_messages
+                    if m.role == "user" or m.context_only
+                )
+                matched = anima_characters.match_characters(characters, mention_text)[:6]
+                persona_text = anima_characters.render_persona_block(matched)
+        except Exception as e:
+            logger.warning(f"[漫画空闲作画] 人设带出失败（跳过）: {e.__class__.__name__}: {e}")
+
         # 获取漫画知识：与漫画 schema description 同一份压缩 knowledge。
         # 漫画规则/自定义画风/解锁规则已在 schema description 内（见 get_chat_draw_schema），此处不再重复注入
         manga_knowledge = get_knowledge(get_default_model()) or ""
@@ -369,7 +412,7 @@ async def manga_idle_draw(chat_key: str, chat, config, bot=None, pending_request
         # 当前时间
         time_text = f"当前时间: {time.strftime('%Y-%m-%d %H:%M')}"
         
-        # 构建精简 prompt（顺序：漫画技能 → 画图指令 → 群记忆 → 时间 → 最近对话）
+        # 构建精简 prompt（顺序：漫画技能 → 画图指令 → 群记忆 → 人设资料 → 时间 → 最近对话）
         messages = [
             {"role": "system", "content": f"你正在以第一人称扮演指定角色参与聊天。\n[角色设定]\n{persona}"},
             {"role": "system", "content": f"[你的漫画技能]\n{manga_knowledge}"},
@@ -383,6 +426,8 @@ async def manga_idle_draw(chat_key: str, chat, config, bot=None, pending_request
         ]
         if memory_text:
             messages.append({"role": "system", "content": memory_text})
+        if persona_text:
+            messages.append({"role": "system", "content": persona_text})
         messages.append({"role": "system", "content": time_text})
         if history_text:
             messages.append({"role": "system", "content": history_text})

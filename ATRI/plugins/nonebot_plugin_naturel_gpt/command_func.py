@@ -347,25 +347,19 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
 def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     preset = chat.chat_preset
     pdm = PersistentDataManager.instance
-    is_global = chat.chat_data.global_memory_enabled
+    if user_id and not pdm.get_custom_nickname(user_id):
+        return {'msg': "你还没设置昵称呢，先用 rg nn <昵称> 设置一个，再来查记忆哦 (￣▽￣)"}
     parts = []
 
-    # global 状态提示
-    if is_global:
-        parts.append("[global 记忆模式: 已开启]")
-
-    # 群记忆
-    if is_global:
-        mem = chat.chat_data.global_chat_memory
-    else:
-        mem = preset.chat_memory
+    # 群记忆（本群所有人格共享）
+    mem = chat.chat_data.chat_memory
     if mem:
         lines = [f"  {i+1}. {k}: {v}" for i, (k, v) in enumerate(mem.items())]
         parts.append(f"[群记忆] ({len(mem)}/{config.MEMORY_MAX_LENGTH})\n" + "\n".join(lines))
     else:
         parts.append(f"[群记忆] (0/{config.MEMORY_MAX_LENGTH}) 无")
 
-    # 当前用户记忆（固定全群全人格共享）
+    # 当前用户记忆（跨群、跨人格共享）
     user_mem = pdm.get_global_user_memories(user_id) if user_id else {}
     if user_mem:
         lines = [f"  {i+1}. {k}: {v}" for i, (k, v) in enumerate(user_mem.items())]
@@ -388,65 +382,23 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
 @cmd.register(route='rg/mem/clear', params=['scope'])
 def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     scope = param_dict.get('scope', '').strip().lower()
-    preset = chat.chat_preset
     pdm = PersistentDataManager.instance
-    is_global = chat.chat_data.global_memory_enabled
 
     if scope == 'group':
-        if is_global:
-            chat.chat_data.global_chat_memory.clear()
-        else:
-            preset.chat_memory.clear()
-        return {'msg': f"已清除 {preset.preset_key} 的群记忆 (￣▽￣)-ok!", 'is_progress': True}
+        chat.chat_data.chat_memory.clear()
+        return {'msg': "已清除本群的群记忆 (￣▽￣)-ok!", 'is_progress': True}
     elif scope == 'user':
         if not user_id:
             return {'msg': "无法获取当前用户信息 (；′⌒`)"}
         pdm.set_global_user_memories(user_id, {})
-        return {'msg': f"已清除你的用户记忆 (global) (￣▽￣)-ok!", 'is_progress': True}
+        return {'msg': "已清除你的个人记忆（跨群共享） (￣▽￣)-ok!", 'is_progress': True}
     elif scope == 'all':
-        if is_global:
-            chat.chat_data.global_chat_memory.clear()
-        else:
-            preset.chat_memory.clear()
+        chat.chat_data.chat_memory.clear()
         if user_id:
             pdm.set_global_user_memories(user_id, {})
-        return {'msg': f"已清除 {preset.preset_key} 的全部记忆 (￣▽￣)-ok!", 'is_progress': True}
+        return {'msg': "已清除本群群记忆与你的个人记忆 (￣▽￣)-ok!", 'is_progress': True}
     else:
         return {'msg': "用法: rg mem clear <group|user|all>\n  group=群记忆  user=你的记忆  all=全部"}
-
-@cmd.register(route='rg/mem/global', params=['action'])
-def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
-    action = param_dict.get('action', '').strip().lower()
-    pdm = PersistentDataManager.instance
-    chat_data = chat.chat_data
-    is_global = chat_data.global_memory_enabled
-
-    # rg mem global (无参数) → 显示状态并切换
-    if not action:
-        new_state = not is_global
-        chat_data.global_memory_enabled = new_state
-        if new_state:
-            report = pdm.init_global_memory(chat_data.chat_key)
-            return {'msg': f"global 记忆已开启\n{report}", 'is_progress': True}
-        else:
-            return {'msg': "global 记忆已关闭", 'is_progress': True}
-
-    # rg mem global on
-    if action == 'on':
-        if is_global:
-            return {'msg': "global 记忆已经是开启状态。"}
-        chat_data.global_memory_enabled = True
-        report = pdm.init_global_memory(chat_data.chat_key)
-        return {'msg': f"global 记忆已开启\n{report}", 'is_progress': True}
-
-    # rg mem global off
-    if action == 'off':
-        if not is_global:
-            return {'msg': "global 记忆已经是关闭状态。"}
-        chat_data.global_memory_enabled = False
-        return {'msg': "global 记忆已关闭", 'is_progress': True}
-
-    return {'msg': "用法: rg mem global [on|off]\n  无参数=切换  on=开启  off=关闭"}
 
 @cmd.register(route='rg/on')
 def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
@@ -933,7 +885,6 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
 【记忆管理】
   rg mem               查看当前记忆
   rg mem clear <scope> 清除记忆 (group/user/all)
-  rg mem global [on|off] 开关全局记忆
 
 【画图相关】
   rg draw              查看画图模式和模型

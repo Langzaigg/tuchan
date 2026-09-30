@@ -10,6 +10,9 @@ from .openai_func import TextGenerator, is_model_request_error_text
 from .persistent_data_manager import ChatMessageData, ImpressionData, PresetData
 from .llm_tool_plugins import TOOL_REGISTRY
 
+# 单条触发句最多带出的人设条数（防异常长文本一次灌入过多人设；正常点名合影远达不到）
+_MAX_PERSONAS_PER_INJECTION = 8
+
 
 class ChatHistoryMixin:
     """对话历史管理 Mixin，提供对话历史的添加、截断和清理功能"""
@@ -168,6 +171,137 @@ class ChatHistoryMixin:
         elif not config.CONTEXT_SUMMARY_ENABLED:
             self._trim_prompt_messages_without_summary(preset)
         return history_item
+
+    async def inject_character_personas(self, anchor: Optional[ChatMessageData] = None) -> str:
+        """人设库带出（上游 AnimaTool /anima/characters，只读，只服务于画图）：仅当本条消息画图功能实际启用
+        （anima_generate.is_draw_active：force/on/漫画模式，或 auto 且触发句含画图关键词）时，
+        只看锚点触发句（发送者名 + 正文）提到的角色
+        （名称/别名；历史触发句的人设在当时已带出、自然留在上下文里，背景上下文块不扫），bot 自己的人设不带
+        （已在人格 md 里定义，见 _bot_self_names）。请求窗口内还没带出过、或上游改过的，写进锚点所在轮的
+        前导 system 块——与该轮的印象/记忆 system 共用一条，没有则新建一条 impression_user_id 为空的块。
+        块随绑定轮一起裁剪/摘要删除，删除后再被提到时重新带出；写入后不再改写，保持历史前缀缓存。
+
+        anchor 缺省为当前触发消息（主路径在 context_only flush 之后、构建 prompt 之前调用）；
+        循环邮箱路径传入刚落库的 entry 消息。返回本次新带出的人设块文本（邮箱路径并入新消息提醒），无则空串。
+        尽力而为：任何异常只记日志，不影响回复。"""
+        try:
+            return await self._inject_character_personas(anchor)
+        except Exception as e:
+            logger.warning(f"[会话: {self.chat_key}] 人设带出失败（跳过）: {e.__class__.__name__}: {e}")
+            return ""
+
+    def _bot_self_names(self) -> List[str]:
+        """bot 自己的名字：当前人格名（md 人格为完整文件名，如「兔酱-夏装」，另取 - 前的主名）+ 全局 nickname。"""
+        preset_key = str(self._preset_key or "")
+        names = [preset_key, preset_key.split("-")[0]]
+        try:
+            import nonebot
+            names += [str(n) for n in (nonebot.get_driver().config.nickname or [])]
+        except Exception:
+            pass
+        return names
+
+    async def _inject_character_personas(self, anchor: Optional[ChatMessageData]) -> str:
+        from .llm_tool_plugins import anima_characters, anima_generate
+
+        if not anima_characters.is_enabled():
+            return ""
+        preset = self.chat_preset_dicts.get(self._preset_key)
+        if not preset:
+            return ""
+        messages = preset.prompt_messages
+        if anchor is None:
+            for item in reversed(messages):
+                if isinstance(item, ChatMessageData) and item.role == "user" and not item.context_only:
+                    anchor = item
+                    break
+        anchor_idx = next((i for i, m in enumerate(messages) if m is anchor), -1)
+        if anchor is None or anchor_idx < 0:
+            return ""
+        # 人设库只服务于画图：本条消息画图功能实际启用（force/on/漫画，或 auto 且触发句含画图关键词）才带出
+        if not anima_generate.is_draw_active(self.chat_key, anchor.text or ""):
+            return ""
+
+        characters = await anima_characters.get_characters()
+        if not characters:
+            return ""
+        if not self.get_unlock_content_limit():
+            characters = [c for c in characters if not c.get("nsfw")]
+        characters = anima_characters.exclude_names(characters, self._bot_self_names())
+
+        # 请求窗口（与 _build_openai_history_messages 同口径：最近 _history_buffer_round_limit() 个真实轮）
+        max_rounds = self._history_buffer_round_limit()
+        window_start = 0
+        rounds = 0
+        for i in range(len(messages) - 1, -1, -1):
+            m = messages[i]
+            if isinstance(m, ChatMessageData) and m.role == "user" and not m.context_only:
+                rounds += 1
+                if rounds >= max_rounds:
+                    window_start = i
+                    while window_start > 0 and (messages[window_start - 1].is_impression or messages[window_start - 1].context_only):
+                        window_start -= 1
+                    break
+        window = [m for m in messages[window_start:] if isinstance(m, ChatMessageData)]
+
+        injected: Dict[str, float] = {}
+        for m in window:
+            if m.is_impression:
+                for cid, ver in m.character_versions.items():
+                    injected[cid] = max(injected.get(cid, 0.0), ver)
+
+        # 只匹配锚点触发句：发送者自己的名字 + 正文（合并消息的正文里已带各发送者名）
+        matched = anima_characters.match_characters(characters, f"{anchor.sender or ''}\n{anchor.text or ''}")
+
+        pending: List[Dict[str, Any]] = []
+        updated_ids: List[str] = []
+        for c in matched:
+            cid = str(c.get("id"))
+            ver = anima_characters.character_version(c)
+            if cid in injected:
+                if ver <= injected[cid]:
+                    continue
+                updated_ids.append(cid)
+            pending.append(c)
+        if not pending:
+            return ""
+
+        entries = anima_characters.render_persona_entries(pending[:_MAX_PERSONAS_PER_INJECTION], updated_ids)
+        if not entries:
+            return ""
+        versions = {str(c.get("id")): anima_characters.character_version(c) for c, _ in entries}
+        body = "\n".join(text for _, text in entries)
+        block = anima_characters.persona_block_header() + "\n" + body
+
+        # 宿主：锚点前连续的 context_only / 印象块属于锚点这一轮；有印象块就并进去，没有就在该轮最前面新建
+        k = anchor_idx
+        host: Optional[ChatMessageData] = None
+        while k > 0 and (messages[k - 1].is_impression or messages[k - 1].context_only):
+            k -= 1
+            if messages[k].is_impression and host is None:
+                host = messages[k]
+        if host is not None:
+            host.character_text = f"{host.character_text}\n{body}" if host.character_text else block
+            host.character_versions.update(versions)
+        else:
+            messages.insert(k, ChatMessageData(
+                role="system",
+                user_id="",
+                sender="",
+                text="",
+                context_only=False,
+                timestamp=time.time(),
+                is_impression=True,
+                impression_user_id="",
+                character_text=block,
+                character_versions=versions,
+            ))
+        logger.info(
+            f"[人设库] 带出人设 | 会话: {self.chat_key} | "
+            f"{', '.join(str(c.get('name')) for c, _ in entries)}"
+            + (f" | 已更新: {len(updated_ids)}" if updated_ids else "")
+        )
+        return block
 
     async def save_tool_messages(self, tool_messages: List[Dict[str, Any]]) -> Optional[ChatMessageData]:
         """保存工具调用消息到内存中的prompt_messages（不持久化）"""

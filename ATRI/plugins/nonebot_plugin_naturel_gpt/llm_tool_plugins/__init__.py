@@ -10,8 +10,8 @@ from . import anima_generate
 # 工具注册表: {name: (schema, run_func)}
 TOOL_REGISTRY: Dict[str, Tuple[Dict[str, Any], Callable]] = {}
 
-# 不参与自动发现的模块
-_EXCLUDED_MODULES = {"__init__", "common", "anima_generate"}
+# 不参与自动发现的模块（anima_characters 是人设库客户端，不是工具）
+_EXCLUDED_MODULES = {"__init__", "common", "anima_generate", "anima_characters"}
 
 
 def _discover_tools(config) -> None:

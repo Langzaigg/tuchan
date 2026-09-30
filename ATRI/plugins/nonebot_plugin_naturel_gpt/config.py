@@ -241,6 +241,8 @@ class Config(BaseModel, extra=Extra.ignore):
     """ComfyUI Anima 画图服务地址"""
     COMFYUI_ENABLED: bool
     """ComfyUI Anima 画图是否开启，启动时自动 health check 后设置"""
+    ANIMA_CHARACTERS_ENABLE: bool
+    """人设库带出：对话提到的角色（含发言者自己的名字）从上游 /anima/characters 读取人设注入上下文（只读）"""
 
     MANGA_IDLE_MINUTES: int
     """漫画模式下多少分钟未画图触发自动画图"""
@@ -367,6 +369,7 @@ CONFIG_TEMPLATE = {
 
     'COMFYUI_BASE_URL': 'http://127.0.0.1:8188',
     'COMFYUI_ENABLED': False,
+    'ANIMA_CHARACTERS_ENABLE': True,  # 人设库带出（上游 /anima/characters，只读；与 COMFYUI_BASE_URL 同一服务）
 
     'MANGA_IDLE_MINUTES': 5,
     'MANGA_IDLE_ROUNDS': 5,

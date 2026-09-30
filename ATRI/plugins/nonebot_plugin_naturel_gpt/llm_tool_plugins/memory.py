@@ -15,6 +15,7 @@ schema = {
             "不要记：\n"
             "- 性格、爱好、习惯、偏好倾向（系统会自动归纳到用户印象）。\n"
             "- 当前话题进展、群内日常事件（系统会自动压缩到上下文摘要）。\n"
+            "- 人物人设（外观、造型、画图设定）：由人设库统一管理，画图时自动带出；有人要添加或修改人设时，告诉对方去人设库网页自行修改。\n"
             "- 一次性的闲聊内容。\n"
             "\n"
             "【关键规则】当用户明确要求记忆相关操作时，必须立即调用本工具，不得有任何延迟或推诿：\n"
@@ -38,7 +39,7 @@ schema = {
                 "scope": {
                     "type": "string",
                     "enum": ["group", "user"],
-                    "description": "记忆范围：group=群记忆（所有人共享），user=用户记忆（仅对该用户有效）"
+                    "description": "记忆范围：group=群记忆（本群所有人共享），user=用户记忆（仅对该用户有效，跨群共享）"
                 },
                 "key": {
                     "type": "string",
@@ -84,9 +85,7 @@ def _get_memories(chat, preset, scope: str, trigger_userid: str = None) -> Dict[
             return {}
         from ..persistent_data_manager import PersistentDataManager
         return PersistentDataManager.instance.get_global_user_memories(trigger_userid)
-    if chat.chat_data.global_memory_enabled:
-        return chat.chat_data.global_chat_memory
-    return preset.chat_memory
+    return chat.chat_data.chat_memory
 
 
 def _set_memories(chat, preset, scope: str, memories: Dict[str, str], trigger_userid: str = None) -> None:
@@ -96,12 +95,8 @@ def _set_memories(chat, preset, scope: str, memories: Dict[str, str], trigger_us
         from ..persistent_data_manager import PersistentDataManager
         PersistentDataManager.instance.set_global_user_memories(trigger_userid, memories)
     else:
-        if chat.chat_data.global_memory_enabled:
-            chat.chat_data.global_chat_memory.clear()
-            chat.chat_data.global_chat_memory.update(memories)
-        else:
-            preset.chat_memory.clear()
-            preset.chat_memory.update(memories)
+        chat.chat_data.chat_memory.clear()
+        chat.chat_data.chat_memory.update(memories)
 
 
 async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:

@@ -25,9 +25,12 @@ from .openai_func import (
     TextGenerator,
     is_model_request_error_text,
     is_content_review_error,
+    is_provider_rejection_text,
+    PROVIDER_REJECTION_ERROR_TEXT,
     sanitize_draw_reply_text,
     sanitize_internal_control_text,
     strip_chat_markdown,
+    strip_edge_commas,
     contains_tool_call_xml,
     strip_tool_call_xml,
 )
@@ -1115,6 +1118,12 @@ async def do_msg_response(
                 await chat.update_chat_history_row_for_user(
                     sender=sender_name, msg=incoming_text, userid=trigger_userid,
                     username=sender_name, require_summary=False)
+            # 人设库：本条提到的人设落进它这一轮的前导块（后续请求可见），同时随 entry 带进
+            # 运行中的循环（并入新消息提醒），本次回复就能用上
+            persona_text = (
+                await chat.inject_character_personas(anchor=recorded_user_msg)
+                if recorded_user_msg is not None else ""
+            )
             tg.push_loop_input(chat_key, {
                 "text": _format_loop_entry_text(recorded_user_msg, sender_name, incoming_text),
                 "raw_text": incoming_text,
@@ -1122,6 +1131,7 @@ async def do_msg_response(
                 "userid": trigger_userid,
                 "image_urls": incoming_images,
                 "recorded_msg": recorded_user_msg,
+                "persona_text": persona_text,
             })
             preview = incoming_text.replace("\n", " ")[:50]
             logger.info(
@@ -1239,6 +1249,10 @@ async def do_msg_response(
                 f"[上下文缓冲] 已注入 context_only: 图片={len(buffered_images)}"
             )
     # context_only 块的图片就地保留在该块内（渲染层统一过期 / 编号），不合并到触发消息
+
+    # 人设库：触发句（含发送者自己的名字）提到、窗口内尚未带出的人设（bot 自己的除外），
+    # 写入本轮触发前导 system 块（与印象/记忆共用），须在构建 prompt 之前
+    await chat.inject_character_personas()
 
     sta_time:float = time.time()
 
@@ -1382,7 +1396,11 @@ async def do_msg_response(
         reply_text, _ = _strip_think_tags(reply_text)
         if not config.ENABLE_MSG_TO_IMG:
             reply_text = strip_chat_markdown(reply_text)
-        reply_text = _strip_speaker_prefix(reply_text)
+        reply_text = strip_edge_commas(_strip_speaker_prefix(reply_text))
+        # 上游审核拒绝文案（HTTP 200 当正常 content 返回的网关文本）兜底拦截：永不进群
+        if is_provider_rejection_text(reply_text):
+            logger.warning(f"[审核拒绝兜底] 拦截上游拒绝文案分段: {reply_text!r}")
+            return
         if not reply_text:
             return
         if re.match(r'^[^\u4e00-\u9fa5\w]{1}$', reply_text):
@@ -1509,7 +1527,7 @@ async def do_msg_response(
         text, _ = _strip_think_tags(text)
         if not config.ENABLE_MSG_TO_IMG:
             text = strip_chat_markdown(text)
-        text = _strip_speaker_prefix(text)
+        text = strip_edge_commas(_strip_speaker_prefix(text))
         text = text.strip()
         if not text:
             return
@@ -1622,6 +1640,17 @@ async def do_msg_response(
                 logger.warning("模型返回空响应（success 但无任何内容），按失败处理并尝试重试")
                 success = False
 
+            # 上游内容审核以 HTTP 200 正常 content 返回拒绝文案（网关行为，如
+            # "The request was rejected because it was considered high risk"）：改判失败，
+            # 换成带 content_filter 标记的错误文本走下方重试/静默路径；文案本身永不进群
+            #（send_segment 也有同款拦截兜底，防止流式分段已部分发出）。
+            _provider_rejected = False
+            if success and not tool_messages and _manga_replies_checked == 0 and is_provider_rejection_text(raw_res or ""):
+                logger.warning(f"检测到上游审核拒绝文案（HTTP 200），按失败处理: {raw_res!r}")
+                raw_res = PROVIDER_REJECTION_ERROR_TEXT
+                success = False
+                _provider_rejected = True
+
             # 每次失败都保存完整的未脱敏 error log（即使后续会重试）
             if not success:
                 failure_cost = tg.cal_token_count(str(prompt_template) + str(raw_res or ""))
@@ -1677,9 +1706,9 @@ async def do_msg_response(
             # 无图片可剥离时不再重试
             if not _prompt_contains_images(prompt_template):
                 break
-            # 仅在图片相关 400 错误时重试（非图片 400 如工具调用格式错误，剥离图片无意义）
+            # 仅在图片相关 400 / 上游审核拒绝时重试（非图片 400 如工具调用格式错误，剥离图片无意义）
             _img_limit_hit = _is_image_limit_error(raw_res)
-            if not _is_image_download_error(raw_res) and not _img_limit_hit:
+            if not _is_image_download_error(raw_res) and not _img_limit_hit and not _provider_rejected:
                 break
             if _retry >= MAX_RETRIES:
                 logger.warning(f"已达到最大重试次数 ({MAX_RETRIES})，停止重试")
@@ -1687,7 +1716,7 @@ async def do_msg_response(
 
             # 直传图片 URL 被 provider 拉取失败：先原位转 base64 重试一次，仍失败再走无图剥离
             # 图片数量/尺寸超限与拉取无关，转 base64 救不回来，直接走下面的无图剥离
-            if not _passthrough_retried and not _img_limit_hit:
+            if not _passthrough_retried and not _img_limit_hit and not _provider_rejected:
                 _pt_urls = _collect_passthrough_image_urls(prompt_template)
                 if _pt_urls:
                     _passthrough_retried = True
@@ -1699,8 +1728,8 @@ async def do_msg_response(
                     continue
 
             logger.warning(f"含图片上下文请求返回 400 (第 {_retry + 1} 次)，回退到无图片上下文重试...")
-            # 图片数量超限时上下文本身没问题，剥图即可解决，不做会丢历史的清理
-            if not _img_limit_hit:
+            # 图片数量超限/上游审核拒绝时上下文本身没问题，剥图即可解决，不做会丢历史的清理
+            if not _img_limit_hit and not _provider_rejected:
                 chat.cleanup_after_bad_request(keep_history=5)
                 PersistentDataManager.instance.save_to_file(must_save=True)
             raw_parts.clear()
@@ -1790,7 +1819,7 @@ async def do_msg_response(
                 raw_res_for_save, _ = _strip_think_tags(raw_res_for_save)
                 if not config.ENABLE_MSG_TO_IMG:
                     raw_res_for_save = strip_chat_markdown(raw_res_for_save)
-                raw_res_for_save = _strip_speaker_prefix(raw_res_for_save)
+                raw_res_for_save = strip_edge_commas(_strip_speaker_prefix(raw_res_for_save))
                 if is_model_request_error_text(raw_res_for_save):
                     raw_res_for_save = ""
                 # 思考泄漏兜底（失败路径）：避免思考内容随部分回复进入对话历史

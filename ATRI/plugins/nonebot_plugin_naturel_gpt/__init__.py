@@ -107,9 +107,11 @@ else:
 # fetch_schema_and_knowledge_sync 内部先拉 GET /anima/workflows 动态确定可选工作流全集
 # （过滤 deprecated），再逐工作流拉 schema/knowledge；工作流列表不可达时降级内置最小默认值，
 # 服务整体离线时仅关闭画图功能，不影响插件启动。
-from .llm_tool_plugins import anima_generate, enable_anima_tool
+from .llm_tool_plugins import anima_generate, enable_anima_tool, anima_characters
 ok, err = anima_generate.health_check_sync()
 if ok:
+    # 人设库（/anima/characters，只读）：启动时先拉一次，运行期按 ETag 后台校验
+    anima_characters.refresh_sync()
     ok2, err2 = anima_generate.fetch_schema_and_knowledge_sync()
     if ok2:
         if enable_anima_tool():

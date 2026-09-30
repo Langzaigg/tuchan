@@ -10,13 +10,11 @@ class ChatMemoryMixin:
     """记忆管理 Mixin，提供群记忆和用户个人记忆的管理功能"""
 
     def _get_chat_memory(self) -> Dict[str, str]:
-        """获取当前有效的群记忆（global 或按人格）。"""
-        if self._chat_data.global_memory_enabled:
-            return self._chat_data.global_chat_memory
-        return self.chat_preset.chat_memory
+        """获取本群的群记忆（本群所有人格共享）。"""
+        return self._chat_data.chat_memory
 
     def _get_user_memory(self, userid: str) -> Dict[str, str]:
-        """获取当前有效的用户记忆（固定全群全人格共享）。"""
+        """获取用户个人记忆（跨群、跨人格共享）。"""
         return PersistentDataManager.instance.get_global_user_memories(userid)
 
     def set_memory(self, mem_key: str, mem_value: str = '') -> None:

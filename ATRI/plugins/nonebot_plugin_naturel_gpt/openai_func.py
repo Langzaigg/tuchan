@@ -200,6 +200,30 @@ _INTERNAL_CONTROL_PATTERNS = (
 )
 _MODEL_REQUEST_ERROR_PREFIX = "请求大模型时发生错误:"
 
+# 上游/网关内容审核拒绝文案（HTTP 200 返回，content 就是拒绝文本，
+# 如 "The request was rejected because it was considered high risk"）。
+# 只匹配英文网关措辞：中文「审核/违规」类词汇正常聊天也会说，误伤面太大。
+_PROVIDER_REJECTION_RE = re.compile(
+    r"(request was rejected|considered high risk|high[\s-]?risk (content|request)|"
+    r"content.?policy|cannot (fulfill|comply with)|unable to (fulfill|process) (this|your) request)",
+    re.I,
+)
+# 改判失败时使用的错误文本：以 _MODEL_REQUEST_ERROR_PREFIX 开头并带 content_filter 标记，
+# 保证走 matcher 失败路径时被 is_model_request_error_text / is_content_review_error 同时识别——
+# 不进群、不进历史、静默落 error log
+PROVIDER_REJECTION_ERROR_TEXT = f"{_MODEL_REQUEST_ERROR_PREFIX} 上游内容审核拒绝了本次请求 (content_filter)"
+
+
+def is_provider_rejection_text(content: Optional[str]) -> bool:
+    """判断模型回复文本是否整体就是上游/网关的内容审核拒绝文案（而非正常回复）。
+    要求整条文本较短（≤300 字），避免误伤正常讨论中引用这类短语的长回复。"""
+    if not content:
+        return False
+    text = str(content).strip()
+    if len(text) > 300:
+        return False
+    return bool(_PROVIDER_REJECTION_RE.search(text))
+
 # 工具调用标记泄漏检测：模型把工具调用写进了 content 而非 tool_calls。
 # 1) Anthropic/通用 XML：<function_calls>…</function_calls>、<tool_call>…</tool_call>
 # 2) DeepSeek 原生 DSML：<｜DSML｜calls> <｜DSML｜invoke name="x"> <｜DSML｜parameter …>…</｜DSML｜calls>
@@ -393,6 +417,18 @@ _MD_BULLET_RE = re.compile(r'^\s*[-*+]\s+', re.M)  # 要求标记后有空白，
 _MD_NUMBERED_RE = re.compile(r'^\s*\d{1,2}[.、)]\s+', re.M)  # 要求数字+分隔符后有空白，"1.5"、"2026.9" 不受影响
 _MD_INLINE_CODE_RE = re.compile(r'`([^`\n]+?)`')
 _MD_QUOTE_RE = re.compile(r'^\s{0,3}>\s?', re.M)
+
+
+_EDGE_COMMA_HEAD_RE = re.compile(r'^\s*[，,][\s，,]*')
+_EDGE_COMMA_TAIL_RE = re.compile(r'[\s，,]*[，,]\s*$')
+
+
+def strip_edge_commas(text: str) -> str:
+    """去掉回复（或单个分段）首尾的逗号：分段恰好切在逗号处、或剥掉「名字：」前缀后，
+    常留下孤零零的「，」开头/结尾。只动首尾，句中逗号不碰。"""
+    if not text:
+        return text
+    return _EDGE_COMMA_TAIL_RE.sub("", _EDGE_COMMA_HEAD_RE.sub("", text))
 
 
 def strip_chat_markdown(content: str) -> str:
@@ -1276,8 +1312,10 @@ class TextGenerator(Singleton["TextGenerator"]):
         # 上游内容审查拦截：阶梯用尽后置 True，本轮不再重试（同时给下面的「疑似 ctx 错误 → 剥图
         # 重试」分支加闸，避免白折腾一次）
         _content_review_blocked = False
-        _review_model_switched = False  # 审查阶梯是否已用过「① 保留图片 + 换 model_mini」这一步
-        _review_original_model = ""  # 审查发生前的原模型名（② 剥图后换回它重试）
+        _review_model_switched = False  # 审查阶梯是否已用过「保留图片 + 换 model_mini」这一步
+        _review_original_model = ""  # 审查发生前的原模型名（剥图后换回它重试）
+        _review_nonstream_retried = False  # 审查阶梯是否已用过「同模型关流式重试本轮」这一步
+        _force_nonstream_round = False  # 一次性标志：置位后下一轮请求改走非流式（读取后即清零）
         # 本轮是否已产生对外副作用（已流出文字 / 已执行工具 / 已落库）：有副作用就不能重试本轮，
         # 否则重复发消息、重复跑画图。用 dict 存放，嵌套函数里无需 nonlocal 声明即可置位。
         _round_fx = {"text": False, "tools": False}
@@ -1383,7 +1421,16 @@ class TextGenerator(Singleton["TextGenerator"]):
             # 未处理标记（ephemeral system：不落历史、不进 tool_messages、不进返回的 tool_messages 列表）。
             # 要求逐条分别回应、各自成段、句中自然称呼点名——多条新消息合并为下一条 user 消息，
             # 避免"一并回应"把不同人的话题揉进一段。
-            messages.append({"role": "system", "content": build_mailbox_notice(count, reply_completed)})
+            # 新消息提到的人设（matcher 落库时已写进各自轮的前导块，供后续请求使用）一并附上，本次回复就能用
+            notice = build_mailbox_notice(count, reply_completed)
+            persona_texts: List[str] = []
+            for entry in entries:
+                persona_text = str(entry.get("persona_text") or "").strip()
+                if persona_text and persona_text not in persona_texts:
+                    persona_texts.append(persona_text)
+            if persona_texts:
+                notice += "\n\n" + "\n\n".join(persona_texts)
+            messages.append({"role": "system", "content": notice})
             multimodal_enabled = bool(getattr(plugin_config, "MULTIMODAL_ENABLE", True)) if plugin_config else True
             # 整批合并为一条 user 消息；图片编号从当前 messages 最大 [图片N] 续编，并入可见图片表
             img_index = _next_image_index(messages)
@@ -1551,6 +1598,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                 # 每轮请求前重置副作用标记：本轮一旦流出去文字或跑过工具，瞬时错误就不再重试
                 _round_fx["text"] = False
                 _round_fx["tools"] = False
+                _round_used_stream = False  # 本轮请求是否走了流式（审查阶梯①据此判断能否关流式重试）
                 # 流式回调包一层：文字一旦真正转发出去就置位（决定这一轮能不能安全重发）。
                 # 内部控制轮走的是缓冲回调（还没对外发），不算副作用。
                 _track_text_output = effective_on_text is round_on_text
@@ -1566,7 +1614,11 @@ class TextGenerator(Singleton["TextGenerator"]):
                 else:
                     _stream_on_text = None
 
-                if (request_state.get("config") or {}).get("enable_stream", True):
+                _round_used_stream = (
+                    (request_state.get("config") or {}).get("enable_stream", True) and not _force_nonstream_round
+                )
+                _force_nonstream_round = False  # 一次性标志，读取后即清零
+                if _round_used_stream:
                     content, tool_calls, reasoning_content = await self._stream_once(
                         messages, type, current_tools, _stream_on_text, round_on_reasoning, request_state, on_tool_call, tool_choice=round_tool_choice
                     )
@@ -1805,6 +1857,23 @@ class TextGenerator(Singleton["TextGenerator"]):
                     _filtered = [tc for tc in tool_calls if _get(_get(tc, "function", {}), "name", "") in TERMINAL_TOOLS]
                     if len(_filtered) < len(tool_calls):
                         logger.info(f"终端工具轮：过滤掉 {len(tool_calls) - len(_filtered)} 个非终端工具调用")
+                        # 协议配对：assistant(tool_calls) 里的每个 tool_call_id 都必须紧跟对应的 tool 响应，
+                        # 被过滤的调用不能静默丢弃——否则下一轮请求末尾挂着无响应的 tool_calls，上游直接 400
+                        # （"insufficient tool messages following tool_calls message"，实测 2026-09-22 终端轮模型
+                        # 仍返回 browse_url，过滤后无任何 tool 消息追加，收尾轮请求被打回）。
+                        # 补一条「未执行」占位响应，模型据此直接用已有信息收尾。
+                        _tail_asst = messages[-1] if messages else None
+                        if _tail_asst and _tail_asst.get("role") == "assistant" and _tail_asst.get("tool_calls"):
+                            for tc in tool_calls:
+                                _tc_name = _get(_get(tc, "function", {}), "name", "")
+                                if _tc_name in TERMINAL_TOOLS:
+                                    continue
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": str(_get(tc, "id", "") or ""),
+                                    "name": _tc_name,
+                                    "content": "工具调用已达上限（终端轮），该调用未执行。请基于已有信息直接用文字回复，不要再发起工具调用。",
+                                })
                     tool_calls = _filtered
                 current_tool_count = len(tool_calls)
                 current_search_count = sum(1 for tc in tool_calls if _get(_get(tc, "function", {}), "name", "") in SEARCH_TOOL_NAMES)
@@ -1890,18 +1959,28 @@ class TextGenerator(Singleton["TextGenerator"]):
                 err_text = f"{e.__class__.__name__}: {e}".lower()
                 # 上游内容审查拦截（阿里系 DataInspectionFailed；实测走聚合网关时会被路由到阿里系模型上）。
                 # 处置阶梯（保留原有可重试前提：本轮还没流出文字、没执行过工具）：
-                #   ① **保留图片**，改走本群 profile 的 `model_mini`（摘要模型）重试本轮 —— 换条上游通道；
-                #   ② 图片被拦且仍不放行 → **剥离图片 + 换回原模型**重试本轮；
-                #   ③ 仍被拦 → 放弃：不再重试，按失败上报（matcher 只落 error log + 控制台，不入群、不清上下文）。
-                # 三步都用完不会回环：`_review_model_switched` / `_image_stripped` 各自只置位一次。
+                #   ① 同模型关流式重试本轮 —— 网关输出审查只拦流式响应（逐 delta 扫描 reasoning/
+                #      content/tool_args），实测同一请求非流式原样放行，损失最小；
+                #   ② **保留图片**，改走本群 profile 的 `model_mini`（摘要模型）重试本轮 —— 换条上游通道；
+                #   ③ 图片被拦且仍不放行 → **剥离图片 + 换回原模型**重试本轮；
+                #   ④ 仍被拦 → 放弃：不再重试，按失败上报（matcher 只落 error log + 控制台，不入群、不清上下文）。
+                # 各步不会回环：`_review_nonstream_retried` / `_review_model_switched` / `_image_stripped` 各自只置位一次。
                 if is_content_review_error(err_text) and not _round_fx["text"] and not _round_fx["tools"]:
                     _is_image_block = "image data" in err_text
                     _cfg = request_state.get("config") if isinstance(request_state.get("config"), dict) else {}
                     _cur_model = _cfg.get("model") or ""
                     if not _review_original_model:
                         _review_original_model = _cur_model
+                    # ① 本轮走的是流式：同模型关流式重试（one-shot，仅本轮）
+                    if _round_used_stream and not _review_nonstream_retried:
+                        _review_nonstream_retried = True
+                        _force_nonstream_round = True
+                        logger.warning(
+                            f"请求被上游内容审查拦截（流式输出审查），本轮关流式用原模型 {_cur_model} 重试: {str(e)[:160]}"
+                        )
+                        continue
                     _mini_model = _cfg.get("model_mini") or ""
-                    # ① 保留图片，换本群摘要模型（model_mini）重试本轮
+                    # ② 保留图片，换本群摘要模型（model_mini）重试本轮
                     if not _review_model_switched and _mini_model and _mini_model != _cur_model:
                         _review_model_switched = True
                         _cfg["model"] = _mini_model
@@ -1910,7 +1989,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                             f"（保留图片，原模型 {_cur_model}）: {str(e)[:160]}"
                         )
                         continue
-                    # ② 图片被拦：剥离图片并换回原模型重试（messages 里确实有图才走这一步）
+                    # ③ 图片被拦：剥离图片并换回原模型重试（messages 里确实有图才走这一步）
                     _has_img_in_msgs = any(
                         isinstance(_m.get("content"), list)
                         and any(isinstance(c, dict) and c.get("type") == "image_url" for c in _m["content"])
@@ -1935,7 +2014,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                             f"换回原模型（{_review_original_model or _cur_model}）重试本轮: {str(e)[:160]}"
                         )
                         continue
-                    # ③ 阶梯用尽：按失败上报（不重试、不入群、不清理上下文）
+                    # ④ 阶梯用尽：按失败上报（不重试、不入群、不清理上下文）
                     _content_review_blocked = True
                     logger.warning(f"内容审查拦截未化解，按失败上报（不重试、不在群里提示）: {str(e)[:200]}")
                 # keep_reasoning=true 但 provider 不接受 reasoning_content（400）：

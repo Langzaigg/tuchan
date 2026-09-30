@@ -75,6 +75,11 @@ class ChatMessageData(StoreSerializable):
     # 同一用户在整个上下文中最多注入一次（首次触发时），随其绑定轮次一起被摘要/裁剪删除。
     is_impression: bool = field(default=False)
     impression_user_id: str = field(default="")
+    # 人设库带出的人设段（仅 is_impression 块使用，与印象/记忆共用同一条 system）：
+    # character_text 为渲染好的 [人设资料] 文本，character_versions 记录已带出的 {人设 id: 上游 updated_at}，
+    # 用于「窗口内已带出不重复带出、上游改过再带出一次」的判定。随块一起不落盘。
+    character_text: str = field(default="")
+    character_versions: Dict[str, float] = field(default_factory=dict)
     # 每张图片的元数据 [{sender, timestamp}]，与 images 平行；仅 context_only 块使用
     #（块内各行来自不同时间/发送者，图片过期判定需按张而非按块）。普通消息用 item.timestamp。
     image_meta: List[Dict[str, Any]] = field(default_factory=list)
@@ -103,6 +108,15 @@ class ChatMessageData(StoreSerializable):
         self.tool_call_summary = str(getattr(self, "tool_call_summary", "") or "")
         self.is_impression = bool(getattr(self, "is_impression", False))
         self.impression_user_id = str(getattr(self, "impression_user_id", "") or "")
+        self.character_text = str(getattr(self, "character_text", "") or "")
+        raw_versions = getattr(self, "character_versions", {}) or {}
+        self.character_versions = {}
+        if isinstance(raw_versions, dict):
+            for cid, ver in raw_versions.items():
+                try:
+                    self.character_versions[str(cid)] = float(ver or 0.0)
+                except (TypeError, ValueError):
+                    continue
         self.image_meta = [m for m in (getattr(self, "image_meta", []) or []) if isinstance(m, dict)]
         # 印象 system 在内存中保留以服务当次运行；持久化时由 PresetData._serializable 过滤掉（不落盘）。
         # 重启后历史轮的印象 system 丢失，下次该用户触发时按最新印象重新注入，避免旧印象残留。
@@ -122,8 +136,9 @@ class PresetData(StoreSerializable):
     is_only_private: bool = field(default=False)
 
     chat_impressions: Dict[str, ImpressionData] = field(default_factory=dict)
-    chat_memory: Dict[str, str] = field(default_factory=dict)  # 群记忆
-    user_memories: Dict[str, Dict[str, str]] = field(default_factory=dict)  # 用户个人记忆: {user_id: {key: value}}
+    # 群记忆已统一为会话级（ChatData.chat_memory，本群所有人格共享）；旧数据的人格级 chat_memory
+    # 加载时暂存到 _legacy_chat_memory，由 ChatData._init_from_dict 合并后清空
+    user_memories: Dict[str, Dict[str, str]] = field(default_factory=dict)  # 旧版人格级用户记忆，加载时迁移到全局后清空
     context_summary: str = field(default="")
     tool_call_summary: str = field(default="")  # 模式3: 最近一次工具调用的摘要
     prompt_messages: List[ChatMessageData] = field(default_factory=list)
@@ -159,8 +174,12 @@ class PresetData(StoreSerializable):
         self.is_locked = bool(getattr(self, "is_locked", False))
         self.is_default = bool(getattr(self, "is_default", False))
         self.is_only_private = bool(getattr(self, "is_only_private", False))
-        self.chat_memory = dict(getattr(self, "chat_memory", {}) or {})
-        
+        # 旧版人格级群记忆：暂存（下划线属性不落盘），由 ChatData 合并进会话级群记忆
+        raw_chat_memory = self.__dict__.pop("chat_memory", None)
+        self._legacy_chat_memory = {
+            str(k): str(v) for k, v in (raw_chat_memory or {}).items() if v
+        } if isinstance(raw_chat_memory, dict) else {}
+
         # 加载用户个人记忆
         raw_user_memories = getattr(self, "user_memories", {}) or {}
         self.user_memories = {}
@@ -247,8 +266,7 @@ class ChatData(StoreSerializable):
     preset_datas: Dict[str, PresetData] = field(default_factory=dict)
     next_message_index: int = field(default=0)
     chat_image_history: List[Dict[str, Any]] = field(default_factory=list)
-    global_memory_enabled: bool = field(default=False)  # 群级 global 记忆开关
-    global_chat_memory: Dict[str, str] = field(default_factory=dict)  # global 群记忆（所有人格共享）
+    chat_memory: Dict[str, str] = field(default_factory=dict)  # 群记忆（本群所有人格共享；用户记忆另存全局、跨群共享）
 
     def reset(self):
         self.chat_image_history.clear()
@@ -324,9 +342,34 @@ class ChatData(StoreSerializable):
                 max_seen_index = max(max_seen_index, index + 1)
         self.next_message_index = max_seen_index
 
-        self.global_memory_enabled = bool(getattr(self, "global_memory_enabled", False))
-        raw_global_chat_mem = getattr(self, "global_chat_memory", {}) or {}
-        self.global_chat_memory = {str(k): str(v) for k, v in raw_global_chat_mem.items() if v}
+        # 群记忆统一为会话级（旧 rg mem global 开关打开时的行为，开关已移除）。旧数据兼容：
+        # 已有会话级 chat_memory → 旧 global_chat_memory → 各人格下的旧群记忆，依次合并；
+        # 同名键内容不同时后来者改名为「键_人格名」保留，不丢数据。旧字段合并后移除、不再落盘。
+        merged: Dict[str, str] = {}
+
+        def _merge(source: Any, suffix: str = "") -> None:
+            if not isinstance(source, dict):
+                return
+            for k, v in source.items():
+                k, v = str(k), str(v or "")
+                if not v:
+                    continue
+                if k not in merged:
+                    merged[k] = v
+                elif merged[k] != v:
+                    alt = f"{k}_{suffix}" if suffix else f"{k}_旧"
+                    if alt not in merged:
+                        merged[alt] = v
+
+        _merge(getattr(self, "chat_memory", None))
+        _merge(self.__dict__.pop("global_chat_memory", None))
+        self.__dict__.pop("global_memory_enabled", None)
+        for preset_key, preset in self.preset_datas.items():
+            legacy = getattr(preset, "_legacy_chat_memory", None)
+            if legacy:
+                _merge(legacy, suffix=preset_key)
+                preset._legacy_chat_memory = {}
+        self.chat_memory = merged
         return self
 
 
@@ -334,7 +377,7 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
     """Persistent chat data manager."""
 
     _datas: Dict[str, ChatData] = {}
-    _global_user_memories: Dict[str, Dict[str, str]] = {}  # global 用户记忆: {user_id: {key: value}}
+    _global_user_memories: Dict[str, Dict[str, str]] = {}  # 用户个人记忆（跨群、跨人格共享）: {user_id: {key: value}}
     _custom_nicknames: Dict[str, str] = {}  # 用户自定义昵称: {user_id: nickname}
     _last_save_data_time: float = 0
     _file_path: str
@@ -575,14 +618,14 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
         return chat_data
 
     def get_global_user_memories(self, user_id: str) -> Dict[str, str]:
-        """获取指定用户的 global 记忆。不存在时自动创建。"""
+        """获取指定用户的个人记忆（跨群、跨人格共享）。不存在时自动创建。"""
         uid = str(user_id)
         if uid not in self._global_user_memories:
             self._global_user_memories[uid] = {}
         return self._global_user_memories[uid]
 
     def set_global_user_memories(self, user_id: str, memories: Dict[str, str]) -> None:
-        """设置指定用户的 global 记忆。"""
+        """设置指定用户的个人记忆（跨群、跨人格共享）。"""
         self._global_user_memories[str(user_id)] = memories
 
     def get_custom_nickname(self, user_id: str) -> str:
@@ -596,35 +639,6 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
             self._custom_nicknames[uid] = nickname
         else:
             self._custom_nicknames.pop(uid, None)
-
-    def init_global_memory(self, chat_key: str) -> str:
-        """为指定会话开启 global 群记忆，合并该会话所有人格的群记忆到 global 空间。返回合并报告。"""
-        chat_data = self._datas.get(chat_key)
-        if not chat_data:
-            return "会话不存在。"
-
-        chat_data.global_memory_enabled = True
-
-        # 合并该会话所有人格的群记忆
-        merged_group: Dict[str, str] = dict(chat_data.global_chat_memory)
-        group_parts = []
-        for preset_key, preset in chat_data.preset_datas.items():
-            if preset.chat_memory:
-                group_parts.append(f"{preset_key}: {len(preset.chat_memory)}条")
-                for k, v in preset.chat_memory.items():
-                    if k not in merged_group:
-                        merged_group[k] = v
-                preset.chat_memory.clear()
-        chat_data.global_chat_memory = merged_group
-
-        report_parts = []
-        if group_parts:
-            report_parts.append(f"群记忆 <- {', '.join(group_parts)}")
-        else:
-            report_parts.append("群记忆: 无合并")
-        report_parts.append("用户记忆: 固定全群全人格共享")
-
-        return "\n".join(report_parts)
 
 
 @driver.on_shutdown
