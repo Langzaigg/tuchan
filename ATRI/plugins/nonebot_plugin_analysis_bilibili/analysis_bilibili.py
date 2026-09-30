@@ -122,7 +122,8 @@ def extract(text: str) -> Tuple[str, Optional[str], Optional[str]]:
         elif mdid:
             url = f"https://api.bilibili.com/pgc/review/user?media_id={mdid[0][2:]}"
         elif room_id:
-            url = f"https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom?room_id={room_id[2]}"
+            # getInfoByRoom 已被 B 站风控（返回 code=-352），getH5InfoByRoom 结构相同且可用
+            url = f"https://api.live.bilibili.com/xlive/web-room/v1/index/getH5InfoByRoom?room_id={room_id[2]}"
         elif cvid:
             page = cvid[4]
             url = f"https://api.bilibili.com/x/article/viewinfo?id={page}&mobi_app=pc&from=web"
@@ -272,28 +273,35 @@ async def live_detail(url: str, session: ClientSession) -> Tuple[List[str], str]
             if res["code"] != 0:
                 return None, None
         res = res["data"]
-        uname = res["anchor_info"]["base_info"]["uname"]
-        room_id = res["room_info"]["room_id"]
-        title = res["room_info"]["title"]
+        room_info = res.get("room_info") or {}
+        if not room_info:
+            return None, None
+        uname = ((res.get("anchor_info") or {}).get("base_info") or {}).get("uname", "")
+        room_id = room_info.get("room_id")
+        title = room_info.get("title", "")
 
         has_image = False
         if analysis_display_image or "live" in analysis_display_image_list:
             has_image = True
 
+        cover_src = room_info.get("cover") or ""
         cover = (
-            resize_image(res["room_info"]["cover"], is_cover=True) if has_image else ""
+            resize_image(cover_src, is_cover=True) if has_image and cover_src else ""
         )
-        live_status = res["room_info"]["live_status"]
-        lock_status = res["room_info"]["lock_status"]
-        parent_area_name = res["room_info"]["parent_area_name"]
-        area_name = res["room_info"]["area_name"]
-        online = res["room_info"]["online"]
-        tags = res["room_info"]["tags"]
-        watched_show = res["watched_show"]["text_large"]
+        live_status = room_info.get("live_status", 0)
+        # getH5InfoByRoom 不返回 lock_status/lock_time/tags，缺失时按未封禁处理
+        lock_status = room_info.get("lock_status", 0)
+        parent_area_name = room_info.get("parent_area_name", "")
+        area_name = room_info.get("area_name", "")
+        online = room_info.get("online", 0)
+        tags = room_info.get("tags")
+        watched_show = (res.get("watched_show") or {}).get("text_large", "")
         vurl = f"https://live.bilibili.com/{room_id}\n"
         if lock_status:
-            lock_time = res["room_info"]["lock_time"]
-            lock_time = strftime("%Y-%m-%d %H:%M:%S", localtime(lock_time))
+            lock_time = room_info.get("lock_time")
+            lock_time = (
+                strftime("%Y-%m-%d %H:%M:%S", localtime(lock_time)) if lock_time else ""
+            )
             title = f"[已封禁]直播间封禁至：{lock_time}\n"
         elif live_status == 1:
             title = f"[直播中]标题：{title}\n"

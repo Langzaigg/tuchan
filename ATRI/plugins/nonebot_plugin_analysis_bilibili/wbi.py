@@ -7,7 +7,9 @@ from aiohttp import ClientSession
 # doc: https://github.com/SocialSisterYi/bilibili-API-collect/blob/master/docs/misc/sign/wbi.md
 
 headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0",
+    # 同 __init__.py：环境里 Brotli 1.1.0 与 aiohttp 3.13 不兼容，不能声明 br
+    "Accept-Encoding": "gzip, deflate",
 }
 
 # fmt: off

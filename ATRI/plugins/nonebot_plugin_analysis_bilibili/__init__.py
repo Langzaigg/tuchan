@@ -24,7 +24,11 @@ __plugin_meta__ = PluginMetadata(
 )
 
 headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0",
+    # 显式声明不接收 br：aiohttp 3.13 与环境中 Brotli 1.1.0 不兼容
+    # （Brotli.Decompressor 只有 process(data)，aiohttp 却调用 process(data, max_length)），
+    # 服务端一旦返回 br 就抛 ClientPayloadError。B 站直播接口会返回 br。
+    "Accept-Encoding": "gzip, deflate",
 }
 
 whitelist = [str(i) for i in getattr(config, "analysis_whitelist", [])]
