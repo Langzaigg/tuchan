@@ -358,6 +358,11 @@ async def handler(matcher_:Matcher, event: MessageEvent, bot:Bot) -> None:
         return
     
     chat_text, wake_up, image_urls = await gen_chat_payload(event=event, bot=bot)
+    # 唤醒判定用「纯文本段」拼出的真实句子：gen_chat_payload 会把 at 段渲染成「@昵称」插在句首，
+    # 回复上下文又会被注入 `[回复 … 的消息]` 前缀——两者都会把句首唤醒词挡掉（实测漏回复）。
+    _wake_text = "".join(
+        seg.data.get("text", "") for seg in event.message if seg.is_text()
+    ).strip()
 
     # 提取被回复消息的内容（文本 + 图片），作为上下文注入触发消息
     if getattr(event, 'reply', None) and event.reply.message:
@@ -417,6 +422,7 @@ async def handler(matcher_:Matcher, event: MessageEvent, bot:Bot) -> None:
         bot=bot,
         image_urls=image_urls,
         event=event,
+        wake_text=_wake_text,
     )
 
 """ ======== 注册通知响应器 ======== """
@@ -498,6 +504,12 @@ async def _(matcher_:Matcher, event: MessageEvent, bot:Bot, arg: Message = Comma
     if not permit_success:
         await identity.finish(permit_msg if permit_msg else "对不起！你没有权限进行此操作 ＞﹏＜")
 
+    # rg moss <画面描述>：MOSS 独立通道（摘要模型写提示词 → 出图），不经主模型。
+    # 走这里而不是 cmd 路由，是为了拿到 event 里本条消息 / 引用回复的参考图。
+    _moss_reply = _submit_moss_command(raw_cmd, event, bot, chat_key)
+    if _moss_reply is not None:
+        await identity.finish(_moss_reply)
+
     # 执行命令 *取消注释下列行以启用新的命令执行器*
     res = cmd.execute(
         chat=chat,
@@ -524,6 +536,64 @@ async def _(matcher_:Matcher, event: MessageEvent, bot:Bot, arg: Message = Comma
         if config.DEBUG_LEVEL > 0: logger.info(f"用户: {event.get_user_id()} 进行了人格预设编辑: {cmd}")
         PersistentDataManager.instance.save_to_file()  # 保存数据
     return
+
+
+""" ======== MOSS 画图指令（rg moss <画面描述>）======== """
+
+def _collect_moss_refs(event: MessageEvent) -> List[str]:
+    """收集本指令的参考图：本条消息自带的图 + 引用回复里的图（最多 4 张，保持顺序去重）。"""
+    urls: List[str] = []
+    sources: List[Message] = []
+    reply = getattr(event, "reply", None)
+    if reply is not None and getattr(reply, "message", None):
+        sources.append(reply.message)
+    sources.append(event.get_message())
+    for msg in sources:
+        for seg in msg:
+            if seg.type != "image":
+                continue
+            for key in ("url", "file"):
+                value = str(seg.data.get(key) or "")
+                if value.startswith(("http://", "https://")):
+                    urls.append(value)
+                    break
+    return list(dict.fromkeys(urls))[:4]
+
+
+def _submit_moss_command(raw_cmd: str, event: MessageEvent, bot: Bot, chat_key: str) -> Optional[str]:
+    """`rg moss <画面描述>` 的实际执行：解析描述 + 取参考图，交给 MOSS 独立通道。
+    返回要回复的文本；不是 moss 指令时返回 None（交给常规指令路由）。"""
+    cmd = (raw_cmd or "").lstrip()
+    match = re.match(r'^moss(?:\s+|$)', cmd, re.IGNORECASE)
+    if not match:
+        return None
+    idea = cmd[match.end():].strip()
+    from .llm_tool_plugins import moss_generate
+    if idea.lower() in ("on", "off"):
+        enabled = idea.lower() == "on"
+        moss_generate.set_moss_enabled(chat_key, enabled)
+        if enabled:
+            return "已开启 MOSS 触发：聊天里提到 moss（或需要画面内文字/分格排版）时会调用 MOSS 画图。"
+        return "已关闭 MOSS 触发：聊天里不再自动用 MOSS，只能用 rg moss <画面描述> 提交任务。"
+    if not idea:
+        state = "开启" if moss_generate.get_moss_enabled(chat_key) else "关闭"
+        return (
+            f"当前 MOSS 触发：{state}\n"
+            "用法：rg moss <画面描述>（可 @我 并附参考图）\n"
+            "      rg moss on|off  开启/关闭聊天里的 MOSS 触发\n"
+            "例：rg moss 雨夜街角的白猫，四格漫画，格子里写「又下雨了」"
+        )
+    ref_urls = _collect_moss_refs(event)
+    # 只有一张图 + 话里有改图意图时，这张图作为 VAE 改图底图（保持构图/比例）；
+    # 多图或只是「照着画」时仍走 TE 参考图路径。
+    edit = len(ref_urls) == 1 and moss_generate.looks_like_edit_intent(idea)
+    return moss_generate.submit_direct(
+        chat_key=chat_key,
+        bot_id=str(bot.self_id),
+        idea=idea,
+        ref_urls=ref_urls,
+        edit=edit,
+    )
 
 
 """ ======== 消息响应方法 ======== """
@@ -737,6 +807,14 @@ def _snapshot_request_profile(chat: Chat) -> Dict[str, Any]:
         profile["name"] = active_profile  # 稳定标识，供 per-profile 多 key 轮换索引用
         profile["api_keys"] = list(profile.get("api_keys", config.OPENAI_API_KEYS) or [""])
         profile["enable_stream"] = config.LLM_ENABLE_STREAM
+        # 会话级思考强度覆盖（rg model <profile> <effort>）：压过 profile 的 reasoning_effort。
+        # 显式 default 档把值置 None —— 请求层只在非 None 时才发，等价于「交给供应商默认」。
+        effort_override = chat.get_effort_override() if hasattr(chat, "get_effort_override") else ""
+        if effort_override:
+            if effort_override == config.REASONING_EFFORT_DEFAULT_TOKEN:
+                profile["reasoning_effort"] = None
+            else:
+                profile["reasoning_effort"] = effort_override
         return profile
     return {
         "api_keys": list(config.OPENAI_API_KEYS or [""]),
@@ -999,10 +1077,13 @@ async def do_msg_response(
     image_urls: Optional[List[str]] = None,
     event: Optional[Event] = None,
     recorded_msg: Optional[ChatMessageData] = None,
+    wake_text: Optional[str] = None,
 ): # type: ignore
     """消息响应方法。
     recorded_msg 非空表示该触发消息的 user 已写入 prompt_messages（循环邮箱残留重处理路径），
-    跳过唤醒/违禁/落库步骤，直接进入节流与 prompt 构造。"""
+    跳过唤醒/违禁/落库步骤，直接进入节流与 prompt 构造。
+    wake_text 是「真实的触发文本」（不含 matcher 注入的 `[回复 … 的消息]` 前缀），
+    只用于唤醒判定——否则回复别人的消息再喊角色名时，句首判断会被前缀挡掉。"""
     sender_name = sender_name or 'anonymous'
     chat:Chat = ChatManager.instance.get_or_create_chat(chat_key=chat_key)
     chat.apply_profile()  # 按群切换到对应的 OpenAI profile
@@ -1042,8 +1123,11 @@ async def do_msg_response(
                     return
 
             # 唤醒词检测（支持当前激活角色名，仅在句首出现时无条件唤醒）
-            # 多模态消息会把图片编成 [图片N] 插在文本前（如 [图片1][图片2]兔酱…），剥掉占位后再判句首
-            text_head = _IMG_MARKER_RE.sub("", incoming_text).lower().lstrip()
+            # 多模态消息会把图片编成 [图片N] 插在文本前（如 [图片1][图片2]兔酱…），剥掉占位后再判句首；
+            # 回复别人的消息会被 matcher 注入 `[回复 … 的消息]` 前缀，唤醒只看真实触发文本（wake_text），
+            # 否则「@别人 + 回复某条 + 兔酱…」的句首永远被前缀挡掉（曾实测漏回复）。
+            wake_source = incoming_text if wake_text is None else wake_text
+            text_head = _IMG_MARKER_RE.sub("", wake_source).lower().lstrip()
             wake_prefix = False
             if chat.preset_key.lower() and text_head.startswith(chat.preset_key.lower()):
                 wake_prefix = True
@@ -1068,8 +1152,8 @@ async def do_msg_response(
                         wake_up = True
                         break
 
-            # 判断是否需要回复
-            has_name_mention = any(n.lower() in incoming_text.lower() for n in list(BotSelfConfig.nickname) + [chat.preset_key])
+            # 判断是否需要回复（提及判定同样只看真实触发文本，被回复内容里的角色名不算在叫 bot）
+            has_name_mention = any(n.lower() in wake_source.lower() for n in list(BotSelfConfig.nickname) + [chat.preset_key])
             name_mention_reply = random.random() < config.REPLY_ON_NAME_MENTION_PROBABILITY and has_name_mention
             at_reply = config.REPLY_ON_AT and is_tome and '全体成员' not in incoming_text.lower()
             should_reply = wake_up or name_mention_reply or at_reply
@@ -1317,7 +1401,10 @@ async def do_msg_response(
     _in_think = False          # 是否正在 <think> 块内
     _think_buffer = ""          # 当前思考块的累积内容
     _extracted_reasoning = ""   # 从 content 中提取的完整思考内容
-    _thinking_mode = bool(request_profile.get("thinking", True))  # 该 profile 是否为思考模式（默认开启）
+    # 思考泄漏兜底（本变量只控制这一套）：全局开关 THINK_LEAK_GUARD 是总闸，profile 的 thinking 是二道闸。
+    # 总闸关掉后不会「收完再发」、也不会按短段落启发式切分——不走思考通道的模型（如 anthropic 协议下
+    # 不返回 thinking block 的 Claude）否则每条回复都会进缓冲+切分，既压延迟又可能误伤正常回复。
+    _thinking_mode = bool(request_profile.get("thinking", True)) and bool(getattr(config, "THINK_LEAK_GUARD", False))
     _saw_reasoning = False      # 本次是否收到过 reasoning_content（模型走了正常思考通道）
     _skip_think_buffer_mode = False  # 模型跳过思考标签、content 可能混入思考时，收完再发避免泄漏
     _tool_rounds = 0  # 本回复内已发生的工具轮数（每轮 tool_calls +1）：分段上限按轮放宽，中间轮文本各算一轮
@@ -1363,16 +1450,30 @@ async def do_msg_response(
         """漫画模式自动画图检查（每个回复/每次尾部补查至多执行一次）：
         有画图请求但该段回复未实际调用画图工具 → 用 mini 模型强制画图兜底，锚定该段请求；
         否则按空闲策略兜底。两种兜底提交前都 mark_manga_drawn 重置空闲计时，
-        保证同一触发内回复回调与尾部检查不会重复触发（否则一条消息会连画多张）。"""
+        保证同一触发内回复回调与尾部检查不会重复触发（否则一条消息会连画多张）。
+        moss 走的是另一条通道，调用过 generate_moss_image 即视为已画：既不补画，也不触发空闲兜底。"""
         from .llm_tool_plugins import anima_generate
         if not anima_generate.get_manga_mode(chat_key):
+            return
+        # 两个画图工具都算「已画」：MOSS 出手后同样不能再用漫画兜底补一张
+        _DRAW_TOOL_NAMES = {"generate_anima_image", "generate_moss_image"}
+        _moss_drew = False
+        for tm in tool_msgs or []:
+            if isinstance(tm, dict):
+                for tc in tm.get("tool_calls", []) or []:
+                    _name = tc.get("function", {}).get("name") if isinstance(tc, dict) else ""
+                    if _name == "generate_moss_image":
+                        _moss_drew = True
+        if _moss_drew:
+            # MOSS 已经出图：重新计时并直接返回，draw_reqs / 空闲两条兜底都不再触发
+            anima_generate.mark_manga_drawn(chat_key)
             return
         if draw_reqs:
             _drew = False
             for tm in tool_msgs or []:
                 if isinstance(tm, dict):
                     for tc in tm.get("tool_calls", []) or []:
-                        if isinstance(tc, dict) and tc.get("function", {}).get("name") == "generate_anima_image":
+                        if isinstance(tc, dict) and tc.get("function", {}).get("name") in _DRAW_TOOL_NAMES:
                             _drew = True
                             break
             if not _drew:

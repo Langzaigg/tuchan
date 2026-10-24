@@ -41,6 +41,13 @@ def get_tool_schemas(config, chat_key: str = "") -> List[Dict[str, Any]]:
             if model_schema:
                 schemas.append(model_schema)
                 continue
+        # MOSS 画图：独立通道，默认常驻暴露（由 schema description 约束调用时机：
+        # 用户提到 moss，或需要画面内文字/分格/海报级排版时才用；提示词由摘要模型撰写）。
+        # 本群 `rg moss off` 后不再暴露，只剩 rg moss <描述> 指令通道。
+        if name == "generate_moss_image" and chat_key:
+            from .llm_tool_plugins import moss_generate
+            if not moss_generate.get_moss_enabled(chat_key):
+                continue
         schemas.append(schema)
     return schemas
 

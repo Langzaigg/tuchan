@@ -258,10 +258,12 @@ class ChatData(StoreSerializable):
     enable_auto_switch_identity: bool = field(default=config.NG_ENABLE_AWAKE_IDENTITIES)
     active_preset: str = field(default="")
     active_profile: str = field(default="")  # 当前会话使用的 OpenAI profile
+    active_effort: str = field(default="")  # 当前会话的思考强度覆盖（空=用 profile 配置值；见 rg model）
     draw_mode: str = field(default="auto")  # 画图模式: force/on/auto/off
     draw_model: str = field(default="")  # 画图模型：上游工作流名（可选集由 /anima/workflows 动态决定），空 = 动态默认（首选 fuse）
     manga_mode: str = field(default="off")  # 漫画模式: on/off（开启后覆盖 draw_model，使用动态默认工作流）
     manga_style: str = field(default="")    # 漫画模式自定义画风描述
+    moss_enabled: bool = field(default=True)  # MOSS 触发开关：false 时聊天里不暴露 MOSS 工具，只能用 rg moss 提交
     unlock_content_limit: Optional[bool] = field(default=None)  # 内容限制解锁开关（None=使用配置默认值）
     preset_datas: Dict[str, PresetData] = field(default_factory=dict)
     next_message_index: int = field(default=0)
@@ -284,8 +286,19 @@ class ChatData(StoreSerializable):
         )
         self.active_preset = str(getattr(self, "active_preset", "") or "")
         self.active_profile = str(getattr(self, "active_profile", "") or "")
+        # 思考强度覆盖：合法档位 = low/medium/high/max + 显式 default（不传参），
+        # 脏数据（改名/手改存档）一律丢弃回落到 profile 配置
+        _raw_effort = str(getattr(self, "active_effort", "") or "").strip().lower()
+        _choices = tuple(getattr(config, "REASONING_EFFORT_CHOICES", ()) or ())
+        _default_token = getattr(config, "REASONING_EFFORT_DEFAULT_TOKEN", "default")
+        self.active_effort = _raw_effort if (_raw_effort in _choices or _raw_effort == _default_token) else ""
         raw_draw_mode = str(getattr(self, "draw_mode", "auto") or "auto")
         self.draw_mode = raw_draw_mode if raw_draw_mode in ("force", "on", "auto", "off") else "auto"
+        # MOSS 触发开关（rg moss on/off）：旧数据缺字段时默认开启；字符串脏值按 false/off/0 判否
+        _raw_moss = getattr(self, "moss_enabled", True)
+        if isinstance(_raw_moss, str):
+            _raw_moss = _raw_moss.strip().lower() not in ("", "0", "false", "off", "no")
+        self.moss_enabled = bool(_raw_moss)
         # 画图模型迁移：旧 turbo_mode(bool) → draw_model(str)
         # 合法取值由上游 /anima/workflows 动态决定，此处不做名单校验；
         # 旧内部名映射与默认值回退由读取侧的 anima_generate.get_draw_model() 完成

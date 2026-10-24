@@ -51,6 +51,17 @@ class Config(BaseModel, extra=Extra.ignore):
     DEFAULT_PROFILE_KEY: ClassVar[str] = "default"
     """OPENAI_PROFILES 内的默认指针键：值为真实 profile 名，指向默认使用的模型配置。"""
 
+    REASONING_EFFORT_CHOICES: ClassVar[tuple] = ("low", "medium", "high", "max")
+    """`rg model <profile> <effort>` 可选的思考强度（原样透传给 provider 的 reasoning_effort）；
+    不在名单内的值一律拒绝，避免把非法参数发给上游换回 400。"""
+
+    REASONING_EFFORT_DEFAULT_TOKEN: ClassVar[str] = "default"
+    """显式「不传思考参数」档：会话存这个值时，请求里完全省略 reasoning_effort，
+    由供应商自己决定思考强度（压过 profile 里配置的 reasoning_effort）。"""
+
+    REASONING_EFFORT_FOLLOW_TOKEN: ClassVar[str] = "auto"
+    """「跟随配置」档：清除会话覆盖，回到 profile 里配置的 reasoning_effort。"""
+
     def get_profile_names(self) -> List[str]:
         """全部真实 profile 名（跳过 default 指针这类非 dict 值）"""
         return [name for name, value in (self.OPENAI_PROFILES or {}).items() if isinstance(value, dict)]
@@ -198,6 +209,9 @@ class Config(BaseModel, extra=Extra.ignore):
     """分段消息发送最短间隔秒数"""
     REPLY_MAX_SEGMENTS: int
     """单次回复最多分段数，最后一段会接收剩余流式内容"""
+    THINK_LEAK_GUARD: bool
+    """思考泄漏兜底总开关。true 时才启用「无 reasoning 也无 <think> → 全部缓冲后按短段落启发式切分」这套判断；
+    默认 false：直接按正常分段流式发送（模型不回思考通道时不会误伤正常回复，也不会压着不发）"""
     THINK_LEAK_THRESHOLD: int
     """思考泄漏兜底阈值：思考模式下模型跳过思考标签、把思考混入 content 时，content 字符数超过此值且含双换行，则触发兜底切分，前段视为思考"""
     THINK_LEAK_SHORT_SEGMENT: int
@@ -243,6 +257,8 @@ class Config(BaseModel, extra=Extra.ignore):
     """ComfyUI Anima 画图是否开启，启动时自动 health check 后设置"""
     ANIMA_CHARACTERS_ENABLE: bool
     """人设库带出：对话提到的角色（含发言者自己的名字）从上游 /anima/characters 读取人设注入上下文（只读）"""
+    MOSS_ENABLE: bool
+    """MOSS 画图（上游独立接口 /moss/*）：用户明确说用 moss 画图时，由摘要模型独立撰写提示词后出图"""
 
     MANGA_IDLE_MINUTES: int
     """漫画模式下多少分钟未画图触发自动画图"""
@@ -342,6 +358,7 @@ CONFIG_TEMPLATE = {
     'NG_ENABLE_MSG_SPLIT': True,   # 是否启用消息分割
     'REPLY_SEGMENT_INTERVAL': 1.0,
     'REPLY_MAX_SEGMENTS': 5,
+    'THINK_LEAK_GUARD': False,  # 思考泄漏兜底总开关（默认关）：开启后模型不回 reasoning、也没有 <think> 标签时，收完再按短段落启发式切分
     'THINK_LEAK_THRESHOLD': 150,  # 思考泄漏兜底阈值（字符数），思考模式下 content 超过此值且含双换行则触发兜底切分
     'THINK_LEAK_SHORT_SEGMENT': 50,  # 兜底切分短段阈值（字符数）：分段后从第一个短于该值的段落开始视为真实回复，避免回复开头的短句被误判为思考
     'NG_ENABLE_AWAKE_IDENTITIES': True, # 是否允许自动唤醒其它人格
@@ -370,6 +387,7 @@ CONFIG_TEMPLATE = {
     'COMFYUI_BASE_URL': 'http://127.0.0.1:8188',
     'COMFYUI_ENABLED': False,
     'ANIMA_CHARACTERS_ENABLE': True,  # 人设库带出（上游 /anima/characters，只读；与 COMFYUI_BASE_URL 同一服务）
+    'MOSS_ENABLE': True,  # MOSS 画图（上游 /moss/*；用户明确说用 moss 画时才触发，提示词由摘要模型撰写）
 
     'MANGA_IDLE_MINUTES': 5,
     'MANGA_IDLE_ROUNDS': 5,

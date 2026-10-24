@@ -19,10 +19,10 @@ from .singleton import Singleton
 # 工具调用限制常量（从配置读取，这些是默认值）
 MAX_TOTAL_TOOL_CALLS = 15  # 单轮总工具调用次数限制，实际值从 LLM_MAX_TOTAL_TOOL_CALLS 配置读取
 MAX_SEARCH_TOOL_CALLS = 3  # 单轮搜索工具调用次数限制
-TERMINAL_TOOLS = {"generate_anima_image", "remember"}  # 终端工具：超限后仍允许最后一次调用
+TERMINAL_TOOLS = {"generate_anima_image", "generate_moss_image", "remember"}  # 终端工具：超限后仍允许最后一次调用
 SEARCH_TOOL_NAMES = {"bocha_search", "tavily_search"}  # 搜索工具名称
-# 仅在画图场景下暴露的工具：画图工具本体 + 为它确定作画标签的 danbooru_search
-_DRAW_ONLY_TOOLS = {"generate_anima_image", "danbooru_search"}
+# 仅在画图场景下暴露的工具：画图工具本体 + 为它确定作画标签的 danbooru_search / 参考图反推的 anima_reverse_tag
+_DRAW_ONLY_TOOLS = {"generate_anima_image", "generate_moss_image", "danbooru_search", "anima_reverse_tag"}
 
 _CURRENT_CHAT_KEY: ContextVar[str] = ContextVar("naturel_gpt_current_chat_key", default="")
 _CURRENT_TRIGGER_USERID: ContextVar[str] = ContextVar("naturel_gpt_current_trigger_userid", default="")
@@ -173,6 +173,16 @@ _FORCE_DRAW_HINT_TEXT = (
     "当前用户明确要求作画。你必须通过 tool_calls 调用 generate_anima_image 工具完成作画，"
     "禁止只在文字里说「画了」「在画了」「等图吧」而不实际调用工具；任务编号只能由工具返回，禁止编造。"
 )
+# force 模式 + 触发句同时提到 moss 与画图意图（画/p/图/换…）时改注入这条：
+# 用户点名要 moss 就不能推回 generate_anima_image（MOSS 的画面内文字/分格能力是这次请求的重点）
+_FORCE_MOSS_HINT_TEXT = (
+    "当前用户明确要求用 MOSS 作画。你必须通过 tool_calls 调用 generate_moss_image 工具完成作画，"
+    "不要改调 generate_anima_image，也不要在文字里假装已经画了；"
+    "只需要把画面构思（画什么、场景、要出现的文字）交给该工具，提示词由后台模型撰写。"
+    "任务编号只能由工具返回，禁止编造。"
+)
+# moss force 提示的「画图意图」判定词：用户口径为 画 / p / 图 / 换 等
+_MOSS_DRAW_INTENT_WORDS = ("画", "p", "图", "换", "draw")
 # 轮数上限的最后一轮：除 tool_choice="none" 外再明说一句。DeepSeek 系模型在 tool_choice="none"
 # 下仍会"想"调工具，服务端不再解析，原生 DSML 标记就原样落进 content（群里出现一串
 # <｜DSML｜calls>…）；明确告知"不能再调了、直接说结果"能显著降低这种泄漏。
@@ -274,7 +284,8 @@ def strip_tool_call_xml(content: str) -> str:
 # 历史上下文中隐去单号的占位符（与 chat_prompt.py 一致）
 _TASK_ID_PLACEHOLDER = '[请调用 generate_anima_image 画图工具获取编号]'
 _TASK_ID_PLACEHOLDER_RE = re.compile(
-    r'\[[^\]\n]*(?:编号已隐藏|请调用\s*generate_anima_image|generate_anima_image\s*画图工具)[^\]\n]*\]'
+    r'\[[^\]\n]*(?:编号已隐藏|请调用\s*generate_anima_image|generate_anima_image\s*画图工具'
+    r'|请调用\s*generate_moss_image|generate_moss_image\s*画图工具)[^\]\n]*\]'
 )
 
 
@@ -548,6 +559,7 @@ class TextGenerator(Singleton["TextGenerator"]):
         self.proxy = proxy
         self.base_url = base_url
         self.extra_prompt = extra_prompt or ""
+        self.protocol = ""  # "" / "openai" = OpenAI 兼容；"anthropic" = /v1/messages 原生协议
         self.last_tool_outputs: List[Dict[str, Any]] = []
         self._last_tool_outputs_by_chat: Dict[str, List[Dict[str, Any]]] = {}
         self._current_chat_key: str = ""  # 当前会话的chat_key，供工具使用
@@ -685,6 +697,7 @@ class TextGenerator(Singleton["TextGenerator"]):
         self.base_url = profile.get("base_url", "")
         self.use_socket_proxy = profile.get("use_socket_proxy", False)
         self.proxy = profile.get("proxy") or None
+        self.protocol = str(profile.get("protocol", "") or "").strip().lower()
         self.multimodal = profile.get("multimodal", True)
         self.extra_prompt = profile.get("extra_prompt", "") or ""
         self.config = {
@@ -701,7 +714,8 @@ class TextGenerator(Singleton["TextGenerator"]):
             "reasoning_effort": profile.get("reasoning_effort"),
         }
         proxy_info = f"socks:{self.proxy}" if self.use_socket_proxy and self.proxy else ("直连" if not self.proxy else self.proxy)
-        return f"模型: {self.config['model']} | mini: {self.config['model_mini']} | base_url: {self.base_url or '默认'} | 代理: {proxy_info}"
+        protocol_info = f" | 协议: {self.protocol}" if self.protocol and self.protocol != "openai" else ""
+        return f"模型: {self.config['model']} | mini: {self.config['model_mini']} | base_url: {self.base_url or '默认'} | 代理: {proxy_info}{protocol_info}"
 
     @staticmethod
     def _profile_key_id(profile: Dict[str, Any]) -> str:
@@ -783,6 +797,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                 "proxy": profile.get("proxy") or None,
                 "use_socket_proxy": profile.get("use_socket_proxy", False),
                 "multimodal": profile.get("multimodal", True),
+                "protocol": str(profile.get("protocol", "") or "").strip().lower(),
                 "keep_reasoning": bool(profile.get("keep_reasoning", False)),
             }
         api_key, api_key_index = self._key_plan(self._SINGLETON_KEY_SCOPE, list(self.api_keys or [""]))
@@ -795,6 +810,7 @@ class TextGenerator(Singleton["TextGenerator"]):
             "proxy": self.proxy,
             "use_socket_proxy": getattr(self, "use_socket_proxy", False),
             "multimodal": getattr(self, "multimodal", True),
+            "protocol": str(getattr(self, "protocol", "") or "").lower(),
             "keep_reasoning": bool(self.config.get("keep_reasoning", False)),
         }
 
@@ -886,11 +902,12 @@ class TextGenerator(Singleton["TextGenerator"]):
             value = request_config.get(optional_key)
             if value is not None:
                 kwargs[optional_key] = value
-        # reasoning_effort（如 "low"/"medium"/"high"）：仅主对话请求透传，摘要/印象走 model_mini 不传
-        if type not in {"summarize", "impression"}:
-            reasoning_effort = request_config.get("reasoning_effort")
-            if reasoning_effort is not None:
-                kwargs["reasoning_effort"] = reasoning_effort
+        # reasoning_effort（如 "low"/"medium"/"high"）：与主对话共享同一套思考预算设置，
+        # 摘要/印象（model_mini）同样透传 —— 摘要模型要一次性规划整页 layout + 逐字转写文字，
+        # 关掉思考预算会让它写得更随意、同一提示词两次结果差异很大。
+        reasoning_effort = request_config.get("reasoning_effort")
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
         if state.get("base_url"):
             kwargs["base_url"] = state["base_url"]
         # 代理：use_socket_proxy=True 时将 proxy 作为 socks 代理地址
@@ -905,6 +922,10 @@ class TextGenerator(Singleton["TextGenerator"]):
                 kwargs["tool_choice"] = "auto"
             elif tool_choice != "":
                 kwargs["tool_choice"] = tool_choice
+        # 传输协议（openai / anthropic）：只在请求层消费，不会出现在 provider body 里
+        protocol = str(state.get("protocol") or "").lower()
+        if protocol:
+            kwargs["protocol"] = protocol
         return kwargs
 
     def _normalize_prompt(self, prompt, custom: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -1094,7 +1115,61 @@ class TextGenerator(Singleton["TextGenerator"]):
                         continue
 
     async def _acompletion(self, **kwargs) -> Dict[str, Any]:
+        if str(kwargs.get("protocol") or "").lower() == "anthropic":
+            return await self._request_anthropic(kwargs)
         return await self._request_openai_compatible(kwargs)
+
+    async def _request_anthropic(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """非流式调用 Anthropic `/v1/messages`，返回 OpenAI chat.completion 结构。"""
+        import httpx
+        from . import anthropic_func
+
+        kwargs = dict(kwargs)
+        kwargs.pop("protocol", None)
+        timeout = kwargs.get("timeout", 30)
+        proxy = kwargs.get("proxy")
+        url, headers, body = anthropic_func.build_request(kwargs)
+        headers.update(_build_provider_headers(str(kwargs.get("base_url") or "")))
+
+        client_kwargs: Dict[str, Any] = {"timeout": httpx.Timeout(float(timeout))}
+        if proxy:
+            client_kwargs["proxy"] = proxy
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            response = await client.post(url, headers=headers, json=body)
+            if response.status_code >= 400:
+                raise RuntimeError(f"HTTP {response.status_code}: {response.text[:1000]}")
+            return anthropic_func.message_to_completion(response.json())
+
+    async def _stream_iter_anthropic(self, kwargs: Dict[str, Any]):
+        """流式调用 Anthropic `/v1/messages`，YIELD 与 OpenAI chunk 同构的字典。"""
+        import httpx
+        from . import anthropic_func
+
+        kwargs = dict(kwargs)
+        kwargs.pop("protocol", None)
+        kwargs["stream"] = True
+        timeout = kwargs.get("timeout", 30)
+        proxy = kwargs.get("proxy")
+        base_url = str(kwargs.get("base_url") or "")
+        url, headers, body = anthropic_func.build_request(kwargs)
+        headers.update(_build_provider_headers(base_url))
+
+        http_timeout = httpx.Timeout(connect=10.0, read=float(timeout), write=30.0, pool=10.0)
+        client_kwargs: Dict[str, Any] = {"timeout": http_timeout}
+        if proxy:
+            client_kwargs["proxy"] = proxy
+
+        MAX_TOTAL_SECONDS = 300.0
+        start_time = time.monotonic()
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            async with client.stream("POST", url, headers=headers, json=body) as response:
+                if response.status_code >= 400:
+                    body_text = (await response.aread()).decode("utf-8", errors="replace")[:1000]
+                    raise RuntimeError(f"HTTP {response.status_code}: {body_text}")
+                async for chunk in anthropic_func.stream_to_openai_chunks(response):
+                    if time.monotonic() - start_time > MAX_TOTAL_SECONDS:
+                        raise RuntimeError(f"流式响应超过总时间上限 {MAX_TOTAL_SECONDS:.0f}s，已中断")
+                    yield chunk
 
     async def _stream_once(
         self,
@@ -1114,7 +1189,14 @@ class TextGenerator(Singleton["TextGenerator"]):
         last_usage: Optional[Dict[str, Any]] = None
         tool_call_notified = False  # 本轮是否已通知过工具调用（每个流式轮只通知一次）
 
-        async for chunk in self._stream_iter_openai(kwargs):
+        # 传输协议分流：anthropic 走 /v1/messages 原生协议，但产出与 OpenAI chunk 同构，
+        # 下面的文本/reasoning/工具增量处理完全复用
+        protocol = str(kwargs.get("protocol") or "").lower()
+        stream_iter = (
+            self._stream_iter_anthropic(kwargs) if protocol == "anthropic"
+            else self._stream_iter_openai(kwargs)
+        )
+        async for chunk in stream_iter:
             # provider 以 HTTP 200 在流内下发上游错误（该 chunk 既无 choices 也无 usage）：
             # 若继续静默跳过，本轮会以空内容“成功”返回，上层拿不到任何错误、也不会重试，
             # 表现为机器人一声不吭。抬成异常交由 stream_response 的 except 统一处理。
@@ -1286,7 +1368,35 @@ class TextGenerator(Singleton["TextGenerator"]):
         self.last_tool_outputs = []
         if request_chat_key:
             self._last_tool_outputs_by_chat[request_chat_key] = []
-        tool_schemas = get_tool_schemas(plugin_config, request_chat_key) if plugin_config and type == "chat" else []
+        # 触发句（最后一条 user 消息）先算出来：画图关键词与 MOSS 触发都要用它，
+        # 供 force 模式区分 anima / moss 两套强制提示。
+        _DRAWING_KEYWORDS = ("画", "draw", "改图", "重画", "来一张", "整一张")
+        _trigger_text = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                c = msg.get("content", "")
+                if isinstance(c, list):
+                    c = " ".join(
+                        item.get("text", "") for item in c
+                        if isinstance(item, dict) and item.get("type") == "text"
+                    )
+                _trigger_text = str(c or "")
+                break
+        _has_draw_request = any(kw in _trigger_text.lower() for kw in _DRAWING_KEYWORDS)
+        # MOSS：工具常驻暴露（不按触发句屏蔽，本群 rg moss off 时 get_tool_schemas 会过滤），
+        # 这里只判定「本轮是不是点名要 moss 且本群开启了触发」，供 force 模式选提示文案。
+        from .llm_tool_plugins import moss_generate as _moss
+        _has_moss_request = (
+            type == "chat"
+            and bool(request_chat_key)
+            and _moss.get_moss_enabled(request_chat_key)
+            and _moss.mentions_moss(_trigger_text)
+        )
+        _has_moss_draw_intent = any(k in _trigger_text.lower() for k in _MOSS_DRAW_INTENT_WORDS)
+        tool_schemas = (
+            get_tool_schemas(plugin_config, request_chat_key)
+            if plugin_config and type == "chat" else []
+        )
         max_rounds = getattr(plugin_config, "LLM_MAX_TOOL_ROUNDS", 0) if plugin_config else 0
         max_total_tool_calls = getattr(plugin_config, "LLM_MAX_TOTAL_TOOL_CALLS", MAX_TOTAL_TOOL_CALLS) if plugin_config else MAX_TOTAL_TOOL_CALLS
 
@@ -1297,7 +1407,7 @@ class TextGenerator(Singleton["TextGenerator"]):
         # 工具调用计数器
         total_tool_calls = 0  # 总工具调用次数
         search_tool_calls = 0  # 联网搜索工具调用次数
-        has_anima_call = False  # 是否已调用过 generate_anima_image 画图工具
+        has_draw_call = False  # 是否已调用过画图工具（generate_anima_image / generate_moss_image）
         _allow_terminal_tools = False  # 工具超限后进入终端阶段：允许终端工具（画图/记忆）单次调用后收尾
         _terminal_wrapup_pending = False  # 终端工具已执行一次，下一轮为无工具收尾轮（tool_choice="none"）
         _bad_json_retries = 0  # 工具参数 JSON 全丢的重试次数（≤1，第二次撤工具强制出文本）
@@ -1320,16 +1430,7 @@ class TextGenerator(Singleton["TextGenerator"]):
         # 否则重复发消息、重复跑画图。用 dict 存放，嵌套函数里无需 nonlocal 声明即可置位。
         _round_fx = {"text": False, "tools": False}
 
-        # 检测用户消息中是否包含画图相关关键词
-        _DRAWING_KEYWORDS = ("画", "draw", "改图", "重画", "来一张", "整一张")
-        _has_draw_request = False
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                c = msg.get("content", "")
-                if isinstance(c, list):
-                    c = " ".join(item.get("text", "") for item in c if isinstance(item, dict) and item.get("type") == "text")
-                _has_draw_request = any(kw in c.lower() for kw in _DRAWING_KEYWORDS)
-                break
+        # 画图关键词已在 schema 构建前算好（_trigger_text / _has_draw_request）
 
         # 画图工具常驻注册（auto/on/force 与漫画模式），仅 off 模式过滤；
         # 调用时机改由工具 description 与 S1 画图行为规则约束，保持 tools 数组稳定以最大化缓存命中
@@ -1482,18 +1583,29 @@ class TextGenerator(Singleton["TextGenerator"]):
                 # 会 400），改为在消息尾部注入强制画图提示（仅一次；尾部追加不破坏历史前缀缓存；
                 # 末尾是 assistant(tool_calls) 时跳过注入，避免 system 隔断 tool_calls → tool 响应的
                 # 连续配对）。模型仍不调用时由 matcher 的伪造编号拦截/漫画强制画图兜底。
+                # 触发句同时提到 moss 且有画图意图（画/p/图/换…）时改注入 MOSS 版提示，
+                # 避免模型把请求推回 generate_anima_image。
+                _force_moss_request = (
+                    type == "chat"
+                    and _draw_mode == "force"
+                    and _has_moss_request
+                    and _has_moss_draw_intent
+                )
                 if (
-                    _force_draw_request
-                    and not has_anima_call
+                    (_force_moss_request or _force_draw_request)
+                    and not has_draw_call
                     and not _force_draw_hint_injected
                 ):
                     _force_draw_hint_injected = True
                     _tail_msg = messages[-1] if messages else {}
                     if not (_tail_msg.get("role") == "assistant" and _tail_msg.get("tool_calls")):
-                        messages.append({"role": "system", "content": _FORCE_DRAW_HINT_TEXT})
+                        messages.append({
+                            "role": "system",
+                            "content": _FORCE_MOSS_HINT_TEXT if _force_moss_request else _FORCE_DRAW_HINT_TEXT,
+                        })
                         logger.info(
-                            f"force 模式：已在尾部注入强制画图提示（不使用 tool_choice） | "
-                            f"type={type} | 会话: {request_chat_key or 'unknown'}"
+                            f"force 模式：已在尾部注入强制画图提示（{'moss' if _force_moss_request else 'anima'}）"
+                            f" | type={type} | 会话: {request_chat_key or 'unknown'}"
                         )
 
                 # 最后一轮 tools 数组保持全量不变，改传 tool_choice="none" 强制模型直接回复（保住缓存前缀）；
@@ -1550,7 +1662,7 @@ class TextGenerator(Singleton["TextGenerator"]):
 
                 def _merge_intermediate(content: str) -> str:
                     raw = _join_intermediate(content)
-                    return sanitize_draw_reply_text(raw, allow_task_ids=has_anima_call)
+                    return sanitize_draw_reply_text(raw, allow_task_ids=has_draw_call)
 
                 control_stream_buf: Optional[List[str]] = None
                 effective_on_text = round_on_text
@@ -1566,7 +1678,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                     if not on_text or not control_stream_buf:
                         return
                     safe_text = sanitize_internal_control_text("".join(control_stream_buf))
-                    safe_text = sanitize_draw_reply_text(safe_text, allow_task_ids=has_anima_call)
+                    safe_text = sanitize_draw_reply_text(safe_text, allow_task_ids=has_draw_call)
                     if safe_text:
                         _round_fx["text"] = True  # 已流出文字 → 本轮不可再重试
                         await on_text(safe_text)
@@ -1767,7 +1879,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                         if _clean_content is None:
                             continue
                         content = _clean_content
-                        safe_content = sanitize_draw_reply_text(content, allow_task_ids=has_anima_call)
+                        safe_content = sanitize_draw_reply_text(content, allow_task_ids=has_draw_call)
                         if on_text and safe_content:
                             await on_text(safe_content)
                         merged_reply = _merge_intermediate(content)
@@ -1784,7 +1896,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                     if _terminal_wrapup_pending:
                         # 收尾轮模型仍返回 tool_calls（不遵守 tool_choice="none"）：不再执行工具，直接以已产出文本收尾
                         final_reasoning_content = message_dict.get("reasoning_content", "")
-                        safe_content = sanitize_draw_reply_text(content, allow_task_ids=has_anima_call)
+                        safe_content = sanitize_draw_reply_text(content, allow_task_ids=has_draw_call)
                         if on_text and safe_content:
                             await on_text(safe_content)
                         merged_reply = _merge_intermediate(content)
@@ -1793,7 +1905,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                         await _insert_mailbox_entries(reply_completed=True)
                         return _joined_reply_text(merged_reply), True, tool_messages, final_reasoning_content
                     if is_last_round and not _allow_terminal_tools:
-                        safe_content = sanitize_draw_reply_text(content, allow_task_ids=has_anima_call)
+                        safe_content = sanitize_draw_reply_text(content, allow_task_ids=has_draw_call)
                         if on_text and safe_content:
                             await on_text(safe_content)
                         if content or intermediate_texts:
@@ -1842,14 +1954,15 @@ class TextGenerator(Singleton["TextGenerator"]):
                 if safe_intermediate and safe_intermediate.strip():
                     intermediate_texts.append(safe_intermediate.strip())
 
-                # 检测是否调用了画图工具（含终端工具轮）
+                # 检测是否调用了画图工具（含终端工具轮）；两个通道都算「已画」，
+                # force 提示与画图兜底据此收手，避免 moss 出图后又补一张 anima
                 if not is_last_round or _allow_terminal_tools:
-                    anima_in_tool_calls = any(
-                        _get(_get(tc, "function", {}), "name", "") == "generate_anima_image"
+                    draw_in_tool_calls = any(
+                        _get(_get(tc, "function", {}), "name", "") in ("generate_anima_image", "generate_moss_image")
                         for tc in tool_calls
                     )
-                    if anima_in_tool_calls:
-                        has_anima_call = True
+                    if draw_in_tool_calls:
+                        has_draw_call = True
 
                 # 检查工具调用限制
                 # 终端工具轮：过滤掉非终端工具调用，只执行允许的终端工具

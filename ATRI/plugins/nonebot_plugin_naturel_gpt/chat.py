@@ -67,6 +67,14 @@ class Chat(ChatMemoryMixin, ChatSummaryMixin, ChatHistoryMixin, ChatPromptMixin)
         """设置当前会话的 profile"""
         self._chat_data.active_profile = profile_name
 
+    def get_effort_override(self) -> str:
+        """当前会话的思考强度覆盖（空串 = 跟随 profile 配置里的 reasoning_effort）"""
+        return str(self._chat_data.active_effort or "")
+
+    def set_effort_override(self, effort: str) -> None:
+        """设置当前会话的思考强度覆盖；传空串清除覆盖、回到 profile 配置值。"""
+        self._chat_data.active_effort = str(effort or "")
+
     def get_unlock_content_limit(self) -> bool:
         """获取当前会话的内容限制解锁开关（None 时回退到配置默认值）"""
         val = self._chat_data.unlock_content_limit

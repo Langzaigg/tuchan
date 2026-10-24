@@ -150,7 +150,7 @@ class ChatSummaryMixin:
             return
 
         SEARCH_TOOLS = {"tavily_search", "browse_url"}  # bocha 已改为 tavily 内部 fallback，不再产生独立工具结果
-        IGNORED_TOOLS = {"generate_anima_image"}  # 工具结果不进历史；调用本身转为 [作画记录] 轻量留痕（见下）
+        IGNORED_TOOLS = {"generate_anima_image", "generate_moss_image"}  # 工具结果不进历史；调用本身转为 [作画记录] 轻量留痕（见下）
 
         search_entries: List[Dict[str, Any]] = []
         other_entries: List[Dict[str, Any]] = []
@@ -166,9 +166,13 @@ class ChatSummaryMixin:
                     except Exception:
                         args = {}
                     if name in IGNORED_TOOLS:
-                        if name == "generate_anima_image" and isinstance(args, dict):
-                            desc_parts = [str(args.get(k)).strip() for k in ("tags", "nltags") if str(args.get(k) or "").strip()]
-                            draw_descs.append("；".join(desc_parts) if desc_parts else "（无画面描述）")
+                        if isinstance(args, dict):
+                            if name == "generate_anima_image":
+                                desc_parts = [str(args.get(k)).strip() for k in ("tags", "nltags") if str(args.get(k) or "").strip()]
+                                draw_descs.append("；".join(desc_parts) if desc_parts else "（无画面描述）")
+                            else:
+                                # MOSS：主模型只给画面构思，提示词在后台由摘要模型撰写，这里也只用构思留痕
+                                draw_descs.append(str(args.get("idea") or "").strip() or "（无画面描述）")
                         continue
                     entry = {"name": name, "args": args}
                     if name in SEARCH_TOOLS:
@@ -205,7 +209,7 @@ class ChatSummaryMixin:
             draw_line = (
                 f"[作画记录] 以上作画任务已完成并发送，画面内容：{'；'.join(draw_descs)}。"
                 "该记录仅表示上述任务已完成；之后任何新的作画请求（含修改/重画/再画一张）"
-                "都必须重新调用 generate_anima_image 工具。"
+                "都必须重新调用对应的画图工具。"
             )
 
         def _raw_part(entries: List[Dict[str, Any]], sep: str = "; ") -> str:

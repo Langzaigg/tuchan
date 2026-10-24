@@ -502,6 +502,7 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
             f"  rg draw <模型名>  切换画图模型\n"
             f"  rg draw <json字符串>  根据 JSON 创建绘图任务\n"
             f"  rg draw-XXXXXX  查询绘图提示词\n"
+            f"  rg moss <画面描述>  用 MOSS 画一张（独立通道，擅长画面内文字/分格）\n"
             f"可用模型: {models_desc}"
         )}
 
@@ -781,15 +782,22 @@ def _create_draw_task_from_json(json_str: str, chat: Chat) -> dict:
 @cmd.register(route='rg/model', params=['profile_name'])
 def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
     from .openai_func import TextGenerator
-    profile_name = param_dict.get('profile_name', '').strip()
+    raw_arg = param_dict.get('profile_name', '').strip()
+    # `rg model kimi low`：params 只有一项，剩余内容会被拼进来，这里自己拆成「配置名 + 思考强度」
+    tokens = [t for t in raw_arg.split() if t]
+    choices = tuple(config.REASONING_EFFORT_CHOICES)
+    default_token = config.REASONING_EFFORT_DEFAULT_TOKEN   # 显式 default 档：请求里不带思考参数
+    follow_token = config.REASONING_EFFORT_FOLLOW_TOKEN     # auto：清除覆盖，回到配置值
+    effort_words = choices + (default_token, follow_token)
     # 真实模型配置名（跳过 OPENAI_PROFILES 里的 default 指针）
     names = config.get_profile_names()
+    current_effort = chat.get_effort_override()
 
     if not names:
         return {'msg': "未配置 OPENAI_PROFILES，无法切换"}
 
     # 无参数：列出所有 profile 及当前会话的配置
-    if not profile_name:
+    if not tokens:
         chat_profile = chat.get_active_profile()
         lines = [f"默认配置: {config.get_default_profile_name()}", "可用配置:"]
         for name in names:
@@ -800,24 +808,88 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
             if not p.get("multimodal", True) and p.get("model_vision"):
                 vision_tag = f" / 视觉:{p.get('model_vision')}"
             lines.append(f"  {name}: {p.get('model', '?')} / {p.get('model_mini', '?')}{vision_tag}{marker}")
-        lines.append(f"\n用法: rg model <配置名>")
+        active_cfg_effort = str(config.get_profile(chat_profile).get("reasoning_effort") or "")
+        if current_effort == default_token:
+            effort_line = f"{default_token}（不发送思考参数，用供应商默认）"
+        elif current_effort:
+            effort_line = f"{current_effort}（本会话覆盖）"
+        else:
+            effort_line = f"跟随配置（{active_cfg_effort or '配置未设置 → 不发送该参数'}）"
+        lines.append(f"\n思考强度: {effort_line}")
+        lines.append(f"\n用法: rg model <配置名> [{'/'.join(choices)}|{default_token}|{follow_token}]")
         return {'msg': '\n'.join(lines)}
 
-    # 切换 profile（按群）；default 是指针键（值为字符串）时不能当配置名切，
-    # 老配置里 default 仍是真实模型配置 dict 时依旧可切（names 只收 dict 条目）
-    if profile_name not in names:
-        if profile_name == config.DEFAULT_PROFILE_KEY:
-            return {'msg': f"'{config.DEFAULT_PROFILE_KEY}' 是指针，不是配置名。可用: {', '.join(names)}"}
-        return {'msg': f"配置 '{profile_name}' 不存在，可用: {', '.join(names)}"}
+    if len(tokens) > 2:
+        return {'msg': f"参数过多。用法: rg model <配置名> [{'/'.join(choices)}|{default_token}|{follow_token}]"}
 
-    profile = config.get_profile(profile_name)
-    chat.set_active_profile(profile_name)
-    # 立即应用到 TextGenerator
-    tg = TextGenerator.instance
-    tg.switch_profile(profile_name, profile)
+    profile_name = ''
+    effort_token = ''
+    if len(tokens) == 2:
+        # 两项时第一项必须是配置名，第二项是思考强度
+        if tokens[0] not in names:
+            if tokens[0] == config.DEFAULT_PROFILE_KEY:
+                return {'msg': f"'{config.DEFAULT_PROFILE_KEY}' 是指针，不是配置名。可用: {', '.join(names)}"}
+            return {'msg': f"配置 '{tokens[0]}' 不存在，可用: {', '.join(names)}"}
+        profile_name, effort_token = tokens[0], tokens[1].lower()
+    else:
+        token = tokens[0]
+        if token in names:
+            profile_name = token
+        elif token in effort_words:
+            # 只给一个强度：不改配置，只调本会话思考强度
+            effort_token = token.lower()
+        elif token == config.DEFAULT_PROFILE_KEY:
+            return {'msg': f"'{config.DEFAULT_PROFILE_KEY}' 是指针，不是配置名。可用: {', '.join(names)}"}
+        else:
+            return {'msg': f"配置 '{token}' 不存在，可用: {', '.join(names)}"}
+
+    # 思考强度：先校验，避免切了配置却带着非法参数
+    effort_action = ''  # ''=不动 / 'set' / 'set_default' / 'clear'
+    if effort_token:
+        if effort_token in choices:
+            effort_action = 'set'
+        elif effort_token == default_token:
+            effort_action = 'set_default'
+        elif effort_token in (follow_token, 'off'):
+            effort_action = 'clear'
+        else:
+            return {
+                'msg': f"思考强度 '{effort_token}' 无效，可选: {'/'.join(choices)} / "
+                       f"{default_token}（不传参，用供应商默认） / {follow_token}（跟随配置）"
+            }
+
+    switched = bool(profile_name)
+    if switched:
+        profile = config.get_profile(profile_name)
+        chat.set_active_profile(profile_name)
+        # 立即应用到 TextGenerator（请求仍以每轮 profile 快照为准）
+        tg = TextGenerator.instance
+        tg.switch_profile(profile_name, profile)
+
+    if effort_action == 'set':
+        chat.set_effort_override(effort_token)
+    elif effort_action == 'set_default':
+        chat.set_effort_override(default_token)
+    elif effort_action == 'clear':
+        chat.set_effort_override('')
+
     # 只改本会话，不动全局默认：默认模型完全由配置文件的 default 指针决定
     PersistentDataManager.instance.save_to_file()
-    return {'msg': f"已切换到 {profile_name}: {profile.get('model', '?')}"}
+
+    active_name = chat.get_active_profile()
+    active_profile = config.get_profile(active_name)
+    applied_effort = chat.get_effort_override()
+    cfg_effort = str(active_profile.get("reasoning_effort") or "")
+    if applied_effort == default_token:
+        effort_desc = f"{default_token}（不发送思考参数，用供应商默认）"
+    elif applied_effort:
+        effort_desc = f"{applied_effort}（本会话覆盖）"
+    elif cfg_effort:
+        effort_desc = f"{cfg_effort}（配置值）"
+    else:
+        effort_desc = "未设置（请求不带该参数）"
+    action = "已切换到" if switched else "当前配置仍是"
+    return {'msg': f"{action} {active_name}: {active_profile.get('model', '?')}｜思考强度: {effort_desc}"}
 
 @cmd.register(route='rg/stat', params=['action'])
 def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''):
@@ -893,9 +965,11 @@ def _(option_dict, param_dict, chat:Chat, chat_presets_dict:dict, user_id:str=''
   rg draw <json>       根据JSON创建绘图任务
   rg draw-XXXXXX       查询绘图提示词
   rg manga [on|off|画风] 漫画模式
+  rg moss <画面描述>   用 MOSS 画一张（可附参考图；擅长画面内文字/分格）
+  rg moss on|off       开启/关闭聊天里的 MOSS 触发（关闭后只能用指令提交）
 
 【其他】
-  rg model [配置名]    查看/切换LLM配置
+  rg model [配置名] [强度]  查看/切换LLM配置；强度=low/medium/high/max，default=不发思考参数，auto=跟随配置
   rg nn <昵称>         设置自定义昵称
   rg nn 清除           清除自定义昵称
   rg stat              查看运行统计(管理员)

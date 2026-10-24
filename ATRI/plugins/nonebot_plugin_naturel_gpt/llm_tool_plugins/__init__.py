@@ -6,12 +6,16 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from nonebot import logger
 
 from . import anima_generate
+from . import anima_reverse_tag
+from . import moss_generate
 
 # 工具注册表: {name: (schema, run_func)}
 TOOL_REGISTRY: Dict[str, Tuple[Dict[str, Any], Callable]] = {}
 
-# 不参与自动发现的模块（anima_characters 是人设库客户端，不是工具）
-_EXCLUDED_MODULES = {"__init__", "common", "anima_generate", "anima_characters"}
+# 不参与自动发现的模块（anima_characters 是人设库客户端，不是工具；
+# anima_reverse_tag 随画图工具由 enable_anima_tool() 显式注册；
+# moss_generate 需要先拉到 /moss/schema 才注册，由 enable_moss_tool() 显式注册）
+_EXCLUDED_MODULES = {"__init__", "common", "anima_generate", "anima_characters", "anima_reverse_tag", "moss_generate"}
 
 
 def _discover_tools(config) -> None:
@@ -96,6 +100,8 @@ def enable_anima_tool() -> bool:
     default_schema = anima_generate.get_schema(anima_generate.get_default_model())
     if default_schema and "generate_anima_image" not in TOOL_REGISTRY:
         TOOL_REGISTRY["generate_anima_image"] = (default_schema, anima_generate.run)
+        # 提示词反推工具随画图功能一起注册（参考图作画的前置步骤）
+        TOOL_REGISTRY["anima_reverse_tag"] = (anima_reverse_tag.schema, anima_reverse_tag.run)
         return True
     return False
 
@@ -103,8 +109,28 @@ def enable_anima_tool() -> bool:
 def disable_anima_tool() -> None:
     """从 TOOL_REGISTRY 中移除 Anima 画图工具。"""
     TOOL_REGISTRY.pop("generate_anima_image", None)
+    TOOL_REGISTRY.pop("anima_reverse_tag", None)
     anima_generate.clear_cache()
 
 
 def is_anima_tool_enabled() -> bool:
     return "generate_anima_image" in TOOL_REGISTRY
+
+
+def enable_moss_tool() -> bool:
+    """注册 MOSS 画图工具（前提取到 /moss/schema；独立于 Anima 工作流集）。
+    schema 刻意精简：MOSS 的提示词知识只给摘要模型，不进主模型上下文。"""
+    if not moss_generate.is_enabled() or moss_generate.get_schema() is None:
+        return False
+    if "generate_moss_image" in TOOL_REGISTRY:
+        return True
+    TOOL_REGISTRY["generate_moss_image"] = (moss_generate.schema, moss_generate.run)
+    return True
+
+
+def disable_moss_tool() -> None:
+    TOOL_REGISTRY.pop("generate_moss_image", None)
+
+
+def is_moss_tool_enabled() -> bool:
+    return "generate_moss_image" in TOOL_REGISTRY

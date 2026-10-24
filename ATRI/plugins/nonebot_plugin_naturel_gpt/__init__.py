@@ -132,6 +132,18 @@ else:
     config.COMFYUI_ENABLED = False
     save_config()
 
+# MOSS 画图：独立接口 /moss/*（不在 /anima/workflows 工作流集里），与 Anima 各工作流互不影响。
+# 拉不到 schema 时不注册工具，指令也会以「服务不可用」回绝，不影响其它功能。
+from .llm_tool_plugins import moss_generate, enable_moss_tool
+if moss_generate.is_enabled():
+    _moss_ok, _moss_err = moss_generate.fetch_schema_and_knowledge_sync()
+    if _moss_ok and enable_moss_tool():
+        logger.info("MOSS 画图工具已注册（触发词：moss；提示词由摘要模型撰写）")
+    else:
+        logger.info(f"MOSS 画图不可用，跳过注册: {_moss_err or 'schema 缺失'}")
+else:
+    logger.info("MOSS_ENABLE=false，跳过 MOSS 画图工具")
+
 # 读取 OpenAI 配置（默认 profile 由 OPENAI_PROFILES 的 default 指针决定）
 _active = config.get_default_profile_name()
 _profile = config.get_profile(_active)

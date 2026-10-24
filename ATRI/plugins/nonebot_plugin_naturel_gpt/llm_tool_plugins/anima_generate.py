@@ -560,6 +560,12 @@ def register_send_context(chat_key: str, bot_id: str, group_id: Optional[str] = 
     }
 
 
+def current_send_context() -> Dict[str, Any]:
+    """当前请求的发送上下文（chat_key / bot_id / group_id / user_id），无则空 dict。
+    其他画图通道（MOSS）复用同一份会话信息，避免各自维护一份 Task 映射。"""
+    return dict(_send_context.get(asyncio.current_task(), {}))
+
+
 def unregister_send_context(chat_key: str) -> None:
     """注销发送上下文。由 matcher 在请求结束后调用。
     遍历找到匹配 chat_key 的条目删除（因为 key 是 Task 对象）。"""
@@ -706,6 +712,8 @@ def get_draw_s1_rules(is_manga: bool) -> str:
     rules += (
         "调用 generate_anima_image 必须走 tool_calls，只在文字里说「在画了」不算画画；任务编号只能由工具返回，禁止编造，等工具返回后再引用编号。\n"
         "历史消息中的「在画了」「等出图」是上一轮的结果，每次新的作画请求必须重新调用工具。\n"
+        "用户发图要求参考/照着某张图作画时，先调 anima_reverse_tag 反推该图标签，再综合反推结果、图片本身和用户需求调 generate_anima_image。\n"
+        "人称对应：用户消息里的「我」指这条消息的发送者本人，「你」才指你（当前角色），画谁不要搞反。\n"
         "调用画图工具前不做画面描述，调用后用第一人称自然描述，不提及工具或系统；用户提出修改意见时立即重新调用。\n"
     )
     return "[画图规则]\n" + rules
@@ -932,9 +940,9 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
     else:
         content = (
             f"你正在画一幅插画：{positive_desc}。任务编号：{task_id}，预计{est_seconds}秒完成。"
-            f"你必须将任务编号和预计时间告知用户，这是确认任务已成功提交的唯一凭证。"
+            f"任务编号必须告知用户，这是确认任务已成功提交的唯一凭证；预计时间顺带提一句就够，不要每次都说「X秒出图、画好会自动发给你」。"
             f"用第一人称自然地告诉用户你正在作画，不要提到工具或系统。"
-            f"注意：调用工具前不要对画面做出描述，调用完成后再描述画面内容。"
+            f"注意：调用工具前不要对画面做出描述；调用后描述画面一两句即可，只讲最值得说的点，不复述用户已经提过的细节。"
         )
 
     _schedule_bg(_do_generate(args_for_api, config, send_ctx, task_id, timeout=600, model=model, is_manga=is_manga))

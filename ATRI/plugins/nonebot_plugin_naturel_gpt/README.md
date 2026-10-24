@@ -227,7 +227,7 @@ MULTIMODAL_IMAGE_FRESH_MINUTES: 60
 - `MULTIMODAL_IMAGE_FRESH_MINUTES` 是统一有效期；过期按 30 分钟量化，整点和半点批量退场并重新编号，过期图片在文本中显示为 `[图片已过期]`。
 - `MULTIMODAL_MAX_IMAGES` 是上下文中可见图片总数上限（默认 4），超限时只保留当前触发消息中的图片。
 - 别人的消息带出的图片另有条数上限：只取最近 2 条消息里的图（更早的不带；最近两条都没带图就不带），触发消息自身图片不受此限。
-- 模型看到的 `[图片N]` 是本次请求的显示编号，vision / anime_trace 工具按同一编号取图。
+- 模型看到的 `[图片N]` 是本次请求的显示编号，vision / anime_trace / anima_reverse_tag 工具按同一编号取图。
 
 注意：
 
@@ -255,7 +255,9 @@ LLM_DISABLED_TOOLS: []  # 按模块名禁用指定工具，如 pixiv_search
 | `danbooru_search` | Danbooru 标签检索（画图提示词辅助） |
 | `bangumi` | Bangumi 番组数据库（单工具 action 分发：search_subject / get_subject / search_character / search_person / calendar） |
 | `anime_trace` | AnimeTrace 以图识角色 |
+| `anima_reverse_tag` | 参考图提示词反推（随画图工具注册，参考图作画前置步骤） |
 | `generate_anima_image` | ComfyUI Anima AI 画图（`anima_generate.py`） |
+| `generate_moss_image` | MOSS-Image 画图（`moss_generate.py`，独立通道：摘要模型写提示词，按需触发） |
 | `memory` | 长期记忆（群 / 用户 scope，模型自主维护） |
 | `nas_game_list` | NAS 游戏目录查询（白名单群限定） |
 | `vision` | 视觉理解：纯文本模型借助独立视觉模型看图 |
@@ -330,6 +332,12 @@ BANGUMI_ACCESS_TOKEN: ''
 
 用途：调用 AnimeTrace 开放 API 以图识角色，`image_index` 引用当前对话中的图片。依赖 `MULTIMODAL_ENABLE: true`，无需额外配置。提交前会用 `image_cache.shrink_data_uri()` 把图压到接口的单字段上限（1024KB）以内（AnimeTrace 走 multipart，超限会报 `Part exceeded maximum size of 1024KB.`）。
 
+#### anima_reverse_tag（anima_reverse_tag.py）
+
+用途：调用上游 AnimaTool 服务的 `POST /anima/reverse_tag`（WD14 tagger，与 `COMFYUI_BASE_URL` 同服务）对图片做提示词反推，`image_index` 引用当前对话中的图片，可选 `threshold` 调标签置信度阈值。返回图片分级、角色候选和一份可直接作为 `generate_anima_image` 参数基础的反推标签。用户发图要求参考/照着画时，模型会先调本工具反推，再综合反推结果、图片本身和用户需求调用画图工具。
+
+本工具不参与自动发现，随画图功能一起注册/移除（`enable_anima_tool()` / `disable_anima_tool()`），`rg draw off` 的会话不暴露，无需额外配置。
+
 #### generate_anima_image（anima_generate.py）
 
 用途：调用 ComfyUI Anima 服务生成图片。可选工作流在启动时从服务端动态发现；`rg draw` 按群控制开关与模型，`rg manga` 控制漫画模式。
@@ -341,6 +349,35 @@ ANIMA_CHARACTERS_ENABLE: true   # 人设库带出（见下）
 MANGA_IDLE_MINUTES: 5
 MANGA_IDLE_ROUNDS: 5
 ```
+
+#### generate_moss_image（moss_generate.py）
+
+用途：调用上游 MOSS-Image（独立接口 `/moss/*`，不在 `/anima/workflows` 里）出图。MOSS 擅长**画面内中英文字面文字**、漫画分格与海报排版，提示词是新版**混合写法**：结构化 tag 字段（`quality_meta_year_safe` / `count` / `character` / `series` / `appearance` / `artist` / `style` / `tags` / `environment`）+ `nltags` 自然语言句子，需要精确摆放时再加 `elements`。
+
+**职责边界**：主模型只给「画面构思」（画谁/什么、场景、气氛）和参考图/改图编号，**不写提示词、不写框位**；提示词由摘要模型（`model_mini`）在 `/moss/knowledge` 下独立写成上述 JSON 后由后台调 `/moss/generate`。MOSS 的 Layout/tag 知识因此不会进入主模型上下文。**采样默认值从 `/moss/schema` 的 `steps.default` 读取**（上游已改 4 步 `res_multistep`，bot 不再写死 8）。
+
+```yaml
+MOSS_ENABLE: true   # 上游 /moss/* 不可用时自动跳过注册
+```
+
+- **触发**：工具常驻暴露，由 description 约束时机——用户提到 moss（「用moss画一张」），或需要画面内准确文字 / 分格漫画 / 海报级排版时使用；普通插画继续走 `generate_anima_image`。`rg draw force` 的群里，触发句同时含 moss 与画图意图（画/p/图/换）时会额外注入一条临时 system 提示，强制调用 MOSS。
+- **开关**：`rg moss on|off` 切本群「聊天里触发 MOSS」的开关（默认开，持久化）。关闭后聊天里不再暴露 MOSS 工具，但 `rg moss <描述>` 指令仍可提交任务。
+- **指令**：`rg moss <画面描述>` 直接作画，不经主模型；可 @机器人 附参考图，也支持引用一条带图的消息。`rg moss` 不带参数查看当前开关与用法。单图 + 改图意图（改/p图/微调/换成/换装…）时自动走改图通道。
+- **两条图片输入路径**：
+  - `reference_images`（TE 视觉分支）：只作语义参考（人物/道具/画风），画幅由 `aspect` 决定，**不保留原图构图**，最多 4 张。语义是「照着这张画一张新的」。
+  - `edit_image`（VAE latent，p 图）：`LoadImage → ImageScale → VAEEncode` 作为初始 latent，**按原图宽高比取 16 的倍数**，构图/包装文字会保留。语义是「在这张上改」。实测同一张杯面图换角色，构图与康师傅包装文字原样保留，明显优于 TE 路径。
+- **改图口径：整体合理度 > 逐像素还原度**。评判先看成图是否自洽可信（文字通顺、版式对齐、无伪文字/残肢/错位），再看像不像原图。三组同图对照（换角色、评论区改名+换头像、黑白漫画换角色+改三格）结论一致：**改图默认走 `edit_image`**，TE 在文字密集图上会把原文当图案重新编造（用户名碎片混进正文、点赞数错乱）。
+- **`edit_denoise` 固定 0.70，不暴露给任何模型**（`_EDIT_DENOISE_FIXED`）：不按场景分支、不进主模型 schema、也不让摘要模型输出。0.70 是两类场景都能接受的通用值——漫画（换角色+三格改递进）分格/镜头/气泡全保、台词全对、格序正确、无伪字；评论区截图版式与金额保得住，后两行与小字会漂（模型能力上限）。实测更低无收益：0.60/0.50 在漫画里推不动「吃胡萝卜」这个改动。`denoise=1.0` 会丢弃 VAE latent（模型看不到原图，等于重画），不能用于改图；`_normalize_edit_denoise()` 另有死区护栏，0.33-0.58 一律抬到 0.62。
+- **改图步数下限 6**：同图实测 4 步底部气泡出伪字、6 步消失、8 步无额外收益且更易出现悬空道具/分格错序。非改图仍用 schema 默认 4 步。
+- **提示词写「成品描述」，不写改动方案**：摘要模型拿到的框架是「那张图只是参照物，输出成图本身的描述」，并禁止「保留/不变/替换/改成/原本/原图」这类口吻；主模型 `idea` 也要求直接描述成品。另有 `[构思是唯一准绳]` 约束：构思优先于参照图、点名项不许漏/换/弱化、不许新增主体或整条内容、输出前自检。
+- **带文字的图只承诺写得下的字**：大致 ≥20px 的关键文字（用户名/标题/正文/按钮/金额/台词）逐字写进 `elements.text`；更小的字（时间戳/点赞数/菜单项/卡片小注）**不给元素、不承诺逐字**，一句话带过即可——这档字号在 1MP 画布上必然渲染成伪字。**验收标准是字形通顺 + 语义合理，不是逐字还原**。
+- **分辨率不放大（已证伪）**：用手写固定提示词做对照后确认，原生 912×848 就能把用户名/正文/点赞数全渲染对；之前「必须放大 1.5×」是摘要模型每次重写提示词造成的假象。`_edit_canvas_size()` 只做 16 对齐。
+- **真正的变量是摘要模型输出的稳定性**：同一底图 + 同一构思，两次调用给出的 elements 数、bbox 精度都不一样，渲染结果能差很多。对策：① 摘要模型与主对话**共享 `reasoning_effort`**；② 提示词给硬性框位规范（一文本块一框、框高≈字号 1.5 倍、徽章并进相邻框）；③ 改图首版没给 elements 就带提醒重试一次。
+- **漫画排版从右往左**：分格与气泡顺序都是右→左、上→下，任务书要求点明「右下/中间/左下」位置；上游 `moss_expert.md` 同步。
+- **参考图落盘**：`%TEMP%/atrI_moss_refs/<task_id>/<序号>_<md5>.<ext>`，每任务独立目录（不同群并发不会共用路径），24 小时自动清理；可见图片表在工具入口同步快照，日志记来源 URL（去 query）与 md5。
+- **内容尺度**：本群解锁内容限制（`rg nolimit on`）时，摘要模型会额外收到一条 `MOSS_UNLOCK_RULES`（与 anima 漫画兜底同口径），要求如实描述、不自行弱化。
+- **回传**：返回 `moss-XXXXXX` 任务编号（不提预计耗时），画完自动发图并在消息里带同一编号；工具结果与调用记录在历史里被抹除（`[作画记录]` + 编号占位符），与 anima 一致。
+- 摘要模型不可用或输出不合法时退化为纯 tag/nltags 出图；Layout 被上游拒绝时再退一次。
 
 #### 人设库带出（anima_characters.py，不是工具）
 
@@ -484,6 +521,8 @@ rg draw [force|on|auto|off]  # AI 画图开关
 rg draw <模型名>         # 切换画图工作流
 rg draw-XXXXXX          # 查询画图任务提示词
 rg manga [on|off|画风]   # 漫画模式
+rg moss <画面描述>       # 用 MOSS 画一张（可带参考图；独立通道，提示词由摘要模型撰写）
+rg moss on|off          # 开启/关闭聊天里的 MOSS 触发（关闭后只能用指令提交）
 rg nolimit [on|off]     # 内容限制解锁（每群独立）
 rg stat                 # 当日运行统计；rg stat reset 清空（管理员）
 rg help                 # 帮助
