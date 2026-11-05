@@ -24,6 +24,10 @@ SEARCH_TOOL_NAMES = {"bocha_search", "tavily_search"}  # 搜索工具名称
 # 仅在画图场景下暴露的工具：画图工具本体 + 为它确定作画标签的 danbooru_search / 参考图反推的 anima_reverse_tag
 _DRAW_ONLY_TOOLS = {"generate_anima_image", "generate_moss_image", "danbooru_search", "anima_reverse_tag"}
 
+# 思考泄漏重试的默认正文阈值（字符）：profile 设 think_leak_retry=true 后，
+# 「本轮没收到 reasoning_content，但正文超过这个长度」就判定思考混进了正文
+_THINK_LEAK_RETRY_MIN_CHARS = 100
+
 _CURRENT_CHAT_KEY: ContextVar[str] = ContextVar("naturel_gpt_current_chat_key", default="")
 _CURRENT_TRIGGER_USERID: ContextVar[str] = ContextVar("naturel_gpt_current_trigger_userid", default="")
 # 视觉工具专用快照：本次请求可见图片表 {显示编号: 原始URL}，由 chat_prompt 的图片策略生成，
@@ -118,6 +122,65 @@ def is_content_review_error(text: Optional[str]) -> bool:
         return False
     lower_text = str(text).lower()
     return any(marker in lower_text for marker in _CONTENT_REVIEW_MARKERS)
+
+
+_IMAGE_DOWNLOAD_ERROR_MARKERS = (
+    "failed to download",
+    "cannot download image",
+    "download url data",
+    "download multimodal file",  # 聚合网关拉取多模态文件超时："Download multimodal file timed out"
+    "download image",
+    "image download failed",
+    "text` is not set",  # Xiaomi proxy 图片处理失败
+    "unsupported image",
+    "not a valid image",
+    "does not represent a valid image",
+    "unsupported media type",
+)
+
+
+def is_image_download_error(text: Optional[str]) -> bool:
+    """provider 拉不到图 / 拉图超时 / 收到的图它不认（格式不受支持）。
+
+    图片属于可选上下文：这类错误把图去掉重试就能过，不该让整条请求失败。
+    """
+    if not text:
+        return False
+    lower_text = str(text).lower()
+    if any(marker in lower_text for marker in _IMAGE_DOWNLOAD_ERROR_MARKERS):
+        return True
+    # 泛指超时只认「下载」语境，避免把普通请求超时误判成图片问题
+    return "download" in lower_text and ("timed out" in lower_text or "timeout" in lower_text)
+
+
+def _drop_provider_failed_images(messages: List[Dict[str, Any]]) -> int:
+    """把临时黑名单里的图片从**请求副本**里剥掉（只影响本次请求，不动历史与编号表）。
+
+    这些图片已被确认会让 provider 拉取超时：留着它们，每轮都要先吃一次 400 再剥图。
+    文本里的 `[图片N]` 占位保留，`_visible_images` 编号表照旧，vision 工具仍能按编号取图。
+    """
+    from . import image_cache
+
+    dropped = 0
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        kept: List[Any] = []
+        changed = False
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "image_url":
+                url = (item.get("image_url") or {}).get("url") or ""
+                if image_cache.is_provider_image_failed(url):
+                    dropped += 1
+                    changed = True
+                    continue
+            kept.append(item)
+        if not changed:
+            continue
+        # content 变成空列表部分 provider 会 400，留个文字占位
+        message["content"] = kept if kept else "[图片获取失败，已省略]"
+    return dropped
 
 
 def is_transient_upstream_error(text: Optional[str]) -> bool:
@@ -456,6 +519,24 @@ def strip_chat_markdown(content: str) -> str:
     return content
 
 
+# 分段符：模型（尤其带思考的模型）习惯用 `---` / `***` / `___` / `===` 这类整行分隔线标记
+# 「换一段话说」，但群聊分段只认双换行，这些符号会原样发进群。统一替换成 `\n\n`，
+# 交给分段逻辑切成多条消息。只匹配「整行只由分隔符字符组成」的行，表格分隔线（|---|---|）
+# 和正文里的破折号（——、「-40」）不受影响。
+_SEPARATOR_LINE_RE = re.compile(r'^[ \t]*(?:[-—–_*=][ \t]*){3,}$', re.M)
+
+
+def normalize_reply_separators(content: str) -> str:
+    """把整行分隔线（---、***、___、=== 等）替换为双换行，便于后续按 `\\n\\n` 自动分段。
+    替换后顺手把连续空行压到最多一个空行，避免出现三段空行被拆成空消息。"""
+    if not content:
+        return content
+    replaced = _SEPARATOR_LINE_RE.sub("\n\n", content)
+    if replaced == content:
+        return content
+    return re.sub(r'\n{3,}', "\n\n", replaced)
+
+
 def build_mailbox_notice(count: int, reply_completed: bool) -> str:
     """循环邮箱插入新消息时的 ephemeral 提醒（不落历史）。
     点名要求「在句子里自然称呼对方」：若写成「开头点名对象」，模型会执行成「名字：」前缀的
@@ -786,6 +867,11 @@ class TextGenerator(Singleton["TextGenerator"]):
                 "timeout": profile.get("timeout", 60),
                 "enable_stream": profile.get("enable_stream", self.config.get("enable_stream", True)),
                 "reasoning_effort": profile.get("reasoning_effort"),
+                # 思考泄漏重试（profile 级开关，默认关）：没回 reasoning_content 且正文超过阈值时，
+                # 丢弃本轮文本原样重发一次。no_think=true 的 profile 本来就不该有 reasoning，不参与判定。
+                "think_leak_retry": bool(profile.get("think_leak_retry", False)),
+                "think_leak_retry_chars": int(profile.get("think_leak_retry_chars") or _THINK_LEAK_RETRY_MIN_CHARS),
+                "no_think": bool(profile.get("no_think", False)),
             }
             api_key, api_key_index = self._key_plan(self._profile_key_id(profile), api_keys)
             return {
@@ -801,11 +887,19 @@ class TextGenerator(Singleton["TextGenerator"]):
                 "keep_reasoning": bool(profile.get("keep_reasoning", False)),
             }
         api_key, api_key_index = self._key_plan(self._SINGLETON_KEY_SCOPE, list(self.api_keys or [""]))
+        singleton_config = dict(self.config)
+        # 无 profile 的兼容路径：开关同样只从「模型配置」读，缺省关闭（阈值缺省 100 字）
+        singleton_config.setdefault("think_leak_retry", False)
+        singleton_config.setdefault(
+            "think_leak_retry_chars",
+            int(singleton_config.get("think_leak_retry_chars") or _THINK_LEAK_RETRY_MIN_CHARS),
+        )
+        singleton_config.setdefault("no_think", False)
         return {
             "api_key": api_key,
             "api_key_index": api_key_index,
             "key_scope": self._SINGLETON_KEY_SCOPE,
-            "config": dict(self.config),
+            "config": singleton_config,
             "base_url": self.base_url,
             "proxy": self.proxy,
             "use_socket_proxy": getattr(self, "use_socket_proxy", False),
@@ -1419,6 +1513,18 @@ class TextGenerator(Singleton["TextGenerator"]):
         _markup_leak_retries = 0  # 正文泄漏工具调用标记（DSML/XML）后的重试次数（≤1）
         _drop_tools_this_round = False  # 泄漏重试轮：整段去掉 tools（一次性标志，读取后即清零）
         _transient_retries = 0  # 上游瞬时故障（5xx/连接断开）已重试次数，上限 len(_TRANSIENT_RETRY_DELAYS)
+        # 思考泄漏重试（profile `think_leak_retry`，默认仅 kimi 系）：没收到 reasoning_content
+        # 却输出了长正文 → 判定思考混进了正文，丢弃本轮文本原样重发一次（整个请求只重发一次）。
+        # no_think=true 的 profile 本来就不该回 reasoning，不参与判定；摘要/印象等后台任务也不做
+        # （重发只会白烧额度，且它们的输出另有 `_clean_llm_text` 兜底）。
+        _think_leak_retries = 0
+        _think_leak_cfg = request_state.get("config") or {}
+        _think_leak_chars = int(_think_leak_cfg.get("think_leak_retry_chars") or _THINK_LEAK_RETRY_MIN_CHARS)
+        _think_leak_retry_enabled = (
+            type == "chat"
+            and bool(_think_leak_cfg.get("think_leak_retry", False))
+            and not bool(_think_leak_cfg.get("no_think", False))
+        )
         # 上游内容审查拦截：阶梯用尽后置 True，本轮不再重试（同时给下面的「疑似 ctx 错误 → 剥图
         # 重试」分支加闸，避免白折腾一次）
         _content_review_blocked = False
@@ -1448,6 +1554,8 @@ class TextGenerator(Singleton["TextGenerator"]):
         _force_draw_request = (type == "chat" and _draw_mode == "force" and _has_draw_request)
 
         _image_stripped = False  # 工具调用后续轮是否已剥离图片
+        _bad_images_logged = False  # 跳过黑名单图片的日志只打一次（每轮都会过滤）
+        _single_stripped_url: Optional[str] = None  # 本次请求只剥了一张图时的候选坏图，成功即登记
 
         # 工具循环终止保护：轮数闸门（LLM_MAX_TOOL_ROUNDS）+ 时间闸门（LLM_TOOL_LOOP_MAX_SECONDS）
         _tool_loop_max_seconds = getattr(plugin_config, "LLM_TOOL_LOOP_MAX_SECONDS", 180) if plugin_config else 180
@@ -1566,6 +1674,13 @@ class TextGenerator(Singleton["TextGenerator"]):
 
         while True:
             try:
+                # 已知会让 provider 拉取超时的图片直接跳过（只改请求副本，历史与编号表不变），
+                # 免得每轮都先吃一次 400 再剥图。首次跳过时记一条日志。
+                _dropped_bad = _drop_provider_failed_images(messages)
+                if _dropped_bad and not _bad_images_logged:
+                    _bad_images_logged = True
+                    logger.info(f"已跳过 {_dropped_bad} 张登记为 provider 拉取失败的图片")
+
                 # 时间闸门：工具循环总耗时超限 → 进终端轮优雅收尾（不强制丢弃已产出文本）
                 # 协议约束：该检查点在轮边界，正常不会紧跟 assistant(tool_calls)；
                 # 若为异常重试等罕见路径导致末尾是带 tool_calls 的 assistant，则跳过提示注入，
@@ -1730,10 +1845,79 @@ class TextGenerator(Singleton["TextGenerator"]):
                     (request_state.get("config") or {}).get("enable_stream", True) and not _force_nonstream_round
                 )
                 _force_nonstream_round = False  # 一次性标志，读取后即清零
+
+                # ---- 思考泄漏探测（profile think_leak_retry）----
+                # 判定依据只有两条：本轮**没有任何 reasoning_content**，且正文超过阈值。
+                # 带工具的回复轮/中间轮最容易把思考漏进正文（网关吞掉 reasoning 或直接并进 content），
+                # 因此这里不区分是否带 tool_calls：探测期间先把正文压住不发（还没对外产生副作用），
+                # 判定泄漏就丢掉这一轮、原样重发一次；一旦中途收到 reasoning_content，说明模型走了
+                # 正常思考通道，立刻把缓冲原样补发并恢复直通。重试结果不再做任何额外处理。
+                _probe: Dict[str, Any] = {
+                    "mode": "buffer" if (_think_leak_retry_enabled and _stream_on_text is not None and _think_leak_retries < 1) else "pass",
+                    "buf": [],
+                    "chars": 0,
+                    "saw_reasoning": False,
+                }
+
+                async def _probe_flush() -> None:
+                    """把探测期间压住的正文按原样交给下游客服回调（顺序不变）。"""
+                    if not _probe["buf"]:
+                        return
+                    pending = "".join(_probe["buf"])
+                    _probe["buf"].clear()
+                    _probe["chars"] = 0
+                    if pending and _stream_on_text is not None:
+                        await _stream_on_text(pending)
+
+                async def _probe_on_text(chunk: str) -> None:
+                    if _probe["mode"] == "pass":
+                        if _stream_on_text is not None:
+                            await _stream_on_text(chunk)
+                        return
+                    _probe["buf"].append(chunk)
+                    _probe["chars"] += len(chunk)
+                    if _probe["mode"] == "buffer" and _probe["chars"] > _think_leak_chars:
+                        _probe["mode"] = "drop"  # 疑似思考混入正文：后续文本继续吞掉，等本轮结束判定
+
+                async def _probe_on_reasoning(chunk: str) -> None:
+                    if _probe["mode"] != "pass":
+                        # 思考通道有返回 → 正文就是纯回复，泄漏判定作废，缓冲原样补发后恢复直通
+                        _probe["saw_reasoning"] = True
+                        _probe["mode"] = "pass"
+                        await _probe_flush()
+                    if round_on_reasoning:
+                        await round_on_reasoning(chunk)
+
+                # 本轮是否判定为疑似泄漏（跨分支共用；非流式在下面单独判定）
+                _leak_suspected = False
+
                 if _round_used_stream:
                     content, tool_calls, reasoning_content = await self._stream_once(
-                        messages, type, current_tools, _stream_on_text, round_on_reasoning, request_state, on_tool_call, tool_choice=round_tool_choice
+                        messages, type, current_tools, _probe_on_text, _probe_on_reasoning, request_state, on_tool_call, tool_choice=round_tool_choice
                     )
+                    # 剥图重试成功 → 确认这张图就是 provider 拉不动的那个，登记 30 分钟不再上送
+                    if _single_stripped_url:
+                        try:
+                            from . import image_cache as _image_cache_mod
+                            _image_cache_mod.mark_provider_image_failed(_single_stripped_url)
+                        except Exception:
+                            pass
+                        _single_stripped_url = None
+                    _leak_suspected = _probe["mode"] == "drop" and not _probe["saw_reasoning"]
+                    if _leak_suspected and _think_leak_retries < 1 and _think_leak_retry_enabled:
+                        # 原样重发：不动 messages（保住前缀缓存）、不加提示、不执行本轮工具——
+                        # 探测期正文没流出去，所以重发不会让群里看到重复内容
+                        _think_leak_retries += 1
+                        logger.warning(
+                            f"[思考泄漏重试] 未收到 reasoning_content 且正文 {_probe['chars']} 字"
+                            f"（工具轮: {bool(tool_calls)}），丢弃本轮文本原样重发一次"
+                            f" | model={_think_leak_cfg.get('model')}"
+                        )
+                        _probe["buf"].clear()
+                        _probe["mode"] = "pass"
+                        continue
+                    # 未重试（未开启/已重试过/正文不够长）：把压住的正文按原样补发，恢复输出时序
+                    await _probe_flush()
                     # 过滤参数 JSON 不完整的 tool_calls（流式截断导致），让模型重试
                     if tool_calls:
                         _valid_tool_calls = []
@@ -1846,6 +2030,29 @@ class TextGenerator(Singleton["TextGenerator"]):
                     tool_messages.append(assistant_msg)
                 else:
                     content, tool_calls, message_dict = await self._complete_once(messages, type, current_tools, request_state, on_tool_call, tool_choice=round_tool_choice)
+                    if _single_stripped_url:
+                        try:
+                            from . import image_cache as _image_cache_mod
+                            _image_cache_mod.mark_provider_image_failed(_single_stripped_url)
+                        except Exception:
+                            pass
+                        _single_stripped_url = None
+                    # 思考泄漏重试（非流式）：没有 reasoning_content 却给出长正文 → 原样重发一次。
+                    # 非流式路径正文还没交给 on_text，直接丢弃本轮即可，不存在重复发消息的问题。
+                    _round_reasoning = str(message_dict.get("reasoning_content") or "")
+                    if (
+                        _think_leak_retry_enabled
+                        and _think_leak_retries < 1
+                        and not _round_reasoning
+                        and len(content) > _think_leak_chars
+                    ):
+                        _think_leak_retries += 1
+                        logger.warning(
+                            f"[思考泄漏重试] 非流式轮未收到 reasoning_content 且正文 {len(content)} 字"
+                            f"（工具轮: {bool(tool_calls)}），丢弃本轮文本原样重发一次"
+                            f" | model={_think_leak_cfg.get('model')}"
+                        )
+                        continue
                     # 过滤参数 JSON 不完整的 tool_calls
                     if tool_calls:
                         _valid_tool_calls = []
@@ -2130,6 +2337,42 @@ class TextGenerator(Singleton["TextGenerator"]):
                     # ④ 阶梯用尽：按失败上报（不重试、不入群、不清理上下文）
                     _content_review_blocked = True
                     logger.warning(f"内容审查拦截未化解，按失败上报（不重试、不在群里提示）: {str(e)[:200]}")
+                # provider 拉取图片失败/超时（如 400 "Download multimodal file timed out"）：
+                # 图片只是可选上下文，静默剥掉后重试本轮，不让整条请求失败（否则群里只能收到表情兜底）。
+                # 只剥一次；本轮已流出文字/执行过工具时不剥，避免重复发送或重复副作用。
+                if (
+                    not _image_stripped
+                    and not _content_review_blocked
+                    and not _round_fx["text"]
+                    and not _round_fx["tools"]
+                    and is_image_download_error(err_text)
+                ):
+                    _img_stripped_msgs = 0
+                    _stripped_urls: List[str] = []
+                    for _m in messages:
+                        if not isinstance(_m.get("content"), list):
+                            continue
+                        if not any(isinstance(c, dict) and c.get("type") == "image_url" for c in _m["content"]):
+                            continue
+                        for _c in _m["content"]:
+                            if isinstance(_c, dict) and _c.get("type") == "image_url":
+                                _u = (_c.get("image_url") or {}).get("url") or ""
+                                if _u:
+                                    _stripped_urls.append(_u)
+                        _texts = [
+                            c.get("text", "") for c in _m["content"]
+                            if isinstance(c, dict) and c.get("type") == "text"
+                        ]
+                        _m["content"] = "\n".join(_texts) if _texts else "[图片已省略]"
+                        _img_stripped_msgs += 1
+                    if _img_stripped_msgs:
+                        _image_stripped = True
+                        # 整条请求就这一张图时才能确定是它坏：剥掉后若请求成功，登记进临时黑名单
+                        _single_stripped_url = _stripped_urls[0] if len(_stripped_urls) == 1 else None
+                        logger.warning(
+                            f"图片拉取失败/超时，已剥离 {_img_stripped_msgs} 条消息中的图片静默重试: {str(e)[:200]}"
+                        )
+                        continue
                 # keep_reasoning=true 但 provider 不接受 reasoning_content（400）：
                 # 剥离全部 reasoning 后重试一次
                 if (

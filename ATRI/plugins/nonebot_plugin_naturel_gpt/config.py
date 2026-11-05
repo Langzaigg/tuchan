@@ -209,13 +209,6 @@ class Config(BaseModel, extra=Extra.ignore):
     """分段消息发送最短间隔秒数"""
     REPLY_MAX_SEGMENTS: int
     """单次回复最多分段数，最后一段会接收剩余流式内容"""
-    THINK_LEAK_GUARD: bool
-    """思考泄漏兜底总开关。true 时才启用「无 reasoning 也无 <think> → 全部缓冲后按短段落启发式切分」这套判断；
-    默认 false：直接按正常分段流式发送（模型不回思考通道时不会误伤正常回复，也不会压着不发）"""
-    THINK_LEAK_THRESHOLD: int
-    """思考泄漏兜底阈值：思考模式下模型跳过思考标签、把思考混入 content 时，content 字符数超过此值且含双换行，则触发兜底切分，前段视为思考"""
-    THINK_LEAK_SHORT_SEGMENT: int
-    """兜底切分短段阈值：按双换行分段后，从第一个长度小于此值的段落开始（含）视为真实回复，之前视为思考；所有段落都不短时回退取最后一段"""
     NG_ENABLE_AWAKE_IDENTITIES: bool
     """是否允许自动唤醒其它人格"""
 
@@ -358,9 +351,6 @@ CONFIG_TEMPLATE = {
     'NG_ENABLE_MSG_SPLIT': True,   # 是否启用消息分割
     'REPLY_SEGMENT_INTERVAL': 1.0,
     'REPLY_MAX_SEGMENTS': 5,
-    'THINK_LEAK_GUARD': False,  # 思考泄漏兜底总开关（默认关）：开启后模型不回 reasoning、也没有 <think> 标签时，收完再按短段落启发式切分
-    'THINK_LEAK_THRESHOLD': 150,  # 思考泄漏兜底阈值（字符数），思考模式下 content 超过此值且含双换行则触发兜底切分
-    'THINK_LEAK_SHORT_SEGMENT': 50,  # 兜底切分短段阈值（字符数）：分段后从第一个短于该值的段落开始视为真实回复，避免回复开头的短句被误判为思考
     'NG_ENABLE_AWAKE_IDENTITIES': True, # 是否允许自动唤醒其它人格
 
     'MULTIMODAL_ENABLE': True,
@@ -530,6 +520,11 @@ def _load_config_obj_from_file()->Config:
                         # 跨轮历史携带 reasoning_content：true 时持久化历史中的思考字段随请求发送
                         #（仅文档化默认值，读取处用 .get 兜底；provider 400 拒绝时自动剥离重试一次）
                         "keep_reasoning": False,
+                        # 思考泄漏重试：true 时「没回 reasoning_content 且正文超过阈值」判定为思考混入正文，
+                        # 丢弃本轮文本原样重发一次，重试结果不做额外处理
+                        # （仅文档化默认值，读取处用 .get 兜底；阈值默认 100 字，可用 think_leak_retry_chars 覆盖）
+                        "think_leak_retry": False,
+                        "think_leak_retry_chars": 100,
                     },
                     "kimi": {
                         "api_keys": config_obj_from_file.get("OPENAI_API_KEYS", []),
@@ -549,6 +544,9 @@ def _load_config_obj_from_file()->Config:
                             "不要复述用户的话，不要重复自己已经表达过的观点，每句话只出现一次。\n"
                             "减少推理和分析过程，直接输出结论和最终回答，不要展示思考步骤。"
                         ),
+                        # kimi 系经聚合网关常把思考并进正文（不回 reasoning_content），默认开启泄漏重试
+                        "think_leak_retry": True,
+                        "think_leak_retry_chars": 100,
                     },
                 }
                 config_obj_from_file["OPENAI_ACTIVE_PROFILE"] = ""  # 默认由 default 指针决定，旧字段留空

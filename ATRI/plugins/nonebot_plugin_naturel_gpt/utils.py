@@ -1,5 +1,5 @@
 ﻿import hashlib
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import asyncio
 import requests
 import aiohttp
@@ -13,6 +13,7 @@ from nonebot.adapters.onebot.v11.permission import GROUP_ADMIN, GROUP_OWNER
 from nonebot.adapters.onebot.v11 import Message, MessageEvent, PrivateMessageEvent, GroupMessageEvent, MessageSegment, GroupIncreaseNoticeEvent
 
 from .config import config
+from .logger import logger
 try:
     import ujson as json
 except ImportError:
@@ -87,6 +88,199 @@ def _is_supported_image_url(url: str) -> bool:
     return bool(url) and str(url).strip().startswith(("http://", "https://", "data:image/", "file:///"))
 
 
+""" ======== 合并转发（forward）消息解析 ======== """
+
+FORWARD_MAX_MESSAGES = 20       # 单条合并转发最多读取的消息条数
+FORWARD_MAX_IMAGES = 4          # 单条合并转发最多带出的图片张数
+FORWARD_MSG_MAX_CHARS = 150     # 单条消息文本截断长度
+FORWARD_TOTAL_MAX_CHARS = 1200  # 整条合并转发的文本总长上限
+
+
+def _forward_node_payload(node: Any) -> Dict[str, Any]:
+    """把各家实现（go-cqhttp / NapCat / Lagrange）的 node 统一成内容 dict。"""
+    if not isinstance(node, dict):
+        return {}
+    if node.get("type") == "node" and isinstance(node.get("data"), dict):
+        return node["data"]
+    return node
+
+
+def _forward_node_segments(node: Any) -> List[Any]:
+    """取出 node 承载的消息段列表（message / content 两种键名都兼容）。"""
+    data = _forward_node_payload(node)
+    for key in ("message", "content"):
+        value = data.get(key)
+        if isinstance(value, str):
+            # 部分协议端把 content 给成 CQ 码串，交给适配器解析成消息段
+            if "[CQ:" in value:
+                try:
+                    return list(Message(value))
+                except Exception:
+                    pass
+            return [{"type": "text", "data": {"text": value}}]
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _forward_node_sender(node: Any) -> str:
+    data = _forward_node_payload(node)
+    sender = data.get("sender") if isinstance(data.get("sender"), dict) else {}
+    for name in (
+        data.get("nickname"),
+        data.get("name"),
+        sender.get("card"),
+        sender.get("nickname"),
+        sender.get("name"),
+        data.get("user_id"),
+        sender.get("user_id"),
+    ):
+        if name:
+            return str(name)
+    return "未知"
+
+
+async def _fetch_forward_nodes(bot: Bot, forward_seg: Any) -> List[Any]:
+    """拿到合并转发的 node 列表：优先用消息段内联的 content，否则调 get_forward_msg。"""
+    data: Dict[str, Any] = {}
+    if isinstance(forward_seg, MessageSegment):
+        data = forward_seg.data or {}
+    elif isinstance(forward_seg, dict):
+        data = forward_seg.get("data") or forward_seg
+
+    inline = data.get("content")
+    if isinstance(inline, list) and inline:
+        return inline
+
+    message_id = data.get("id") or data.get("message_id")
+    if not message_id:
+        return []
+
+    payload: Any = None
+    last_error: Optional[BaseException] = None
+    for args in ({"id": str(message_id)}, {"message_id": str(message_id)}):
+        try:
+            payload = await bot.call_api("get_forward_msg", **args)
+            break
+        except Exception as e:
+            last_error = e
+    else:
+        logger.warning(f"合并转发内容获取失败 id={message_id}: {last_error!r}")
+        return []
+
+    if isinstance(payload, dict):
+        for key in ("messages", "message"):
+            nodes = payload.get(key)
+            if isinstance(nodes, list):
+                return nodes
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+async def extract_forward_content(
+    bot: Bot,
+    forward_seg: Any,
+    *,
+    image_offset: int = 0,
+    max_messages: int = FORWARD_MAX_MESSAGES,
+    max_images: int = FORWARD_MAX_IMAGES,
+) -> Tuple[str, List[str]]:
+    """解析一条合并转发，返回 (塞进 prompt 的文本, 图片 URL 列表)。
+
+    文本里的 ``[图片N]`` 从 ``image_offset + 1`` 开始编号，与调用方把这些 URL 插到
+    image_urls 的位置对齐。只取最多 max_messages 条消息 / max_images 张图片；
+    任何解析失败都返回 ("", [])，不影响主流程。
+    """
+    try:
+        nodes = await _fetch_forward_nodes(bot, forward_seg)
+    except Exception as e:
+        logger.warning(f"合并转发解析异常: {e!r}")
+        return ("", [])
+    if not nodes:
+        return ("", [])
+
+    total = len(nodes)
+    lines: List[str] = []
+    image_urls: List[str] = []
+    total_chars = 0
+    char_limited = False
+
+    for node in nodes[:max_messages]:
+        text_parts: List[str] = []
+        for seg in _forward_node_segments(node):
+            if isinstance(seg, str):
+                text_parts.append(seg)
+                continue
+            if isinstance(seg, MessageSegment):
+                seg_type, seg_data = seg.type, (seg.data or {})
+            elif isinstance(seg, dict):
+                seg_type, seg_data = seg.get("type"), (seg.get("data") or {})
+            else:
+                continue
+            if seg_type == "text":
+                text_parts.append(str(seg_data.get("text") or ""))
+            elif seg_type == "at":
+                qq = seg_data.get("qq")
+                text_parts.append("@全体成员" if qq == "all" else f"@{qq}")
+            elif seg_type == "image":
+                if len(image_urls) >= max_images:
+                    continue
+                url = seg_data.get("url") or seg_data.get("file")
+                if _is_supported_image_url(url):
+                    image_urls.append(str(url))
+                    text_parts.append(f"[图片{image_offset + len(image_urls)}]")
+            elif seg_type == "forward":
+                # 嵌套转发不递归展开，留个占位让模型知道这里还有内容
+                text_parts.append("[嵌套合并转发]")
+
+        text = "".join(text_parts).strip()
+        if len(text) > FORWARD_MSG_MAX_CHARS:
+            text = text[:FORWARD_MSG_MAX_CHARS] + "…"
+        if not text:
+            continue
+        line = f"{_forward_node_sender(node)}: {text}"
+        if total_chars + len(line) > FORWARD_TOTAL_MAX_CHARS:
+            char_limited = True
+            break
+        total_chars += len(line)
+        lines.append(line)
+
+    if not lines and not image_urls:
+        return ("", [])
+
+    if char_limited:
+        header = f"[合并转发消息 共{total}条，内容过长已截断]"
+    elif total > max_messages:
+        header = f"[合并转发消息 共{total}条，仅读取前{max_messages}条]"
+    else:
+        header = f"[合并转发消息 共{total}条]"
+    body = "\n".join(lines) if lines else "（无文字内容）"
+    if char_limited:
+        body += "\n…（后续内容过长，已省略）"
+    return (f"{header}\n{body}", image_urls)
+
+
+async def get_reply_original_message(bot: Bot, event: MessageEvent) -> List[Any]:
+    """reply 消息是空壳（协议端只给 message_id）时，取回原消息的消息段列表。"""
+    reply = getattr(event, "reply", None)
+    message_id = getattr(reply, "message_id", None) if reply is not None else None
+    if not message_id:
+        return []
+    try:
+        payload = await bot.call_api("get_msg", message_id=str(message_id))
+    except Exception as e:
+        logger.warning(f"被回复消息获取失败 id={message_id}: {e!r}")
+        return []
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        if isinstance(message, list):
+            return message
+        if isinstance(message, str) and message.strip():
+            return [{"type": "text", "data": {"text": message}}]
+    return []
+
+
 async def _extract_message_text_and_images(message: Message, event: MessageEvent, bot: Bot) -> Tuple[str, List[str]]:
     text = ""
     image_urls: List[str] = []
@@ -110,6 +304,14 @@ async def _extract_message_text_and_images(message: Message, event: MessageEvent
                 image_index += 1
                 image_urls.append(str(url))
                 text += f"[图片{image_index}]"
+        elif seg.type == "forward":
+            # 合并转发：展开成「昵称: 内容」多行文本，图片并入本条消息的图片列表
+            forward_text, forward_images = await extract_forward_content(
+                bot, seg, image_offset=len(image_urls)
+            )
+            if forward_text:
+                text += ("\n" if text and not text.endswith("\n") else "") + forward_text
+            image_urls.extend(forward_images)
     return text.strip(), image_urls
 
 

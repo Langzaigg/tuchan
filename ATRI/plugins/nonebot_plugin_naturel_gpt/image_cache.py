@@ -7,6 +7,7 @@
 
 import asyncio
 import base64
+import hashlib
 import io
 import ipaddress
 import time
@@ -77,6 +78,59 @@ def mark_passthrough_failed(url: str) -> None:
     """标记直传 URL 被 provider 拉取失败，后续 resolve 回退为 base64 下载"""
     if url:
         _passthrough_bad.add(url)
+
+
+# ---- provider 拉取失败的图片（临时黑名单）----
+# 网关拉取多模态文件超时（400 "Download multimodal file timed out"）的原因在图片本身：
+# 每轮都把它塞进请求，就会先吃一次 400、剥图后才成功，白白多跑一次失败请求。
+# 这里按图片内容登记一段时间，请求层构造前直接跳过；TTL 到期自动失效（网关侧多为临时故障）。
+# 只在「剥掉这一张后请求成功」时才登记，避免把偶发失败的好图也拉黑。
+_PROVIDER_IMAGE_FAIL_TTL_SECONDS = 1800.0
+_provider_failed_images: Dict[str, float] = {}  # 图片指纹 -> 过期时间戳
+
+
+def _image_content_key(url: str) -> str:
+    """data URI 很长（几 MB），用 sha1 指纹；普通 URL 直接用原串，便于日志排查。"""
+    text = str(url or "")
+    if len(text) <= 200:
+        return text
+    return "sha1:" + hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()
+
+
+def mark_provider_image_failed(url: str, ttl: float = _PROVIDER_IMAGE_FAIL_TTL_SECONDS) -> None:
+    """登记一张 provider 拉不动的图片，ttl 秒内不再上送。"""
+    key = _image_content_key(url)
+    if not key:
+        return
+    now = time.time()
+    if len(_provider_failed_images) > 256:
+        _prune_provider_failed_images(now)
+    _provider_failed_images[key] = now + max(1.0, float(ttl))
+    logger.info(f"[图片黑名单] 已登记 provider 拉取失败的图片，{ttl:.0f}s 内不再上送 | {key[:64]}")
+
+
+def is_provider_image_failed(url: str) -> bool:
+    key = _image_content_key(url)
+    if not key:
+        return False
+    expire_at = _provider_failed_images.get(key)
+    if expire_at is None:
+        return False
+    if expire_at <= time.time():
+        _provider_failed_images.pop(key, None)
+        return False
+    return True
+
+
+def _prune_provider_failed_images(now: Optional[float] = None) -> None:
+    now = time.time() if now is None else now
+    for key in [k for k, exp in _provider_failed_images.items() if exp <= now]:
+        _provider_failed_images.pop(key, None)
+
+
+def provider_failed_image_count() -> int:
+    _prune_provider_failed_images()
+    return len(_provider_failed_images)
 
 
 def _evict_lru(needed: int = 0) -> None:

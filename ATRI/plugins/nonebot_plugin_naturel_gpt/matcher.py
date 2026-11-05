@@ -24,17 +24,20 @@ from .chat_manager import ChatManager
 from .openai_func import (
     TextGenerator,
     is_model_request_error_text,
+    is_image_download_error,
     is_content_review_error,
     is_provider_rejection_text,
     PROVIDER_REJECTION_ERROR_TEXT,
     sanitize_draw_reply_text,
     sanitize_internal_control_text,
+    normalize_reply_separators,
     strip_chat_markdown,
     strip_edge_commas,
     contains_tool_call_xml,
     strip_tool_call_xml,
 )
 from .command_func import cmd
+from .error_gif import send_error_gif
 
 try:
     from .text_to_image import md_to_img, text_to_img
@@ -341,8 +344,9 @@ async def handler(matcher_:Matcher, event: MessageEvent, bot:Bot) -> None:
     if config.DEBUG_LEVEL > 1: logger.info(resTmplate)
 
     has_image = any(seg.type == "image" for seg in event.message)
-    # 如果是忽略前缀 或者消息为空且没有图片，则跳过处理
-    if event.get_plaintext().strip().startswith(config.IGNORE_PREFIX) or (not event.get_plaintext() and not has_image):
+    has_forward = any(seg.type == "forward" for seg in event.message)
+    # 如果是忽略前缀 或者消息为空且没有图片/合并转发，则跳过处理
+    if event.get_plaintext().strip().startswith(config.IGNORE_PREFIX) or (not event.get_plaintext() and not has_image and not has_forward):
         if config.DEBUG_LEVEL > 1: logger.info("忽略前缀或消息为空，跳过处理...") # 纯图片消息也会被判定为空消息
         return
 
@@ -364,18 +368,47 @@ async def handler(matcher_:Matcher, event: MessageEvent, bot:Bot) -> None:
         seg.data.get("text", "") for seg in event.message if seg.is_text()
     ).strip()
 
-    # 提取被回复消息的内容（文本 + 图片），作为上下文注入触发消息
-    if getattr(event, 'reply', None) and event.reply.message:
+    # 提取被回复消息的内容（文本 + 图片 + 合并转发），作为上下文注入触发消息
+    if getattr(event, 'reply', None):
         reply_text_parts: List[str] = []
         reply_image_urls: List[str] = []
-        for seg in event.reply.message:
-            if seg.is_text():
-                reply_text_parts.append(seg.data.get("text", ""))
-            elif seg.type == "image":
-                url = seg.data.get("url") or seg.data.get("file")
-                if url and str(url).strip().startswith(("http://", "https://", "data:image/", "file:///")):
-                    reply_image_urls.append(str(url))
+        reply_forward_segs: List[Any] = []
+
+        def _absorb_reply_segments(segments: Any) -> None:
+            """收集消息段；同时兼容 MessageSegment 与 get_msg 返回的原始 dict。"""
+            for seg in segments or []:
+                if isinstance(seg, MessageSegment):
+                    seg_type, seg_data = seg.type, (seg.data or {})
+                elif isinstance(seg, dict):
+                    seg_type, seg_data = seg.get("type"), (seg.get("data") or {})
+                else:
+                    continue
+                if seg_type == "text":
+                    reply_text_parts.append(str(seg_data.get("text") or ""))
+                elif seg_type == "image":
+                    url = seg_data.get("url") or seg_data.get("file")
+                    if url and str(url).strip().startswith(("http://", "https://", "data:image/", "file:///")):
+                        reply_image_urls.append(str(url))
+                elif seg_type == "forward":
+                    reply_forward_segs.append(seg)
+
+        _absorb_reply_segments(event.reply.message)
+        if not reply_text_parts and not reply_image_urls and not reply_forward_segs:
+            # 兜底：reply 只给了 message_id（部分协议端会裁掉消息段），主动拉一次原消息
+            _absorb_reply_segments(await get_reply_original_message(bot, event))
         reply_text = "".join(reply_text_parts).strip()
+
+        # 被回复的是一条合并转发：展开内容（最多 20 条消息 / 4 张图片），
+        # 图片编号接在被回复消息自身图片之后，与 image_urls 的插入顺序对齐。
+        forward_text = ""
+        for fwd_seg in reply_forward_segs:
+            fwd_text, fwd_images = await extract_forward_content(
+                bot, fwd_seg, image_offset=len(reply_image_urls)
+            )
+            if not fwd_text:
+                continue
+            reply_image_urls.extend(fwd_images)
+            forward_text = f"{forward_text}\n{fwd_text}" if forward_text else fwd_text
 
         # 获取被回复者名称
         reply_sender = event.reply.sender
@@ -388,7 +421,7 @@ async def handler(matcher_:Matcher, event: MessageEvent, bot:Bot) -> None:
                     pass
             reply_sender_name = reply_sender_name or reply_sender.nickname or str(reply_sender.user_id or "未知")
 
-        if reply_text or reply_image_urls:
+        if reply_text or reply_image_urls or forward_text:
             # 将被回复图片插入到 image_urls 前面，重新编号已有标记
             existing_count = len(image_urls) if image_urls else 0
             offset = len(reply_image_urls)
@@ -404,11 +437,13 @@ async def handler(matcher_:Matcher, event: MessageEvent, bot:Bot) -> None:
             reply_content = reply_text
             if reply_img_markers:
                 reply_content = f"{reply_content} {reply_img_markers}" if reply_content else reply_img_markers
+            if forward_text:
+                reply_content = f"{reply_content}\n{forward_text}" if reply_content else forward_text
 
             reply_prefix = f"[回复 {reply_sender_name} 的消息] {reply_content}"
             chat_text = f"{reply_prefix}\n{chat_text}" if chat_text else reply_prefix
             if config.DEBUG_LEVEL > 0:
-                logger.info(f"已注入被回复消息上下文 | 发送者: {reply_sender_name} | 文本: {reply_text[:50]}{'...' if len(reply_text) > 50 else ''} | 图片: {len(reply_image_urls)}张")
+                logger.info(f"已注入被回复消息上下文 | 发送者: {reply_sender_name} | 文本: {reply_text[:50]}{'...' if len(reply_text) > 50 else ''} | 图片: {len(reply_image_urls)}张 | 合并转发: {'是' if forward_text else '否'}")
 
     # 进行消息响应
     await do_msg_response(
@@ -663,24 +698,11 @@ def _is_probably_image_bad_request(text: Optional[str]) -> bool:
 
 
 def _is_image_download_error(text: Optional[str]) -> bool:
-    """provider 拉不到图 / 收到的图它不认（格式不受支持）。
+    """provider 拉不到图 / 拉图超时（如 400 "Download multimodal file timed out"）/ 收到的图它不认。
 
-    后半类（unsupported image）走同一条兜底链路：先把直传 URL 标记为不可用并转 base64
-    （转完会经 image_cache 规范化成 JPEG/PNG/GIF/WEBP），仍失败再剥图重试，
-    否则整条请求会以 400 直接失败、用户什么回复都收不到。"""
-    if not text:
-        return False
-    lower_text = text.lower()
-    return (
-        "failed to download" in lower_text
-        or "cannot download image" in lower_text
-        or "text` is not set" in lower_text  # Xiaomi proxy 图片处理失败
-        or "download url data" in lower_text
-        or "unsupported image" in lower_text
-        or "not a valid image" in lower_text
-        or "does not represent a valid image" in lower_text
-        or "unsupported media type" in lower_text
-    )
+    判据与 `openai_func.is_image_download_error` 同源——那边用它在轮内静默剥图重试，
+    两处必须一致，否则会出现「轮内判定为图片问题、轮外判定为普通失败」的分叉。"""
+    return is_image_download_error(text)
 
 
 def _is_image_limit_error(text: Optional[str]) -> bool:
@@ -960,28 +982,6 @@ def _strip_think_tags(text: str) -> Tuple[str, str]:
     cleaned = _THINK_TAG_RE.sub('', _THINK_PAIR_RE.sub('', text)).strip()
     reasoning = "\n".join(t.strip() for t in thinks).strip() if thinks else ""
     return cleaned, reasoning
-
-
-def _split_think_leak(text: str, short_segment: int = 50) -> Optional[Tuple[str, str]]:
-    """思考泄漏兜底切分：按双换行分段，思考通常是连续长段落，而真实回复常以短段落开头
-    （口头语/情绪词等），因此从第一个长度 < short_segment 字的段落开始（含）视为真实回复，
-    之前视为思考；若所有段落都不短，回退取最后一段为回复。返回 (思考, 回复) 或 None（无法切分）。"""
-    parts = [p.strip() for p in text.split("\n\n")]
-    parts = [p for p in parts if p]  # 去掉空段
-    if len(parts) < 2:
-        return None
-    split_idx = None
-    for i, p in enumerate(parts):
-        if len(p) < short_segment:
-            split_idx = i
-            break
-    if split_idx is None:
-        split_idx = len(parts) - 1  # 无短段落，回退原逻辑：最后一段为回复
-    leaked = "\n\n".join(parts[:split_idx]).strip()
-    reply = "\n\n".join(parts[split_idx:]).strip()
-    if not leaked or not reply:
-        return None
-    return leaked, reply
 
 
 async def _send_tool_image_outputs(chat_key: str, matcher: Type[Matcher]) -> None:
@@ -1401,12 +1401,9 @@ async def do_msg_response(
     _in_think = False          # 是否正在 <think> 块内
     _think_buffer = ""          # 当前思考块的累积内容
     _extracted_reasoning = ""   # 从 content 中提取的完整思考内容
-    # 思考泄漏兜底（本变量只控制这一套）：全局开关 THINK_LEAK_GUARD 是总闸，profile 的 thinking 是二道闸。
-    # 总闸关掉后不会「收完再发」、也不会按短段落启发式切分——不走思考通道的模型（如 anthropic 协议下
-    # 不返回 thinking block 的 Claude）否则每条回复都会进缓冲+切分，既压延迟又可能误伤正常回复。
-    _thinking_mode = bool(request_profile.get("thinking", True)) and bool(getattr(config, "THINK_LEAK_GUARD", False))
-    _saw_reasoning = False      # 本次是否收到过 reasoning_content（模型走了正常思考通道）
-    _skip_think_buffer_mode = False  # 模型跳过思考标签、content 可能混入思考时，收完再发避免泄漏
+    # 思考泄漏处理在请求层（`openai_func.stream_response`）：profile 开 `think_leak_retry` 时，
+    # 「没回 reasoning_content 且正文超过阈值」判定为思考混入正文，丢弃本轮文本原样重发一次。
+    # matcher 这层不再做缓冲/启发式切分，收到什么就按 \n\n 正常分段发。
     _tool_rounds = 0  # 本回复内已发生的工具轮数（每轮 tool_calls +1）：分段上限按轮放宽，中间轮文本各算一轮
     _tool_called = False        # 本次请求是否发生过工具调用（用于过滤"整条被括号包围"的噪音分段）
     # 漫画自动画图兜底的去重状态：同一触发内每个完成的回复在 _on_reply_complete 各检查一次；
@@ -1491,6 +1488,9 @@ async def do_msg_response(
         nonlocal sent_segments, last_send_time
         segment = sanitize_internal_control_text(segment)
         segment = sanitize_draw_reply_text(segment, allow_task_ids=True)
+        # 分段符（---/***/___ 等整行分隔线）先归一到双换行：走 send_segment 的残余文本
+        # 与失败兜底路径不会再经过 on_text_chunk 的分段逻辑，这里兜住格式
+        segment = normalize_reply_separators(segment)
         reply_text = _normalize_reply_segment(segment)
         reply_text = sanitize_internal_control_text(reply_text)
         reply_text = sanitize_draw_reply_text(reply_text, allow_task_ids=True)
@@ -1521,7 +1521,7 @@ async def do_msg_response(
         last_send_time = time.time()
 
     async def on_text_chunk(chunk: str) -> None:
-        nonlocal stream_buffer, _think_buffer, _in_think, _skip_think_buffer_mode
+        nonlocal stream_buffer, _think_buffer, _in_think
         raw_parts.append(chunk)
         # 实时拦截 <think>...</think> 标签（Grok 等模型在 content 中返回思考内容）
         _think_buffer_local = _think_buffer
@@ -1555,18 +1555,10 @@ async def do_msg_response(
                     # 无 think 标签，正常输出
                     stream_buffer += remaining
                     remaining = ""
-        # 思考模式兜底：模型跳过思考（无 reasoning_content 且无 <think> 标签）却直接输出 content，
-        # 说明思考过程可能混入 content。此时收完再发，避免思考被分段泄漏到群里。
-        if (
-            _thinking_mode
-            and not _saw_reasoning
-            and not _extracted_reasoning
-            and not _in_think
-            and stream_buffer
-        ):
-            _skip_think_buffer_mode = True
-        if _skip_think_buffer_mode:
-            return  # 收完再发：全部缓冲到 stream_buffer，流结束后统一处理
+        # 整行分隔符（---、***、___、=== 等）归一到双换行，才能被下面的分段逻辑切开；
+        # 只在 chunk 里出现分隔符字符时才做，避免每个 chunk 都跑一遍正则
+        if any(c in chunk for c in "-—–_*="):
+            stream_buffer = normalize_reply_separators(stream_buffer)
         if not config.NG_ENABLE_MSG_SPLIT:
             return
         while sent_segments < max(1, config.REPLY_MAX_SEGMENTS) - 1 and "\n\n" in stream_buffer:
@@ -1574,28 +1566,17 @@ async def do_msg_response(
             await send_segment(segment)
 
     async def on_reasoning_chunk(chunk: str) -> None:
-        nonlocal _saw_reasoning, _skip_think_buffer_mode, stream_buffer
-        _saw_reasoning = True  # 记录模型走了正常思考通道，content 即纯回复，无需收完再发兜底
-        if _skip_think_buffer_mode:
-            # 首段 content 到来时尚未见到 reasoning（常见于工具轮：首轮 tool_calls 不带 reasoning_content）
-            # 而进入了"收完再发"；现在思考通道出现，content 即纯回复，退出缓冲并把已缓冲文本按正常分段发出，
-            # 否则整个多轮回复会在收尾时被压成一条长消息
-            _skip_think_buffer_mode = False
-            if config.NG_ENABLE_MSG_SPLIT:
-                while sent_segments < max(1, config.REPLY_MAX_SEGMENTS) - 1 and "\n\n" in stream_buffer:
-                    segment, stream_buffer = stream_buffer.split("\n\n", 1)
-                    await send_segment(segment)
         if config.LLM_SHOW_REASONING:
             await on_text_chunk(chunk)
 
     async def _send_buffer_segmented(text: str) -> None:
         """把一段残余文本按 \\n\\n 拆成多条消息发送：在剩余分段预算内各自发送，超出部分合并为最后一段。
         预算 = REPLY_MAX_SEGMENTS + 本回复的工具轮数 - 已发送段数（中间轮文本各算一轮）。
-        用于"收完再发"缓冲与回复收尾的残余缓冲，避免整段回复被压成一条长消息。"""
+        用于回复收尾的残余缓冲，避免整段回复被压成一条长消息。"""
         if not config.NG_ENABLE_MSG_SPLIT:
             await send_segment(text)
             return
-        pieces = [p for p in text.split("\n\n") if p.strip()]
+        pieces = [p for p in normalize_reply_separators(text).split("\n\n") if p.strip()]
         if not pieces:
             return
         budget = max(1, config.REPLY_MAX_SEGMENTS) + _tool_rounds - sent_segments
@@ -1606,14 +1587,12 @@ async def do_msg_response(
 
     async def _flush_reply_stream_buffer() -> None:
         """发送当前回复未分段发送的残余缓冲（按 \\n\\n 分段、受分段预算约束），并重置 per-reply 流式状态。"""
-        nonlocal stream_buffer, sent_segments, _tool_called, _skip_think_buffer_mode, _saw_reasoning, _tool_rounds
+        nonlocal stream_buffer, sent_segments, _tool_called, _tool_rounds
         if stream_buffer.strip():
             await _send_buffer_segmented(stream_buffer)
         stream_buffer = ""
         sent_segments = 0
         _tool_called = False
-        _skip_think_buffer_mode = False
-        _saw_reasoning = False
         _tool_rounds = 0
 
     async def _on_reply_complete(reply_text: str, reply_tool_messages: List[Dict[str, Any]],
@@ -1626,26 +1605,14 @@ async def do_msg_response(
         text = sanitize_internal_control_text(reply_text or "")
         text = sanitize_draw_reply_text(text, allow_task_ids=True)
         text, _ = _strip_think_tags(text)
+        # 分段符归一：落库文本与群消息保持一致（--- 之类整行分隔线 → 双换行）
+        text = normalize_reply_separators(text)
         if not config.ENABLE_MSG_TO_IMG:
             text = strip_chat_markdown(text)
         text = strip_edge_commas(_strip_speaker_prefix(text))
         text = text.strip()
         if not text:
             return
-        # 思考泄漏兜底（按回复维度）：避免思考内容随回复进入历史/群消息
-        if _skip_think_buffer_mode and not (_saw_reasoning or _extracted_reasoning):
-            threshold = int(getattr(config, "THINK_LEAK_THRESHOLD", 150))
-            short_seg = int(getattr(config, "THINK_LEAK_SHORT_SEGMENT", 50))
-            if len(text) > threshold and "\n\n" in text:
-                split = _split_think_leak(text, short_seg)
-                if split:
-                    leaked, reply = split
-                    text = reply
-                    stream_buffer = reply
-                    logger.info(
-                        f"[思考泄漏兜底] 检测到 content 混入思考({len(leaked)}字)，"
-                        f"已截取回复部分({len(reply)}字)"
-                    )
         # 流式收尾：发送该回复最后一段并重置分段计数器与 _tool_called 等 per-reply 状态
         await _flush_reply_stream_buffer()
         raw_parts.clear()  # 该回复已落库，失败路径只保留未落库的增量
@@ -1809,7 +1776,8 @@ async def do_msg_response(
                 break
             # 仅在图片相关 400 / 上游审核拒绝时重试（非图片 400 如工具调用格式错误，剥离图片无意义）
             _img_limit_hit = _is_image_limit_error(raw_res)
-            if not _is_image_download_error(raw_res) and not _img_limit_hit and not _provider_rejected:
+            _img_download_hit = _is_image_download_error(raw_res)
+            if not _img_download_hit and not _img_limit_hit and not _provider_rejected:
                 break
             if _retry >= MAX_RETRIES:
                 logger.warning(f"已达到最大重试次数 ({MAX_RETRIES})，停止重试")
@@ -1829,8 +1797,9 @@ async def do_msg_response(
                     continue
 
             logger.warning(f"含图片上下文请求返回 400 (第 {_retry + 1} 次)，回退到无图片上下文重试...")
-            # 图片数量超限/上游审核拒绝时上下文本身没问题，剥图即可解决，不做会丢历史的清理
-            if not _img_limit_hit and not _provider_rejected:
+            # 图片数量超限/上游审核拒绝时上下文本身没问题，剥图即可解决；
+            # 图片下载超时是纯网络问题，清历史只会白丢上下文，同样跳过清理
+            if not _img_limit_hit and not _provider_rejected and not _img_download_hit:
                 chat.cleanup_after_bad_request(keep_history=5)
                 PersistentDataManager.instance.save_to_file(must_save=True)
             raw_parts.clear()
@@ -1918,21 +1887,12 @@ async def do_msg_response(
                 raw_res_for_save = sanitize_internal_control_text(raw_res_for_save)
                 raw_res_for_save = sanitize_draw_reply_text(raw_res_for_save, allow_task_ids=True)
                 raw_res_for_save, _ = _strip_think_tags(raw_res_for_save)
+                raw_res_for_save = normalize_reply_separators(raw_res_for_save)
                 if not config.ENABLE_MSG_TO_IMG:
                     raw_res_for_save = strip_chat_markdown(raw_res_for_save)
                 raw_res_for_save = strip_edge_commas(_strip_speaker_prefix(raw_res_for_save))
                 if is_model_request_error_text(raw_res_for_save):
                     raw_res_for_save = ""
-                # 思考泄漏兜底（失败路径）：避免思考内容随部分回复进入对话历史
-                if _skip_think_buffer_mode and not reasoning_content and raw_res_for_save:
-                    _candidate = raw_res_for_save.strip()
-                    _threshold = int(getattr(config, "THINK_LEAK_THRESHOLD", 150))
-                    _short_seg = int(getattr(config, "THINK_LEAK_SHORT_SEGMENT", 50))
-                    if len(_candidate) > _threshold and "\n\n" in _candidate:
-                        _split = _split_think_leak(_candidate, _short_seg)
-                        if _split:
-                            _leaked, _reply = _split
-                            raw_res_for_save = _reply
             if raw_res_for_save:
                 await chat.update_chat_history_row(sender=chat.preset_key, msg=raw_res_for_save, require_summary=False, record_time=False, is_bot_reply=True)
                 if config.DEBUG_LEVEL > 0:
@@ -1959,21 +1919,22 @@ async def do_msg_response(
                 logger.warning("检测到 400 Bad Request，清理图片上下文和近期历史...")
                 chat.cleanup_after_bad_request(keep_history=5)
                 PersistentDataManager.instance.save_to_file(must_save=True)
-                await matcher.send("[系统] 请求上下文异常，已清理近期上下文，请继续对话")
+                # 群里不出现技术性错误文案，改发一张随机 gif 表情
+                await send_error_gif(matcher.send)
                 return
             if _is_context_length_error(raw_res):
                 logger.warning("检测到上下文长度超限错误，清理近期历史...")
                 chat.cleanup_after_bad_request(keep_history=5)
                 PersistentDataManager.instance.save_to_file(must_save=True)
-                await matcher.send("[系统] 对话历史过长已自动清理，请继续对话")
+                await send_error_gif(matcher.send)
                 return
             if not raw_res:
                 logger.warning("模型返回空响应（重试后仍失败），error 日志已保存")
-                await matcher.send("[系统] 模型响应为空，可能上下文过长，请发送消息触发新对话")
+                await send_error_gif(matcher.send)
                 return
             if not raw_parts and raw_res:
                 if is_model_request_error_text(raw_res):
-                    await matcher.send("[系统] 请求模型失败，已记录错误日志，请稍后重试")
+                    await send_error_gif(matcher.send)
                 else:
                     await send_segment(raw_res)
             return
@@ -1987,26 +1948,8 @@ async def do_msg_response(
         raw_res, think_reasoning = _strip_think_tags(raw_res)
         if think_reasoning and not reasoning_content:
             reasoning_content = think_reasoning
-
-        # 思考泄漏兜底：模型跳过思考标签，把思考过程混入 content（无 reasoning_content 也无 <think> 标签）。
-        # 此时 stream_buffer 为全部 content（收完再发模式下未分段发送），按双换行分段切分：
-        # 从第一个短段落（< THINK_LEAK_SHORT_SEGMENT 字，通常为回复开头的口头语/短句）开始视为实际回复，
-        # 前段视为思考存入 reasoning_content（仅用于 debug 日志，不进入历史、不发送到群里）。
-        if _skip_think_buffer_mode and not reasoning_content:
-            candidate = (raw_res or stream_buffer).strip()
-            threshold = int(getattr(config, "THINK_LEAK_THRESHOLD", 150))
-            short_seg = int(getattr(config, "THINK_LEAK_SHORT_SEGMENT", 50))
-            if len(candidate) > threshold and "\n\n" in candidate:
-                split = _split_think_leak(candidate, short_seg)
-                if split:
-                    leaked, reply = split
-                    reasoning_content = leaked
-                    raw_res = reply
-                    stream_buffer = reply
-                    logger.info(
-                        f"[思考泄漏兜底] 检测到 content 混入思考({len(leaked)}字)，"
-                        f"已截取回复部分({len(reply)}字)"
-                    )
+        # 分段符归一：--- 之类整行分隔线 → 双换行，残余缓冲据此切段
+        raw_res = normalize_reply_separators(raw_res)
 
         if stream_buffer:
             await send_segment(stream_buffer)
