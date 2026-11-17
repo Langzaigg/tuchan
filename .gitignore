@@ -171,4 +171,11 @@ export_group_chat.py
 test_llm_request.py
 *.lnk
 
-nonebot_plugin_dice
+# 旧版 Dice! 源码与本仓库自研移植版分开管理：只忽略 old/ 下的原始拷贝
+old/nonebot_plugin_dice
+
+# 本地素材与创作稿（人设设计稿等），不入库
+/assets/
+
+# dice 插件的本地运行数据（会话、角色卡、每日运势）
+/data/dice/
