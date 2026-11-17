@@ -250,6 +250,8 @@ MULTIMODAL_IMAGE_FRESH_MINUTES: 60
 
 请求模型失败、上下文超限、400 等错误不再往群里发 `[系统] ...` 文案，改为从 `data/naturel_gpt/gif/` 随机挑一张 gif 发出（目录可随时增删图片；先按本地路径发送，协议端不支持时自动转 base64）。目录为空或两次发送都失败则静默跳过——技术细节只留在控制台与 `data/naturel_gpt/logs/*.error.json`。
 
+上游内容审查（`data_inspection_failed`）同样走这条兜底，但会先按阶梯自救：关流式重试 → 换 `model_mini` 重试 → **剥离图片重试**（不管拦的是图片还是文本），三步都不行才发 gif。
+
 ### 🛠️ 工具调用
 
 ```yaml
