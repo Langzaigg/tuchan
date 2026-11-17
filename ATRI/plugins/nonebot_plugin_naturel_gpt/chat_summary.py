@@ -116,7 +116,7 @@ class ChatSummaryMixin:
             active_profile = config.resolve_profile_name(active_profile)
             profile["name"] = active_profile  # 稳定标识，供 per-profile 多 key 冷却索引用
             profile["api_keys"] = list(profile.get("api_keys", config.OPENAI_API_KEYS) or [""])
-            profile["enable_stream"] = config.LLM_ENABLE_STREAM
+            profile["enable_stream"] = config.profile_enable_stream(profile)
             return profile
         return {
             "api_keys": list(config.OPENAI_API_KEYS or [""]),

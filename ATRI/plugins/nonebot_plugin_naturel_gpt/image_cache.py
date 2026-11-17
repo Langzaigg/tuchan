@@ -27,9 +27,11 @@ _MAX_CACHE_TOTAL_BYTES = 200 * 1024 * 1024
 # 下载超时（秒）
 _DOWNLOAD_TIMEOUT = 15.0
 
-# 超过该体积的图片先缩放再送模型（8MB）：原图 base64 塞进请求体太大会让网关侧
+# 超过该体积的图片先缩放再送模型（5MB）：原图 base64 塞进请求体太大会让网关侧
 # （Cloudflare Worker）资源超限直接 503，token 也白烧。阈值以下原样送，不动画质。
-_IMAGE_DOWNSCALE_THRESHOLD_BYTES = 8 * 1024 * 1024
+# 5MB 是各协议里最严的一个（Anthropic 单图上限 5MB / 20 张 / 8000px），统一按它取，
+# 免得同一张图在 OpenAI 兼容通道能过、切到 anthropic / gemini 原生就 400。
+_IMAGE_DOWNSCALE_THRESHOLD_BYTES = 5 * 1024 * 1024
 # 缩放目标：最长边像素 + JPEG 质量（仅超阈值图片会重编码）
 _IMAGE_DOWNSCALE_MAX_SIDE = 1536
 _IMAGE_DOWNSCALE_JPEG_QUALITY = 85

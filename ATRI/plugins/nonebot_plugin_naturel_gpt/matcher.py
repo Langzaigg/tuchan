@@ -828,7 +828,7 @@ def _snapshot_request_profile(chat: Chat) -> Dict[str, Any]:
     if profile:
         profile["name"] = active_profile  # 稳定标识，供 per-profile 多 key 轮换索引用
         profile["api_keys"] = list(profile.get("api_keys", config.OPENAI_API_KEYS) or [""])
-        profile["enable_stream"] = config.LLM_ENABLE_STREAM
+        profile["enable_stream"] = config.profile_enable_stream(profile)
         # 会话级思考强度覆盖（rg model <profile> <effort>）：压过 profile 的 reasoning_effort。
         # 显式 default 档把值置 None —— 请求层只在非 None 时才发，等价于「交给供应商默认」。
         effort_override = chat.get_effort_override() if hasattr(chat, "get_effort_override") else ""
@@ -1908,12 +1908,13 @@ async def do_msg_response(
                 failure_cost,
                 success,
             )
-            # 上游内容审查拦截（DataInspectionFailed）：既不是上下文/参数问题，也不该惊动群里——
-            # 不做上下文清理、不发任何系统提示，只在控制台与该会话的 error log 里留痕
-            # （error log 已在上面的 _save_debug_log 落好）。必须放在 400 分支之前，
-            # 否则会被当成「请求上下文异常」清掉近期历史。
+            # 上游内容审查拦截（DataInspectionFailed）：openai_func 已按「关流式 → 换摘要模型
+            # → 剥离图片」逐级重试，仍不放行才走到这里。不做上下文清理（既不是上下文/参数问题）、
+            # 不发审核文案，改发一张随机表情，别让群里干等着。必须放在 400 分支之前，
+            # 否则会被当成「请求上下文异常」清掉近期历史（error log 已在上面的 _save_debug_log 落好）。
             if is_content_review_error(raw_res):
-                logger.warning("请求被上游内容审查拦截，已记录 error log（不在群里提示）")
+                logger.warning("请求被上游内容审查拦截，已记录 error log，改为发送表情兜底")
+                await send_error_gif(matcher.send)
                 return
             if _is_bad_request_error(raw_res):
                 logger.warning("检测到 400 Bad Request，清理图片上下文和近期历史...")

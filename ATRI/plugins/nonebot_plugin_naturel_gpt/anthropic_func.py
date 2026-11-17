@@ -22,7 +22,16 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 ANTHROPIC_VERSION = "2023-06-01"
-DEFAULT_MAX_TOKENS = 8192
+# Anthropic 必填 max_tokens；profile 没配时用这个兜底。8192 对长回复偏小（会被 finish_reason=length 截断），
+# 官方 2026 示例普遍写 16000，这里跟上。
+DEFAULT_MAX_TOKENS = 16000
+# max_tokens 是「正文 + 思考」的总上限（实测 max_tokens=300 + 困难任务 → thinking 300、正文为空、
+# stop_reason=max_tokens），所以配了 max_tokens 时要按 ×8 留思考余量，再按模型上限收敛
+# （实测 Sonnet 5.5 接受 128000）。
+MAX_OUTPUT_TOKENS_MULTIPLIER = 8
+MAX_OUTPUT_TOKENS_CAP = 128000
+# 上一轮 thinking block（含 signature）在内部消息里的存放键，`split_messages` 会原样回传
+THINKING_BLOCKS_KEY = "_anthropic_thinking_blocks"
 
 # Anthropic 只接受这几种图片 media_type
 _IMAGE_MEDIA_TYPES = {
@@ -129,7 +138,8 @@ def _convert_tool_choice(tool_choice: Any) -> Optional[Dict[str, Any]]:
         if low == "any":
             return {"type": "any"}
         if low == "none":
-            return None  # 由调用方决定：不传 tools
+            # Anthropic 原生支持 none（旧实现是「干脆不传 tools」，模型会因此看不到工具描述）
+            return {"type": "none"}
         return None
     if isinstance(tool_choice, dict):
         fn = tool_choice.get("function") or {}
@@ -166,6 +176,11 @@ def split_messages(messages: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict
 
         if role == "assistant":
             blocks: List[Dict[str, Any]] = []
+            # 上一轮的 thinking block（含 signature）必须原样回传，且要排在 content 最前面，
+            # 否则开了 adaptive thinking 之后多轮/工具轮会被上游 400。
+            saved_thinking = msg.get(THINKING_BLOCKS_KEY)
+            if isinstance(saved_thinking, list):
+                blocks.extend(block for block in saved_thinking if isinstance(block, dict))
             text = _flatten_text(content)
             if text:
                 blocks.append({"type": "text", "text": text})
@@ -210,21 +225,69 @@ def _build_url(base_url: str) -> str:
     return base + "/v1/messages"
 
 
+# ---- prompt caching（11-17 实测 CC：**顶层 cache_control 无效，必须逐块打点**）----
+# 打点后 run1 产出 cache_creation 2617、run2/3 变成 cache_read 2617 + input 15，
+# 也就是历史前缀几乎零成本。两个断点足够：system 末尾 + 上一轮历史的末尾。
+CACHE_CONTROL = {"type": "ephemeral"}
+
+
+def _system_blocks(system_texts: List[str]) -> List[Dict[str, Any]]:
+    """system 拆成 blocks 并给最后一块打缓存断点（顶层 cache_control 在 CC 上会被忽略）。"""
+    blocks = [{"type": "text", "text": text} for text in system_texts if text]
+    if blocks:
+        blocks[-1]["cache_control"] = dict(CACHE_CONTROL)
+    return blocks
+
+
+def _apply_cache_breakpoints(conv: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """给「上一轮历史」的末尾补第二个断点：群聊每轮只追加新消息，前缀天然稳定。
+
+    断点会随轮次前移，但 Anthropic 是前缀匹配——旧断点包含在新前缀里，仍然命中。
+    只有一条消息（单轮）时不打历史断点，system 那个已经够用。
+    """
+    if len(conv) >= 2:
+        prev = conv[-2]
+        blocks = prev.get("content") or []
+        if blocks and isinstance(blocks[-1], dict):
+            blocks[-1]["cache_control"] = dict(CACHE_CONTROL)
+    return conv
+
+
 def build_request(kwargs: Dict[str, Any]) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
     """OpenAI 风格请求参数 → (url, headers, body)。"""
     api_key = str(kwargs.get("api_key") or "")
     base_url = str(kwargs.get("base_url") or "https://api.anthropic.com")
     system_texts, conv = split_messages(kwargs.get("messages") or [])
 
+    # Anthropic 的 max_tokens 把 thinking 也算进去（和 Gemini 的 maxOutputTokens 一样），
+    # 按配置值 ×8 再收敛到模型上限，避免思考吃光额度导致正文为空。
+    raw_max_tokens = kwargs.get("max_tokens")
+    if raw_max_tokens:
+        max_tokens = min(
+            int(raw_max_tokens) * MAX_OUTPUT_TOKENS_MULTIPLIER, MAX_OUTPUT_TOKENS_CAP
+        )
+    else:
+        max_tokens = DEFAULT_MAX_TOKENS
+
     body: Dict[str, Any] = {
         "model": kwargs.get("model"),
-        "max_tokens": int(kwargs.get("max_tokens") or DEFAULT_MAX_TOKENS),
-        "messages": conv,
+        "max_tokens": max_tokens,
+        "messages": _apply_cache_breakpoints(conv),
     }
     if system_texts:
-        body["system"] = "\n\n".join(system_texts)
+        # 逐块给断点；顶层 cache_control 在部分网关（实测 CC）会被直接忽略
+        body["system"] = _system_blocks(system_texts)
     if kwargs.get("stream"):
         body["stream"] = True
+
+    # 思考：新版 Claude（Fable 5 / Opus 4.8 / 4.7 / Sonnet 4.6+）只认 adaptive，
+    # budget_tokens 已移除（传了直接 400）。profile 配 `anthropic_thinking: adaptive` 才发。
+    thinking = kwargs.get("anthropic_thinking")
+    if thinking:
+        if isinstance(thinking, str) and thinking.strip().lower() in ("adaptive", "true", "on", "1"):
+            body["thinking"] = {"type": "adaptive"}
+        elif isinstance(thinking, dict):
+            body["thinking"] = thinking
 
     for key in ("temperature", "top_p"):
         if kwargs.get(key) is not None:
@@ -234,13 +297,10 @@ def build_request(kwargs: Dict[str, Any]) -> Tuple[str, Dict[str, str], Dict[str
     tools = [t for t in tools if t]
     tool_choice = kwargs.get("tool_choice")
     if tools:
+        body["tools"] = tools
         choice = _convert_tool_choice(tool_choice)
-        if choice is None and isinstance(tool_choice, str) and tool_choice.lower() == "none":
-            pass  # 模型不该调工具：干脆不给 tools
-        else:
-            body["tools"] = tools
-            if choice:
-                body["tool_choice"] = choice
+        if choice:
+            body["tool_choice"] = choice
 
     headers = {
         "Content-Type": "application/json",
@@ -251,17 +311,32 @@ def build_request(kwargs: Dict[str, Any]) -> Tuple[str, Dict[str, str], Dict[str
 
 
 def _usage_to_openai(usage: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Anthropic usage → OpenAI usage。
+
+    Anthropic 的 `input_tokens` **只算未命中的新增输入**，缓存命中/写入分开报，
+    所以 prompt_tokens 要把三部分加起来；否则开了缓存之后统计会凭空变小。
+    """
     if not usage:
         return None
-    prompt = int(usage.get("input_tokens") or 0)
+    fresh = int(usage.get("input_tokens") or 0)
     completion = int(usage.get("output_tokens") or 0)
     cached = int(usage.get("cache_read_input_tokens") or 0)
-    return {
+    created = int(usage.get("cache_creation_input_tokens") or 0)
+    thinking = int((usage.get("output_tokens_details") or {}).get("thinking_tokens") or 0)
+    prompt = fresh + cached + created
+    converted: Dict[str, Any] = {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": prompt + completion,
-        "prompt_tokens_details": {"cached_tokens": cached},
+        "prompt_tokens_details": {
+            "cached_tokens": cached,
+            "cache_creation_tokens": created,
+        },
     }
+    if thinking:
+        # output_tokens 本身已包含 thinking，这里只是把明细标出来
+        converted["completion_tokens_details"] = {"reasoning_tokens": thinking}
+    return converted
 
 
 def _finish_reason(stop_reason: Optional[str]) -> str:
@@ -283,15 +358,20 @@ def _extract_error(data: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-async def stream_to_openai_chunks(response):
+async def stream_to_openai_chunks(response, sink: Optional[Dict[str, Any]] = None):
     """Anthropic SSE → OpenAI 风格 chunk（async generator）。
 
     产出结构与 `/chat/completions` 的 stream chunk 一致：
     `{"choices":[{"delta":{...}}]}` 与 `{"usage":{...}}`。
+
+    `sink` 用来把本轮完整 thinking block（thinking + signature）带出异步生成器，
+    供上层的 assistant 消息保存、下一轮原样回传——signature 丢了会被上游 400。
     """
     tool_index: Dict[int, int] = {}   # content_block index → tool_calls index
     next_tool_idx = 0
     usage_acc: Dict[str, Any] = {}
+    thinking_state: Dict[int, Dict[str, str]] = {}
+    thinking_blocks: List[Dict[str, Any]] = []
 
     async for raw in response.aiter_lines():
         line = (raw or "").strip()
@@ -323,8 +403,14 @@ async def stream_to_openai_chunks(response):
 
         if etype == "content_block_start":
             block = data.get("content_block") or {}
-            if block.get("type") == "tool_use":
-                idx = int(data.get("index") or 0)
+            idx = int(data.get("index") or 0)
+            btype = block.get("type")
+            if btype == "thinking":
+                thinking_state[idx] = {
+                    "thinking": str(block.get("thinking") or ""),
+                    "signature": str(block.get("signature") or ""),
+                }
+            elif btype == "tool_use":
                 tool_index[idx] = next_tool_idx
                 yield {"choices": [{"delta": {"tool_calls": [{
                     "index": next_tool_idx,
@@ -338,16 +424,22 @@ async def stream_to_openai_chunks(response):
         if etype == "content_block_delta":
             delta = data.get("delta") or {}
             dtype = delta.get("type")
+            idx = int(data.get("index") or 0)
             if dtype == "text_delta":
                 text = delta.get("text") or ""
                 if text:
                     yield {"choices": [{"delta": {"content": text}}]}
             elif dtype == "thinking_delta":
                 think = delta.get("thinking") or ""
+                if idx in thinking_state:
+                    thinking_state[idx]["thinking"] += think
                 if think:
                     yield {"choices": [{"delta": {"reasoning_content": think}}]}
+            elif dtype == "signature_delta":
+                sig = delta.get("signature") or ""
+                if idx in thinking_state:
+                    thinking_state[idx]["signature"] += sig
             elif dtype == "input_json_delta":
-                idx = int(data.get("index") or 0)
                 ti = tool_index.get(idx)
                 partial = delta.get("partial_json") or ""
                 if ti is not None and partial:
@@ -355,6 +447,17 @@ async def stream_to_openai_chunks(response):
                         "index": ti,
                         "function": {"arguments": partial},
                     }]}}]}
+            continue
+
+        if etype == "content_block_stop":
+            idx = int(data.get("index") or 0)
+            state = thinking_state.pop(idx, None)
+            if state and state.get("thinking") and state.get("signature"):
+                thinking_blocks.append({
+                    "type": "thinking",
+                    "thinking": state["thinking"],
+                    "signature": state["signature"],
+                })
             continue
 
         if etype == "message_delta":
@@ -371,12 +474,16 @@ async def stream_to_openai_chunks(response):
             break
         # ping / content_block_stop 等：忽略
 
+    if thinking_blocks and sink is not None:
+        sink[THINKING_BLOCKS_KEY] = thinking_blocks
+
 
 def message_to_completion(data: Dict[str, Any]) -> Dict[str, Any]:
     """Anthropic message → OpenAI chat.completion。"""
     text_parts: List[str] = []
     reasoning_parts: List[str] = []
     tool_calls: List[Dict[str, Any]] = []
+    thinking_blocks: List[Dict[str, Any]] = []
     for idx, block in enumerate(data.get("content") or []):
         if not isinstance(block, dict):
             continue
@@ -385,6 +492,9 @@ def message_to_completion(data: Dict[str, Any]) -> Dict[str, Any]:
             text_parts.append(str(block.get("text") or ""))
         elif btype == "thinking":
             reasoning_parts.append(str(block.get("thinking") or ""))
+            # 原样留存（thinking + signature），下一轮必须带回去
+            if block.get("signature"):
+                thinking_blocks.append(block)
         elif btype == "tool_use":
             tool_calls.append({
                 "id": str(block.get("id") or f"toolu_{idx}"),
@@ -403,6 +513,8 @@ def message_to_completion(data: Dict[str, Any]) -> Dict[str, Any]:
         message["tool_calls"] = tool_calls
     if reasoning_parts:
         message["reasoning_content"] = "".join(reasoning_parts)
+    if thinking_blocks:
+        message[THINKING_BLOCKS_KEY] = thinking_blocks
 
     return {
         "id": str(data.get("id") or ""),

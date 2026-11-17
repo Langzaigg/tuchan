@@ -24,9 +24,150 @@ SEARCH_TOOL_NAMES = {"bocha_search", "tavily_search"}  # 搜索工具名称
 # 仅在画图场景下暴露的工具：画图工具本体 + 为它确定作画标签的 danbooru_search / 参考图反推的 anima_reverse_tag
 _DRAW_ONLY_TOOLS = {"generate_anima_image", "generate_moss_image", "danbooru_search", "anima_reverse_tag"}
 
+# 单次工具返回最多注入多少张图进上下文（与多模态容量上限一致，防 token 爆炸）
+_TOOL_CONTEXT_IMAGE_LIMIT = 4
+
 # 思考泄漏重试的默认正文阈值（字符）：profile 设 think_leak_retry=true 后，
 # 「本轮没收到 reasoning_content，但正文超过这个长度」就判定思考混进了正文
 _THINK_LEAK_RETRY_MIN_CHARS = 100
+
+# ---- 思考前缀剥离（profile `strip_thought_prefix`）----
+# 部分网关（实测 TeamoRouter 的 gemini-4-hydrogen / carbon）把 Gemini 的 thought summary
+# 当普通 content 下发：既没有 `<think>` 标签，也没有 reasoning_content / reasoning 字段，
+# 所以 `_strip_think_tags` 与 `LLM_SHOW_REASONING` 全都拦不到，思考会跟着正文发进群。
+# 判据只看「块」（以空行分段）：块内几乎不含 CJK、ASCII 字母占比高 → 候选思考块。
+# 候选块先压住不发，**等后面真的出现中文正文才确认丢弃**；整条都是英文则原样回放，绝不吞正文。
+_THOUGHT_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
+_THOUGHT_MAX_DROP_CHARS = 1200  # 连续丢弃上限：超过就判定不是思考，整段回放
+_THOUGHT_MAX_BLOCKS = 6
+_THOUGHT_BODY_CJK_RATIO = 0.12  # 块内 CJK 占比超过它 = 正文（思考里可能零星引用中文原话）
+
+
+def _cjk_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    return len(_THOUGHT_CJK_RE.findall(text)) / len(text)
+
+
+def _looks_like_thought_block(block: str) -> bool:
+    """候选思考块：够长、基本没有 CJK、且以 ASCII 字母为主。"""
+    stripped = block.strip()
+    if len(stripped) < 12:
+        return False
+    if _cjk_ratio(stripped) > 0.02:
+        return False
+    letters = sum(1 for ch in stripped if ch.isalpha() and ch.isascii())
+    return letters / len(stripped) >= 0.45
+
+
+class _ThoughtPrefixStripper:
+    """流式剥离「英文思考前缀」。
+
+    只有在后续出现中文正文时，前面压住的候选块才会被真正丢弃；流结束时仍未确认的
+    候选块由 `finish()` 原样回放。因此最坏情况是「思考没剥干净」，不会是「正文被吞」。
+    """
+
+    def __init__(self) -> None:
+        self.buf = ""
+        self.pending: List[str] = []
+        self.pending_chars = 0
+        self.done = False
+
+    def _release(self, out: List[str], keep_pending: bool) -> str:
+        if keep_pending:
+            out.extend(self.pending)
+        out.append(self.buf)
+        self.pending.clear()
+        self.pending_chars = 0
+        self.buf = ""
+        self.done = True
+        return "".join(out)
+
+    def feed(self, chunk: str) -> str:
+        """吃一段增量，返回本次可以向下游发送的文本（可能为空）。"""
+        if self.done:
+            return chunk
+        if not chunk:
+            return ""
+        self.buf += chunk
+        out: List[str] = []
+        while True:
+            idx = self.buf.find("\n\n")
+            if idx < 0:
+                break
+            block = self.buf[:idx]
+            sep = 2
+            while self.buf[idx + sep: idx + sep + 1] == "\n":
+                sep += 1
+            if _cjk_ratio(block.strip()) > _THOUGHT_BODY_CJK_RATIO:
+                # 正文开始 → 前面压住的候选块确认为思考，丢弃
+                return self._release(out, keep_pending=False)
+            if not _looks_like_thought_block(block):
+                # 不像思考（短句/符号块/中文混排）→ 全部原样放行
+                return self._release(out, keep_pending=True)
+            self.pending.append(self.buf[: idx + sep])
+            self.pending_chars += idx + sep
+            self.buf = self.buf[idx + sep:]
+            if len(self.pending) > _THOUGHT_MAX_BLOCKS or self.pending_chars > _THOUGHT_MAX_DROP_CHARS:
+                # 太多/太长 → 判定不是思考，整段回放
+                return self._release(out, keep_pending=True)
+        if _cjk_ratio(self.buf) > _THOUGHT_BODY_CJK_RATIO:
+            return self._release(out, keep_pending=False)
+        if len(self.buf) > _THOUGHT_MAX_DROP_CHARS:
+            return self._release(out, keep_pending=True)
+        return "".join(out)
+
+    def finish(self, drop_pending: bool = False) -> str:
+        """流结束：未确认的候选块默认原样回放，保证不丢内容。
+
+        `drop_pending=True`（本轮带 tool_calls）时把候选块丢掉——工具轮的 content
+        往往整段都是思考，正文在下一轮才出来，此时回放等于把思考直接发进群。
+        候选块都经过 `_looks_like_thought_block` 判定，丢掉不会伤到中文正文。
+        """
+        if self.done:
+            return ""
+        if drop_pending:
+            self.pending.clear()
+            self.pending_chars = 0
+            text = self.buf
+            # 尾部没成块的残片同样可能是思考（工具轮的 content 整段都是思考）
+            if text and _looks_like_thought_block(text):
+                text = ""
+        else:
+            text = "".join(self.pending) + self.buf
+        self.pending.clear()
+        self.pending_chars = 0
+        self.buf = ""
+        self.done = True
+        return text
+
+
+def strip_thought_prefix_text(text: str, allow_empty: bool = False) -> str:
+    """一次性版本（非流式 / 摘要 / 收尾兜底）。逻辑与 `_ThoughtPrefixStripper` 一致。"""
+    if not text or not text.strip():
+        return text
+    blocks = text.split("\n\n")
+    drop = 0
+    dropped_chars = 0
+    for block in blocks:
+        if _cjk_ratio(block.strip()) > _THOUGHT_BODY_CJK_RATIO:
+            break
+        if not _looks_like_thought_block(block):
+            break
+        drop += 1
+        dropped_chars += len(block)
+        if drop > _THOUGHT_MAX_BLOCKS or dropped_chars > _THOUGHT_MAX_DROP_CHARS:
+            return text
+    if drop == 0:
+        return text
+    rest = "\n\n".join(blocks[drop:]).lstrip("\n")
+    if not rest.strip():
+        # 整条 content 都是思考（工具轮常见）：有 tool_calls 时允许留空
+        return "" if allow_empty else text
+    if _cjk_ratio(rest) <= _THOUGHT_BODY_CJK_RATIO:
+        return text
+    return rest
+
 
 _CURRENT_CHAT_KEY: ContextVar[str] = ContextVar("naturel_gpt_current_chat_key", default="")
 _CURRENT_TRIGGER_USERID: ContextVar[str] = ContextVar("naturel_gpt_current_trigger_userid", default="")
@@ -92,6 +233,14 @@ _TRANSIENT_UPSTREAM_TEXT_MARKERS = (
     "readtimeout",
     "connecttimeout",
     "connecterror",
+    # httpx 传输层异常**类名**兜底：这几个的 str(e) 经常是空串（与 ConnectError 同款），
+    # 只能靠 err_text 里的类名识别。ReadError = 读响应体时连接被对端关闭（复用到已被服务端
+    # 单方面关掉的 keep-alive 连接、网关/代理中途掐断流式响应），原样重发一次基本就过；
+    # WriteError 是上传阶段断连，PoolTimeout 是连接池排队超时，同样值得退避后重发。
+    "readerror",
+    "writeerror",
+    "remoteprotocolerror",
+    "pooltimeout",
     "overloaded",
 )
 # 同一轮请求的瞬时错误重试退避（共 len() 次）：先等一下看是否抖过去，第二次拉长到 5s
@@ -651,6 +800,9 @@ class TextGenerator(Singleton["TextGenerator"]):
         # matcher 在请求结束后可读到的完整状态：含邮箱插入的新触发消息、assistant tool_calls、tool 响应）
         self._last_loop_messages_by_chat: Dict[str, List[Dict[str, Any]]] = {}
         self._last_stream_usage: Optional[Dict[str, Any]] = None  # 最近一次流式请求的 usage 信息
+        # 本轮 profile 是否原生多模态：决定「工具附图」要不要注入 messages
+        #（纯文本 profile 会在 _completion_kwargs 里剥 image_url，注入了既白占位又白下载）
+        self._current_request_multimodal: bool = True
 
     _SINGLETON_KEY_SCOPE = "__singleton__"  # 无 profile 快照的兼容路径使用的 key 冷却作用域
 
@@ -761,7 +913,9 @@ class TextGenerator(Singleton["TextGenerator"]):
         message: Dict[str, Any] = {"role": "user", "content": text}
         if all_images and multimodal_enabled:
             from . import image_cache
-            resolved = await image_cache.resolve_urls(all_images)
+            # Gemini 原生协议只认 inlineData，必须 base64（http 地址会被上游 400）
+            _force_b64 = str(getattr(self, "protocol", "") or "").lower() == "gemini"
+            resolved = await image_cache.resolve_urls(all_images, force_base64=_force_b64)
             if resolved:
                 message["content"] = [{"type": "text", "text": text}] + [
                     {"type": "image_url", "image_url": {"url": url}} for url in resolved
@@ -781,6 +935,10 @@ class TextGenerator(Singleton["TextGenerator"]):
         self.protocol = str(profile.get("protocol", "") or "").strip().lower()
         self.multimodal = profile.get("multimodal", True)
         self.extra_prompt = profile.get("extra_prompt", "") or ""
+        # 后处理开关统一解析（postprocess 数组 + 旧布尔字段兼容），无 profile 快照的路径也从这里读。
+        # 局部导入：openai_func 在插件加载早期就被 import，模块级取 config 有循环风险。
+        from .config import config as _cfg
+        _flags = _cfg.profile_flags(profile)
         self.config = {
             "model": profile.get("model", ""),
             "model_mini": profile.get("model_mini", ""),
@@ -791,8 +949,16 @@ class TextGenerator(Singleton["TextGenerator"]):
             "presence_penalty": profile.get("presence_penalty"),
             "max_summary_tokens": profile.get("max_summary_tokens", 800),
             "timeout": profile.get("timeout", 60),
-            "enable_stream": self.config.get("enable_stream", True),
+            "enable_stream": _cfg.profile_enable_stream(profile),
             "reasoning_effort": profile.get("reasoning_effort"),
+            "strip_thought_prefix": _flags["strip_thought_prefix"],
+            "think_leak_retry": _flags["think_leak_retry"],
+            "no_think": _flags["no_think"],
+            "keep_reasoning": _flags["keep_reasoning"],
+            "anthropic_thinking": profile.get("anthropic_thinking"),
+            # 摘要/印象（model_mini）专用思考强度：**默认不配 = 请求里完全不传**，
+            # 与主对话的 reasoning_effort 解耦（主对话调高不影响后台摘要）。
+            "reasoning_effort_mini": profile.get("reasoning_effort_mini"),
         }
         proxy_info = f"socks:{self.proxy}" if self.use_socket_proxy and self.proxy else ("直连" if not self.proxy else self.proxy)
         protocol_info = f" | 协议: {self.protocol}" if self.protocol and self.protocol != "openai" else ""
@@ -855,6 +1021,9 @@ class TextGenerator(Singleton["TextGenerator"]):
     def _request_state(self, profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if profile:
             api_keys = profile.get("api_keys", [""]) or [""]
+            # 后处理开关统一由 profile_flags 解析（postprocess 数组 + 旧布尔字段兼容）
+            from .config import config as _cfg
+            flags = _cfg.profile_flags(profile)
             request_config = {
                 "model": profile.get("model", ""),
                 "model_mini": profile.get("model_mini", ""),
@@ -865,13 +1034,20 @@ class TextGenerator(Singleton["TextGenerator"]):
                 "presence_penalty": profile.get("presence_penalty"),
                 "max_summary_tokens": profile.get("max_summary_tokens", 800),
                 "timeout": profile.get("timeout", 60),
-                "enable_stream": profile.get("enable_stream", self.config.get("enable_stream", True)),
+                "enable_stream": _cfg.profile_enable_stream(profile),
                 "reasoning_effort": profile.get("reasoning_effort"),
-                # 思考泄漏重试（profile 级开关，默认关）：没回 reasoning_content 且正文超过阈值时，
-                # 丢弃本轮文本原样重发一次。no_think=true 的 profile 本来就不该有 reasoning，不参与判定。
-                "think_leak_retry": bool(profile.get("think_leak_retry", False)),
+                # 摘要/印象专用（默认 None = 不传），与主对话解耦，见 switch_profile 注释
+                "reasoning_effort_mini": profile.get("reasoning_effort_mini"),
+                # Anthropic 协议专用：adaptive thinking（新版 Claude 只认 adaptive，budget_tokens 已移除）
+                "anthropic_thinking": profile.get("anthropic_thinking"),
+                # 思考泄漏重试（默认关）：没回 reasoning_content 且正文超过阈值时，
+                # 丢弃本轮文本原样重发一次。no_think 的 profile 本来就不该有 reasoning，不参与判定。
+                "think_leak_retry": flags["think_leak_retry"],
                 "think_leak_retry_chars": int(profile.get("think_leak_retry_chars") or _THINK_LEAK_RETRY_MIN_CHARS),
-                "no_think": bool(profile.get("no_think", False)),
+                "no_think": flags["no_think"],
+                # 思考前缀剥离（默认关）：网关把 thought summary 当正文下发时，
+                # 靠英文块 + 后续中文确认来丢弃，见 _ThoughtPrefixStripper
+                "strip_thought_prefix": flags["strip_thought_prefix"],
             }
             api_key, api_key_index = self._key_plan(self._profile_key_id(profile), api_keys)
             return {
@@ -884,7 +1060,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                 "use_socket_proxy": profile.get("use_socket_proxy", False),
                 "multimodal": profile.get("multimodal", True),
                 "protocol": str(profile.get("protocol", "") or "").strip().lower(),
-                "keep_reasoning": bool(profile.get("keep_reasoning", False)),
+                "keep_reasoning": flags["keep_reasoning"],
             }
         api_key, api_key_index = self._key_plan(self._SINGLETON_KEY_SCOPE, list(self.api_keys or [""]))
         singleton_config = dict(self.config)
@@ -895,6 +1071,7 @@ class TextGenerator(Singleton["TextGenerator"]):
             int(singleton_config.get("think_leak_retry_chars") or _THINK_LEAK_RETRY_MIN_CHARS),
         )
         singleton_config.setdefault("no_think", False)
+        singleton_config.setdefault("strip_thought_prefix", False)
         return {
             "api_key": api_key,
             "api_key_index": api_key_index,
@@ -996,12 +1173,21 @@ class TextGenerator(Singleton["TextGenerator"]):
             value = request_config.get(optional_key)
             if value is not None:
                 kwargs[optional_key] = value
-        # reasoning_effort（如 "low"/"medium"/"high"）：与主对话共享同一套思考预算设置，
-        # 摘要/印象（model_mini）同样透传 —— 摘要模型要一次性规划整页 layout + 逐字转写文字，
-        # 关掉思考预算会让它写得更随意、同一提示词两次结果差异很大。
-        reasoning_effort = request_config.get("reasoning_effort")
+        # reasoning_effort（如 "low"/"medium"/"high"/"max"）：聊天与摘要**分开取值**。
+        # - 主对话：profile 的 `reasoning_effort`（会话级 rg model 覆盖也只作用于这里）
+        # - 摘要/印象（model_mini）：profile 的 `reasoning_effort_mini`，**默认不配 = 完全不传**，
+        #   交给供应商自己的默认强度 —— 主对话调高思考强度不该把后台摘要一起拖慢。
+        # 需要给摘要单独指定强度时才写 `reasoning_effort_mini: high`。
+        if type in {"summarize", "impression"}:
+            reasoning_effort = request_config.get("reasoning_effort_mini")
+        else:
+            reasoning_effort = request_config.get("reasoning_effort")
         if reasoning_effort is not None:
             kwargs["reasoning_effort"] = reasoning_effort
+        # Anthropic 协议专用思考开关（adaptive）；其它协议忽略这个字段
+        anthropic_thinking = request_config.get("anthropic_thinking")
+        if anthropic_thinking:
+            kwargs["anthropic_thinking"] = anthropic_thinking
         if state.get("base_url"):
             kwargs["base_url"] = state["base_url"]
         # 代理：use_socket_proxy=True 时将 proxy 作为 socks 代理地址
@@ -1209,9 +1395,65 @@ class TextGenerator(Singleton["TextGenerator"]):
                         continue
 
     async def _acompletion(self, **kwargs) -> Dict[str, Any]:
-        if str(kwargs.get("protocol") or "").lower() == "anthropic":
+        protocol = str(kwargs.get("protocol") or "").lower()
+        if protocol == "anthropic":
             return await self._request_anthropic(kwargs)
+        if protocol == "gemini":
+            return await self._request_gemini(kwargs)
         return await self._request_openai_compatible(kwargs)
+
+    async def _request_gemini(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """非流式调用 Gemini 原生 `:generateContent`，返回 OpenAI chat.completion 结构。"""
+        import httpx
+        from . import gemini_func
+
+        kwargs = dict(kwargs)
+        kwargs.pop("protocol", None)
+        kwargs["stream"] = False
+        timeout = kwargs.get("timeout", 30)
+        proxy = kwargs.get("proxy")
+        url, headers, body = gemini_func.build_request(kwargs)
+        headers.update(_build_provider_headers(str(kwargs.get("base_url") or "")))
+
+        client_kwargs: Dict[str, Any] = {"timeout": httpx.Timeout(float(timeout))}
+        if proxy:
+            client_kwargs["proxy"] = proxy
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            response = await client.post(url, headers=headers, json=body)
+            if response.status_code >= 400:
+                raise RuntimeError(f"HTTP {response.status_code}: {response.text[:1000]}")
+            return gemini_func.message_to_completion(response.json())
+
+    async def _stream_iter_gemini(self, kwargs: Dict[str, Any], sig_sink: Dict[str, Any]):
+        """流式调用 Gemini 原生 `:streamGenerateContent?alt=sse`，YIELD OpenAI 同构 chunk。"""
+        import httpx
+        from . import gemini_func
+
+        kwargs = dict(kwargs)
+        kwargs.pop("protocol", None)
+        kwargs["stream"] = True
+        timeout = kwargs.get("timeout", 30)
+        proxy = kwargs.get("proxy")
+        base_url = str(kwargs.get("base_url") or "")
+        url, headers, body = gemini_func.build_request(kwargs)
+        headers.update(_build_provider_headers(base_url))
+
+        http_timeout = httpx.Timeout(connect=10.0, read=float(timeout), write=30.0, pool=10.0)
+        client_kwargs: Dict[str, Any] = {"timeout": http_timeout}
+        if proxy:
+            client_kwargs["proxy"] = proxy
+
+        MAX_TOTAL_SECONDS = 300.0
+        start_time = time.monotonic()
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            async with client.stream("POST", url, headers=headers, json=body) as response:
+                if response.status_code >= 400:
+                    body_text = (await response.aread()).decode("utf-8", errors="replace")[:1000]
+                    raise RuntimeError(f"HTTP {response.status_code}: {body_text}")
+                async for chunk in gemini_func.stream_to_openai_chunks(response, sig_sink):
+                    if time.monotonic() - start_time > MAX_TOTAL_SECONDS:
+                        raise RuntimeError(f"流式响应超过总时间上限 {MAX_TOTAL_SECONDS:.0f}s，已中断")
+                    yield chunk
 
     async def _request_anthropic(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """非流式调用 Anthropic `/v1/messages`，返回 OpenAI chat.completion 结构。"""
@@ -1234,8 +1476,10 @@ class TextGenerator(Singleton["TextGenerator"]):
                 raise RuntimeError(f"HTTP {response.status_code}: {response.text[:1000]}")
             return anthropic_func.message_to_completion(response.json())
 
-    async def _stream_iter_anthropic(self, kwargs: Dict[str, Any]):
-        """流式调用 Anthropic `/v1/messages`，YIELD 与 OpenAI chunk 同构的字典。"""
+    async def _stream_iter_anthropic(self, kwargs: Dict[str, Any], sink: Optional[Dict[str, Any]] = None):
+        """流式调用 Anthropic `/v1/messages`，YIELD 与 OpenAI chunk 同构的字典。
+
+        `sink` 收集本轮 thinking block（含 signature），供上层挂在 assistant 消息上回传。"""
         import httpx
         from . import anthropic_func
 
@@ -1260,7 +1504,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                 if response.status_code >= 400:
                     body_text = (await response.aread()).decode("utf-8", errors="replace")[:1000]
                     raise RuntimeError(f"HTTP {response.status_code}: {body_text}")
-                async for chunk in anthropic_func.stream_to_openai_chunks(response):
+                async for chunk in anthropic_func.stream_to_openai_chunks(response, sink):
                     if time.monotonic() - start_time > MAX_TOTAL_SECONDS:
                         raise RuntimeError(f"流式响应超过总时间上限 {MAX_TOTAL_SECONDS:.0f}s，已中断")
                     yield chunk
@@ -1286,10 +1530,14 @@ class TextGenerator(Singleton["TextGenerator"]):
         # 传输协议分流：anthropic 走 /v1/messages 原生协议，但产出与 OpenAI chunk 同构，
         # 下面的文本/reasoning/工具增量处理完全复用
         protocol = str(kwargs.get("protocol") or "").lower()
-        stream_iter = (
-            self._stream_iter_anthropic(kwargs) if protocol == "anthropic"
-            else self._stream_iter_openai(kwargs)
-        )
+        gemini_sig: Dict[str, Any] = {}
+        anthropic_sink: Dict[str, Any] = {}
+        if protocol == "anthropic":
+            stream_iter = self._stream_iter_anthropic(kwargs, anthropic_sink)
+        elif protocol == "gemini":
+            stream_iter = self._stream_iter_gemini(kwargs, gemini_sig)
+        else:
+            stream_iter = self._stream_iter_openai(kwargs)
         async for chunk in stream_iter:
             # provider 以 HTTP 200 在流内下发上游错误（该 chunk 既无 choices 也无 usage）：
             # 若继续静默跳过，本轮会以空内容“成功”返回，上层拿不到任何错误、也不会重试，
@@ -1348,6 +1596,12 @@ class TextGenerator(Singleton["TextGenerator"]):
                 last_usage = usage
 
         self._last_stream_usage = last_usage
+        # Gemini 原生协议：把本轮 thoughtSignature 交给上层，工具轮/后续轮原样回传
+        if gemini_sig.get("_gemini_thought_signature") and request_state is not None:
+            request_state["_gemini_thought_signature"] = gemini_sig["_gemini_thought_signature"]
+        # Anthropic 协议：thinking block（含 signature）必须原样带进下一轮
+        if anthropic_sink.get("_anthropic_thinking_blocks") and request_state is not None:
+            request_state["_anthropic_thinking_blocks"] = anthropic_sink["_anthropic_thinking_blocks"]
         # 统计本次请求的 token 消耗（按实际模型名分桶）
         try:
             from .stats import stats
@@ -1380,6 +1634,14 @@ class TextGenerator(Singleton["TextGenerator"]):
         # 统计非流式请求的 token 消耗
         usage = _get(response, "usage")
         self._last_stream_usage = usage
+        # Gemini 原生协议：把 thoughtSignature 交给上层，下一轮原样回传该 assistant 消息
+        gemini_sig = message_dict.get("_gemini_thought_signature")
+        if gemini_sig and request_state is not None:
+            request_state["_gemini_thought_signature"] = gemini_sig
+        # Anthropic 协议：thinking block（含 signature）同样要随 assistant 消息带下去
+        anthropic_thinking = message_dict.get("_anthropic_thinking_blocks")
+        if anthropic_thinking and request_state is not None:
+            request_state["_anthropic_thinking_blocks"] = anthropic_thinking
         try:
             from .stats import stats
             stats.record_model_usage(kwargs.get("model"), usage)
@@ -1388,6 +1650,9 @@ class TextGenerator(Singleton["TextGenerator"]):
         return content, tool_calls, message_dict
 
     async def _execute_tool_calls(self, messages: List[Dict[str, Any]], tool_calls: List[Dict[str, Any]], plugin_config) -> None:
+        # 本轮工具附图（只认显式声明 into_context 的附件，避免 pixiv 搜图等既有工具
+        # 被动多带图）：先收齐，循环结束统一追加一条 user 消息，避免连发多条。
+        _ctx_imgs: List[Dict[str, Any]] = []
         for idx, tool_call in enumerate(tool_calls):
             function = _get(tool_call, "function", {}) or {}
             name = _get(function, "name", "")
@@ -1422,6 +1687,59 @@ class TextGenerator(Singleton["TextGenerator"]):
             else:
                 self.last_tool_outputs.extend(attachments)
             messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": name, "content": tool_content})
+            for o in attachments:
+                if (isinstance(o, dict) and o.get("into_context")
+                        and o.get("type") == "image" and o.get("url")):
+                    _ctx_imgs.append(o)
+        if _ctx_imgs:
+            await self._inject_tool_images(messages, _ctx_imgs)
+
+    async def _inject_tool_images(self, messages: List[Dict[str, Any]], outputs: List[Dict[str, Any]]) -> None:
+        """把工具附带的图片作为一条 user 消息追加进本轮 messages，让多模态主模型直接看图。
+
+        追踪语义与用户发图一致：
+          * 单张图下载失败只跳过该张（等价于「剥离」），全部失败则整条消息不追加，
+            工具的文字结果（正文/评论）照常保留，不因配图拖垮整次抓取；
+          * 图片登记进 _visible_images（接在现有最大编号之后），文本里给 [图片N]，
+            这样纯文本 profile 配了 model_vision 时 vision 工具仍能按编号取图；
+          * 纯文本 profile 直接跳过——请求层会剥 image_url，注入了既白占位又白下载。
+        纯图片 400 由 stream_response 既有的剥图重试兜底（剥掉本轮全部 image_url）。
+        """
+        if not getattr(self, "_current_request_multimodal", True):
+            return
+        urls: List[str] = []
+        for o in outputs:
+            u = str(o.get("url") or "")
+            if u and u not in urls:
+                urls.append(u)
+        if not urls:
+            return
+        from . import image_cache
+        try:
+            # 强制 base64：小红书等图床的 URL 带时效签名，provider 侧拉取易失败，
+            # 本地下载已验证可行（单图 200KB 级），一次到底省掉 400 往返。
+            resolved = await image_cache.resolve_urls_keep_order(urls, force_base64=True)
+        except Exception as e:
+            logger.warning(f"[工具附图] 下载失败，已跳过: {e!r}")
+            return
+        pairs = [(u, r) for u, r in zip(urls, list(resolved or [])) if r]
+        if not pairs:
+            return
+
+        table = dict(self._visible_images or {})
+        idx = (max(table) + 1) if table else 1
+        first_idx = idx
+        lines = ["[工具附图] 以下是工具刚抓到的图片，按顺序编号；可以直接依据画面内容回答用户，不必再调 vision。"]
+        content: List[Dict[str, Any]] = []
+        for u, data_uri in pairs[:_TOOL_CONTEXT_IMAGE_LIMIT]:
+            lines.append(f"[图片{idx}]")
+            table[idx] = u
+            idx += 1
+            content.append({"type": "image_url", "image_url": {"url": data_uri}})
+        self._visible_images = table
+        content.insert(0, {"type": "text", "text": "\n".join(lines)})
+        messages.append({"role": "user", "content": content})
+        logger.info(f"[工具附图] 已注入 {len(content) - 1} 张图片（编号 {first_idx}-{idx - 1}）")
 
     async def stream_response(
         self,
@@ -1459,6 +1777,8 @@ class TextGenerator(Singleton["TextGenerator"]):
         # visible_images 由 matcher 在调用 stream_response 前写入；这里重新置位以绑定到本次请求的上下文。
         self._visible_images = dict(self._visible_images or {})
         self._current_vision_config = self._build_vision_config(request_profile, request_state)
+        # 本轮是否原生多模态：工具附图注入的唯一开关（纯文本 profile 剥图，跳过注入）
+        self._current_request_multimodal = bool(request_state.get("multimodal", True))
         self.last_tool_outputs = []
         if request_chat_key:
             self._last_tool_outputs_by_chat[request_chat_key] = []
@@ -1891,10 +2211,42 @@ class TextGenerator(Singleton["TextGenerator"]):
                 # 本轮是否判定为疑似泄漏（跨分支共用；非流式在下面单独判定）
                 _leak_suspected = False
 
+                # ---- 思考前缀剥离（profile `strip_thought_prefix`）----
+                # 网关把 Gemini thought summary 塞进 content 时，正文前面会先来一两段纯英文。
+                # 这里的 stripper 夹在 `_stream_once` 与泄漏探测之间：候选思考块先压住，
+                # 见到中文正文才丢，流结束时未确认的一律回放（见 _ThoughtPrefixStripper）。
+                _tp_stripper = (
+                    _ThoughtPrefixStripper()
+                    if (request_state.get("config") or {}).get("strip_thought_prefix")
+                    else None
+                )
+
+                async def _tp_on_text(chunk: str) -> None:
+                    if _tp_stripper is None:
+                        await _probe_on_text(chunk)
+                        return
+                    ready = _tp_stripper.feed(chunk)
+                    if ready:
+                        await _probe_on_text(ready)
+
+                async def _tp_finish(drop_pending: bool = False) -> None:
+                    if _tp_stripper is None:
+                        return
+                    rest = _tp_stripper.finish(drop_pending=drop_pending)
+                    if rest:
+                        await _probe_on_text(rest)
+
                 if _round_used_stream:
                     content, tool_calls, reasoning_content = await self._stream_once(
-                        messages, type, current_tools, _probe_on_text, _probe_on_reasoning, request_state, on_tool_call, tool_choice=round_tool_choice
+                        messages, type, current_tools, _tp_on_text, _probe_on_reasoning, request_state, on_tool_call, tool_choice=round_tool_choice
                     )
+                    # 先把 stripper 里压住的残余吐给泄漏探测（顺序不能反），再做本轮收尾。
+                    # 本轮带 tool_calls 时丢弃候选块：工具轮的 content 往往整段都是思考。
+                    await _tp_finish(drop_pending=bool(tool_calls))
+                    if _tp_stripper is not None:
+                        # 流式回调层已剥离，这里对完整正文再兜一次（幂等）：
+                        # on_text 为空的后台调用（摘要/印象）只走这一步
+                        content = strip_thought_prefix_text(content, allow_empty=bool(tool_calls))
                     # 剥图重试成功 → 确认这张图就是 provider 拉不动的那个，登记 30 分钟不再上送
                     if _single_stripped_url:
                         try:
@@ -2026,6 +2378,14 @@ class TextGenerator(Singleton["TextGenerator"]):
                     assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content or "", "tool_calls": tool_calls}
                     if reasoning_content:
                         assistant_msg["reasoning_content"] = reasoning_content
+                    # Gemini 原生协议：工具轮必须把签名带回给下一轮（Gemini 3/4 靠它维持上下文）
+                    _gemini_signature = (request_state or {}).get("_gemini_thought_signature")
+                    if _gemini_signature:
+                        assistant_msg["_gemini_thought_signature"] = _gemini_signature
+                    # Anthropic 协议：thinking block（含 signature）同理，缺了会被上游 400
+                    _anthropic_thinking = (request_state or {}).get("_anthropic_thinking_blocks")
+                    if _anthropic_thinking:
+                        assistant_msg["_anthropic_thinking_blocks"] = _anthropic_thinking
                     messages.append(assistant_msg)
                     tool_messages.append(assistant_msg)
                 else:
@@ -2053,6 +2413,9 @@ class TextGenerator(Singleton["TextGenerator"]):
                             f" | model={_think_leak_cfg.get('model')}"
                         )
                         continue
+                    if _tp_stripper is not None:
+                        # 非流式轮没有 on_text 回调，直接在成文上剥一次思考前缀
+                        content = strip_thought_prefix_text(content, allow_empty=bool(tool_calls))
                     # 过滤参数 JSON 不完整的 tool_calls
                     if tool_calls:
                         _valid_tool_calls = []
@@ -2282,8 +2645,9 @@ class TextGenerator(Singleton["TextGenerator"]):
                 #   ① 同模型关流式重试本轮 —— 网关输出审查只拦流式响应（逐 delta 扫描 reasoning/
                 #      content/tool_args），实测同一请求非流式原样放行，损失最小；
                 #   ② **保留图片**，改走本群 profile 的 `model_mini`（摘要模型）重试本轮 —— 换条上游通道；
-                #   ③ 图片被拦且仍不放行 → **剥离图片 + 换回原模型**重试本轮；
-                #   ④ 仍被拦 → 放弃：不再重试，按失败上报（matcher 只落 error log + 控制台，不入群、不清上下文）。
+                #   ③ 仍不放行 → **剥离图片 + 换回原模型**重试本轮（不管拦的是图片还是文本：
+                #      带图的整条请求本身就可能被拒，剥图是放弃前的最后一次尝试）；
+                #   ④ 仍被拦 → 放弃：不再重试，按失败上报（matcher 落 error log 并发一张表情兜底）。
                 # 各步不会回环：`_review_nonstream_retried` / `_review_model_switched` / `_image_stripped` 各自只置位一次。
                 if is_content_review_error(err_text) and not _round_fx["text"] and not _round_fx["tools"]:
                     _is_image_block = "image data" in err_text
@@ -2309,13 +2673,15 @@ class TextGenerator(Singleton["TextGenerator"]):
                             f"（保留图片，原模型 {_cur_model}）: {str(e)[:160]}"
                         )
                         continue
-                    # ③ 图片被拦：剥离图片并换回原模型重试（messages 里确实有图才走这一步）
+                    # ③ 仍不放行：剥离图片并换回原模型重试（messages 里确实有图才走这一步）。
+                    #    不再要求必须是「图片被拦」——文本被拦时，带图的整条请求同样可能被拒，
+                    #    剥图是放弃前的最后一次尝试。
                     _has_img_in_msgs = any(
                         isinstance(_m.get("content"), list)
                         and any(isinstance(c, dict) and c.get("type") == "image_url" for c in _m["content"])
                         for _m in messages
                     )
-                    if _is_image_block and _has_img_in_msgs and not _image_stripped:
+                    if _has_img_in_msgs and not _image_stripped:
                         _image_stripped = True
                         _stripped_msgs = 0
                         for _m in messages:
@@ -2330,13 +2696,14 @@ class TextGenerator(Singleton["TextGenerator"]):
                         if _review_original_model and _cur_model != _review_original_model:
                             _cfg["model"] = _review_original_model
                         logger.warning(
-                            f"图片审查未放行，已剥离 {_stripped_msgs} 条消息中的图片，"
+                            f"内容审查未放行（{'图片被拦' if _is_image_block else '文本被拦'}），"
+                            f"已剥离 {_stripped_msgs} 条消息中的图片，"
                             f"换回原模型（{_review_original_model or _cur_model}）重试本轮: {str(e)[:160]}"
                         )
                         continue
-                    # ④ 阶梯用尽：按失败上报（不重试、不入群、不清理上下文）
+                    # ④ 阶梯用尽：按失败上报（不重试、不清理上下文；matcher 会发一张表情兜底）
                     _content_review_blocked = True
-                    logger.warning(f"内容审查拦截未化解，按失败上报（不重试、不在群里提示）: {str(e)[:200]}")
+                    logger.warning(f"内容审查拦截未化解，按失败上报（群里发表情兜底）: {str(e)[:200]}")
                 # provider 拉取图片失败/超时（如 400 "Download multimodal file timed out"）：
                 # 图片只是可选上下文，静默剥掉后重试本轮，不让整条请求失败（否则群里只能收到表情兜底）。
                 # 只剥一次；本轮已流出文字/执行过工具时不剥，避免重复发送或重复副作用。

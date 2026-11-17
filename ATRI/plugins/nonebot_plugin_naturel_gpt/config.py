@@ -25,6 +25,15 @@ class PresetConfig(BaseModel, extra=Extra.ignore):
     """此预设是否仅限私聊"""
     bot_self_introl:str = ''
 
+# profile 的 `postprocess` 数组支持的开关（顺序仅作文档展示，含义见 AGENTS.md）
+PROFILE_FLAG_CHOICES = (
+    "strip_thought_prefix",  # 剥离网关塞进 content 的英文思考前缀
+    "think_leak_retry",      # 没回 reasoning_content 且正文过长时原样重发一次
+    "no_think",              # 注入 /no_think
+    "keep_reasoning",        # 历史 reasoning 原样保留
+    "no_stream",             # 固定非流式（等价 enable_stream: false）
+)
+
 class Config(BaseModel, extra=Extra.ignore):
     """ng 配置数据，默认保存为 naturel_gpt_config.yml"""
     OPENAI_API_KEYS: List[str] = []
@@ -98,6 +107,37 @@ class Config(BaseModel, extra=Extra.ignore):
         注意：返回值恒为 dict，调用方不需要再判断 OPENAI_PROFILES 里存的是不是指针。"""
         value = (self.OPENAI_PROFILES or {}).get(self.resolve_profile_name(name))
         return dict(value) if isinstance(value, dict) else {}
+
+    def profile_flags(self, profile: Dict[str, Any]) -> Dict[str, bool]:
+        """把 profile 的后处理开关归一成布尔字典。
+
+        新写法（推荐，配置精简）：`postprocess: [strip_thought_prefix, no_stream]`；
+        旧的独立布尔字段（`think_leak_retry` / `no_think` / `keep_reasoning` /
+        `strip_thought_prefix` / `enable_stream: false`）继续生效，老配置不用改。
+        """
+        flags = {name: False for name in PROFILE_FLAG_CHOICES}
+        if not isinstance(profile, dict):
+            return flags
+        raw = profile.get("postprocess")
+        if isinstance(raw, str):
+            raw = [raw]
+        for item in raw or []:
+            key = str(item or "").strip().lower().replace("-", "_")
+            if key in flags:
+                flags[key] = True
+        for key in ("strip_thought_prefix", "think_leak_retry", "no_think", "keep_reasoning"):
+            if profile.get(key):
+                flags[key] = True
+        if profile.get("enable_stream") is False:
+            flags["no_stream"] = True
+        return flags
+
+    def profile_enable_stream(self, profile: Dict[str, Any]) -> bool:
+        """profile 是否走流式：`no_stream` 标志 / `enable_stream: false` 优先，否则跟随全局。"""
+        if self.profile_flags(profile).get("no_stream"):
+            return False
+        value = (profile or {}).get("enable_stream")
+        return bool(self.LLM_ENABLE_STREAM if value is None else value)
 
     REPLY_THROTTLE_TIME: int
     """回复间隔节流时间"""

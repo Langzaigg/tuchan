@@ -473,7 +473,13 @@ class ChatPromptMixin:
 
         # 4) 解析可见图片（直传或 data URI）；解析失败视为不可见（渲染为已过期，保持稳定）
         vis = [c for c in cands if c["visible"]]
-        resolved = await image_cache.resolve_urls_keep_order([c["url"] for c in vis])
+        # Gemini 原生协议不接受任意 http 图片地址（fileData 只认官方 Files API），必须转 base64
+        _profile_protocol = str(
+            (config.get_profile(self.get_active_profile()) or {}).get("protocol") or ""
+        ).lower()
+        resolved = await image_cache.resolve_urls_keep_order(
+            [c["url"] for c in vis], force_base64=(_profile_protocol == "gemini")
+        )
         for c, r in zip(vis, resolved):
             c["resolved"] = r
             if not r:
