@@ -5,7 +5,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .logger import logger
-from .config import config
+from .config import config, get_config
 from .openai_func import TextGenerator, is_model_request_error_text
 from .persistent_data_manager import ChatMessageData, ImpressionData, PresetData
 from .llm_tool_plugins import TOOL_REGISTRY
@@ -20,21 +20,25 @@ class ChatHistoryMixin:
     @staticmethod
     def _target_context_round_limit() -> int:
         """摘要完成后的目标上下文轮数。"""
-        return max(1, int(getattr(config, "CONTEXT_WINDOW_SIZE", 1) or 1))
+        return max(1, get_config().CONTEXT_WINDOW_SIZE)
 
     @staticmethod
-    def _context_overflow_round_limit() -> int:
-        """摘要触发前允许额外保留的溢出轮数。"""
-        try:
-            ratio = float(getattr(config, "CONTEXT_COMPRESS_THRESHOLD_RATIO", 0.5) or 0)
-        except (TypeError, ValueError):
-            ratio = 0.5
-        return int(ChatHistoryMixin._target_context_round_limit() * max(0.0, ratio))
+    def _base_context_round_limit() -> int:
+        """基础窗口，含配置允许的溢出轮数。"""
+        target = ChatHistoryMixin._target_context_round_limit()
+        ratio = max(0.0, get_config().CONTEXT_COMPRESS_THRESHOLD_RATIO)
+        return target + int(target * ratio)
 
     @staticmethod
     def _history_buffer_round_limit() -> int:
-        """请求构造和未摘要硬裁剪使用的独立对话缓冲窗口。"""
-        return ChatHistoryMixin._target_context_round_limit() + ChatHistoryMixin._context_overflow_round_limit()
+        """请求侧硬窗口，为连续对话和后台摘要留出追加空间。"""
+        settings = get_config().CONTEXT_SUMMARY
+        if not settings.enabled:
+            return ChatHistoryMixin._base_context_round_limit()
+        if settings.pressure.max_rounds is not None:
+            return settings.pressure.max_rounds
+        base = ChatHistoryMixin._base_context_round_limit()
+        return base + max(3, min(10, ChatHistoryMixin._target_context_round_limit()))
 
     async def update_chat_history_row(
         self,
@@ -49,6 +53,7 @@ class ChatHistoryMixin:
         context_only: bool = False,
         user_id: str = "",
         image_meta: Optional[List[Dict[str, Any]]] = None,
+        request_tokens: int = 0,
     ) -> Optional[ChatMessageData]:
         """更新当前预设的结构化对话历史。返回新写入的消息对象（未写入时返回 None），供调用方按需回滚。
         image_meta 与 images 平行（[{sender, timestamp}]），仅 context_only 块传入，供按张过期判定。"""
@@ -167,8 +172,8 @@ class ChatHistoryMixin:
             self._last_msg_time = time.time()   # 更新上次对话时间
 
         if require_summary:
-            await self._compress_prompt_messages_if_needed(preset)
-        elif not config.CONTEXT_SUMMARY_ENABLED:
+            await self._compress_prompt_messages_if_needed(preset, request_tokens=request_tokens)
+        elif not get_config().CONTEXT_SUMMARY.enabled:
             self._trim_prompt_messages_without_summary(preset)
         return history_item
 

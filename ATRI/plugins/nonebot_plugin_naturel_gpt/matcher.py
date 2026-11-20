@@ -68,17 +68,7 @@ def _get_chat_lock(chat_key: str) -> asyncio.Lock:
 
 
 def _context_buffer_limit() -> int:
-    try:
-        target_rounds = int(getattr(config, "CONTEXT_WINDOW_SIZE", 1) or 1)
-    except (TypeError, ValueError):
-        target_rounds = 1
-    try:
-        overflow_ratio = float(getattr(config, "CONTEXT_COMPRESS_THRESHOLD_RATIO", 0.5) or 0)
-    except (TypeError, ValueError):
-        overflow_ratio = 0.5
-    target_rounds = max(1, target_rounds)
-    overflow_rounds = int(target_rounds * max(0.0, overflow_ratio))
-    return target_rounds + overflow_rounds
+    return Chat._base_context_round_limit()
 
 
 def _get_recent_context_buffer(chat_key: str) -> Deque[Dict[str, Any]]:
@@ -1025,7 +1015,7 @@ async def _send_tool_image_outputs(chat_key: str, matcher: Type[Matcher]) -> Non
 
 
 async def _finalize_chat_task(
-    chat_key: str,
+    chat: Chat,
     matcher: Type[Matcher],
     chat_type: str,
     bot: Bot = None,
@@ -1035,12 +1025,16 @@ async def _finalize_chat_task(
     与锁内的邮箱推送互斥：注销前推入的 entry 必定被本次 drain 拿到重处理；
     注销后到达的消息走"无运行中任务"分支自行注册为新任务。
     覆盖所有出口：正常完成、失败返回、人格切换/节流放弃的提前 return、异常传播。"""
+    chat_key = chat.chat_key
     chat_lock = _get_chat_lock(chat_key)
     async with chat_lock:
-        if _chat_running_tasks.get(chat_key) is asyncio.current_task():
+        owns_task = _chat_running_tasks.get(chat_key) is asyncio.current_task()
+        if owns_task:
             _chat_running_tasks.pop(chat_key, None)
             _chat_active_inputs.pop(chat_key, None)
         drained = TextGenerator.instance.drain_loop_inputs(chat_key)
+        if owns_task and not drained:
+            chat.schedule_idle_context_summary()
     if not drained:
         return
     logger.info(
@@ -1164,6 +1158,9 @@ async def do_msg_response(
                 reply_reasons.append("name")
             if at_reply:
                 reply_reasons.append("at")
+
+        if should_reply:
+            chat.cancel_idle_context_summary()
 
         if should_reply and not prerecorded and chat_key in _chat_running_tasks \
                 and old_input and not old_input.get("recorded"):
@@ -1368,6 +1365,7 @@ async def do_msg_response(
     #（覆盖历史 / context_only / 触发消息，编号与模型看到的 [图片N] 一致），供 vision / anime_trace 取图。
     tg._visible_images = dict(getattr(chat, "_visible_images", {}) or {})
     request_profile = _snapshot_request_profile(chat)
+    request_context_tokens = tg.cal_token_count(prompt_template) if get_config().CONTEXT_SUMMARY.enabled else 0
     text_tokens, prompt_image_count = _count_prompt_text_and_images(prompt_template, tg)
     logger.info(
         f"触发回复 | 会话: {chat_key} | 预设: {chat.preset_key} | "
@@ -1631,7 +1629,10 @@ async def do_msg_response(
                     target_msg=tool_summary_target,
                 )
         # 记录 Bot 回复，is_bot_reply=True 表示同时更新精简窗口和全量窗口（require_summary=True 触发滑窗/摘要）
-        await chat.update_chat_history_row(sender=chat.preset_key, msg=text, require_summary=True, record_time=False, is_bot_reply=True)
+        await chat.update_chat_history_row(
+            sender=chat.preset_key, msg=text, require_summary=True, is_bot_reply=True,
+            request_tokens=request_context_tokens + tg.cal_token_count(text) if request_context_tokens else 0,
+        )
         chat.update_send_time()
         # 用户维度历史：邮箱批次回复归属到批次内各 entry 的用户（而非原始触发者），
         # 避免把回 B 的话记进 A 的印象历史
@@ -1996,7 +1997,7 @@ async def do_msg_response(
         raise
     finally:
         # 注销任务注册并抽取循环邮箱残留（残留 entry 作为新触发重新处理，覆盖所有出口）
-        await _finalize_chat_task(chat_key, matcher, chat_type, bot)
+        await _finalize_chat_task(chat, matcher, chat_type, bot)
         # 注销 Anima 发送上下文
         from .llm_tool_plugins import anima_generate
         anima_generate.unregister_send_context(chat_key)

@@ -15,10 +15,10 @@ from collections import defaultdict
 from datetime import date
 from typing import Any, Dict, Optional
 
-from .config import config
+from .config import get_archive_dir
 from .logger import logger
 
-_STATS_FILE = os.path.join(config.NG_DATA_PATH, "stats.json")
+_STATS_FILE = os.path.join(get_archive_dir(), "stats.json")
 _LOCK = threading.Lock()
 
 

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .logger import logger
-from .config import config
+from .config import config, get_config
 from .openai_func import TextGenerator
 from .persistent_data_manager import ChatMessageData, PersistentDataManager, PresetData
 
@@ -319,20 +319,71 @@ class ChatSummaryMixin:
         ]
         return matches[0] if len(matches) == 1 else ""
 
-    async def _compress_prompt_messages_if_needed(self, preset: PresetData) -> None:
-        """压缩对话历史：异步生成摘要，完成后截断窗口。摘要未完成前保留完整上下文用于对话。"""
-        max_rounds = self._target_context_round_limit()
-        buffer_rounds = self._history_buffer_round_limit()
-        
+    def cancel_idle_context_summary(self) -> None:
+        task = self._idle_compress_task
+        if task is not None:
+            self._idle_compress_task = None
+            task.cancel()
+
+    def _idle_context_round_limit(self) -> int:
+        """空闲压缩的保留轮数，默认取正常摘要目标的一半（向上取整）。"""
+        keep_rounds = get_config().CONTEXT_SUMMARY.idle.keep_rounds
+        if keep_rounds is not None:
+            return keep_rounds
+        return (self._target_context_round_limit() + 1) // 2
+
+    def schedule_idle_context_summary(self) -> None:
+        """回复任务和邮箱收尾后，再开始计算本会话静默时间。"""
+        self.cancel_idle_context_summary()
+        settings = get_config().CONTEXT_SUMMARY
+        if not settings.enabled:
+            return
+        preset = self.chat_preset
+        if self._count_rounds(preset.prompt_messages) <= self._idle_context_round_limit():
+            return
+
+        async def _after_idle():
+            try:
+                await asyncio.sleep(settings.idle.minutes * 60)
+                if self.chat_preset is preset:
+                    await self._compress_prompt_messages_if_needed(preset, idle=True)
+            finally:
+                if self._idle_compress_task is asyncio.current_task():
+                    self._idle_compress_task = None
+
+        self._idle_compress_task = asyncio.create_task(_after_idle())
+
+    async def _compress_prompt_messages_if_needed(
+        self, preset: PresetData, *, idle: bool = False, request_tokens: int = 0,
+    ) -> None:
+        """连续对话优先保留历史，接近上限或静默后有足够压缩收益时生成摘要。"""
+        context_config = get_config()
+        settings = context_config.CONTEXT_SUMMARY
+        max_rounds = self._idle_context_round_limit() if idle else self._target_context_round_limit()
         all_messages = [m for m in preset.prompt_messages if isinstance(m, ChatMessageData)]
         current_rounds = self._count_rounds(all_messages)
         overflow_rounds = current_rounds - max_rounds
-        threshold = max(0, buffer_rounds - max_rounds)
-        has_pending = bool(self._pending_overflow_text.strip())
-        
-        # 触发条件：当前有溢出，或之前截断时累积了待摘要文本
-        if overflow_rounds <= threshold and not has_pending:
+        if overflow_rounds <= 0:
             return
+
+        if settings.enabled:
+            # 在硬窗前预留轮数，token 压力以请求侧同口径估算。
+            near_round_limit = current_rounds >= self._history_buffer_round_limit() - settings.pressure.round_headroom
+            near_token_limit = request_tokens >= int(context_config.CONTEXT_TOKEN_BUDGET * settings.pressure.token_budget_ratio)
+            if not (idle or near_round_limit or near_token_limit):
+                return
+        elif idle or current_rounds <= self._base_context_round_limit():
+            return
+
+        if self._compress_preset is not preset:
+            if self._compress_task and not self._compress_task.done():
+                return
+            self._compress_preset = preset
+            self._pending_overflow_text = ""
+            self._pending_overflow_item_ids.clear()
+            self._pending_overflow_user_ids = None
+            self._compress_failure_time = 0
+        has_pending = bool(self._pending_overflow_text.strip())
 
         # 冷却检查：如果上次压缩失败，短时间内不再触发
         if self._compress_failure_time > 0:
@@ -344,26 +395,36 @@ class ChatSummaryMixin:
             # 冷却期已过，重置
             self._compress_failure_time = 0
 
-        # 找到溢出轮的截断点：第 overflow_rounds+1 个真实 user 是保留的最旧轮，
-        # 其之前的完整消息段需要摘要/裁剪。注意保留轮 user 前的前导印象 system 与
-        # 本轮 flush 的 context_only 均属于保留轮，需回溯排除，避免误纳入溢出部分。
+        # 只在完整回复后的边界压缩，避免切开循环邮箱中先连续入库的多个 user。
         user_count = 0
+        replied = False
         cut_index = 0
         for i, msg in enumerate(preset.prompt_messages):
-            if isinstance(msg, ChatMessageData) and msg.role == "user" and not msg.context_only:
+            if not isinstance(msg, ChatMessageData):
+                continue
+            if msg.role == "user" and not msg.context_only:
+                if user_count and (not settings.enabled or replied):
+                    cut_index = i
                 user_count += 1
                 if user_count > overflow_rounds:
-                    cut_index = i
-                    while cut_index > 0 and isinstance(preset.prompt_messages[cut_index - 1], ChatMessageData) and (
-                        preset.prompt_messages[cut_index - 1].is_impression or preset.prompt_messages[cut_index - 1].context_only
-                    ):
-                        cut_index -= 1
                     break
+                replied = False
+            elif msg.role == "assistant" and not msg.tool_calls:
+                # 邮箱可能用一条 assistant 回复多个 user，不能按一问一答配对。
+                replied = True
+
+        # 印象和 context_only 都属于后面的 user，将它们一并留在窗口里。
+        while cut_index > 0:
+            previous = preset.prompt_messages[cut_index - 1]
+            if not isinstance(previous, ChatMessageData) or not (previous.is_impression or previous.context_only):
+                break
+            cut_index -= 1
 
         overflow_span = [
             m for m in preset.prompt_messages[:cut_index]
             if isinstance(m, ChatMessageData)
         ]
+
         pending_item_ids = set(self._pending_overflow_item_ids or set())
         compressing_item_ids = set(self._compressing_overflow_item_ids or set())
         new_overflow_messages = [
@@ -381,7 +442,7 @@ class ChatSummaryMixin:
                 if uid:
                     current_active_ids.add(uid)
 
-        if not config.CONTEXT_SUMMARY_ENABLED:
+        if not settings.enabled:
             if cut_index > 0:
                 # context_only 视为普通历史条目，随溢出区间一并删除
                 del preset.prompt_messages[:cut_index]
@@ -389,6 +450,20 @@ class ChatSummaryMixin:
             self._pending_overflow_text = ""
             self._pending_overflow_item_ids = set()
             return
+
+        request_profile = self._snapshot_request_profile()
+        max_summary_chars = max(100, int(request_profile.get("max_summary_tokens") or settings.target_chars))
+        last_input_time = self.last_msg_time
+        if idle:
+            tg = TextGenerator.instance
+            saved_history_tokens = sum(
+                tg.cal_token_count(m.tool_call_summary if m.tool_calls else self._message_text_for_prompt(m))
+                for m in overflow_span
+                if m.role != "tool" and not m.is_impression
+            )
+            expected_growth = max(0, max_summary_chars - tg.cal_token_count(preset.context_summary))
+            if saved_history_tokens < settings.idle.min_saved_tokens + expected_growth:
+                return
 
         # 不在此处截断消息，保留完整上下文供对话使用
         # 摘要任务完成后再删除已总结的溢出消息
@@ -442,7 +517,6 @@ class ChatSummaryMixin:
         preset_key = preset.preset_key
         # 闭包捕获活跃用户 ID
         _active_user_ids = active_user_ids
-        request_profile = self._snapshot_request_profile()
 
         async def _do_compress():
             tg = TextGenerator.instance
@@ -451,8 +525,7 @@ class ChatSummaryMixin:
             summary_prompt = ""
             summary_response = ""
             # 字数软目标（中文约 1 token ≈ 1 字）：profile 显式设置的 max_summary_tokens 优先，
-            # 否则回退到全局 CONTEXT_SUMMARY_TARGET_CHARS；硬截断固定为软目标的 2 倍
-            max_summary_chars = max(100, int(request_profile.get('max_summary_tokens') or config.CONTEXT_SUMMARY_TARGET_CHARS))
+            # 否则回退到 CONTEXT_SUMMARY.target_chars；硬截断固定为软目标的 2 倍
             hard_summary_limit = max_summary_chars * 2
             # 读取最新的 previous_summary（可能已被前一个任务更新）
             latest_previous = preset.context_summary.strip()
@@ -511,6 +584,14 @@ class ChatSummaryMixin:
                 if attempt < max_retries - 1:
                     await asyncio.sleep(0.5)
 
+            if (
+                not get_config().CONTEXT_SUMMARY.enabled
+                or self.chat_preset_dicts.get(preset_key) is not preset
+                or not self._existing_message_ids(preset, remove_item_ids)
+                or (idle and (self.chat_preset is not preset or self.last_msg_time != last_input_time))
+            ):
+                return
+
             if new_summary:
                 # 硬截断：超出软限制2倍时才截断
                 if len(new_summary) > hard_summary_limit:
@@ -533,12 +614,11 @@ class ChatSummaryMixin:
                     - set(remove_item_ids)
                 )
                 self._compressing_overflow_item_ids = set()
-                if config.DEBUG_LEVEL > 0:
-                    logger.info(
-                        f"[会话: {chat_key}][预设: {preset_key}] 摘要生成完成 | "
-                        f"摘要tokens={tg.cal_token_count(new_summary)} | "
-                        f"已清理 {removed_count} 条溢出消息"
-                    )
+                logger.info(
+                    f"[会话: {chat_key}][预设: {preset_key}] 摘要生成完成 | "
+                    f"触发={'空闲' if idle else '窗口压力'} | "
+                    f"摘要tokens={tg.cal_token_count(new_summary)} | 已清理 {removed_count} 条溢出消息"
+                )
             else:
                 # 失败时保留旧摘要和溢出消息（消息仍在 prompt_messages 中，下次重试时会重新捕获）
                 # 恢复溢出文本以便下次重试，合并而非覆盖活跃用户 ID

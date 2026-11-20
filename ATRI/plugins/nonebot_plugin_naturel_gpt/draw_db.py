@@ -1,10 +1,11 @@
 import json
-import os
 import sqlite3
 import threading
 from typing import Any, Dict, Optional
 
-from .config import config
+from pathlib import Path
+
+from .config import config, global_config
 from .logger import logger
 
 _db_lock = threading.Lock()
@@ -15,9 +16,9 @@ def _get_db_path() -> str:
     """获取数据库文件路径"""
     global _db_path
     if not _db_path:
-        base_path = config.NG_DATA_PATH
-        os.makedirs(base_path, exist_ok=True)
-        _db_path = os.path.join(base_path, "draw.db")
+        path = Path(global_config.ng_shared_draw_db) if global_config.ng_shared_draw_db else Path(config.NG_DATA_PATH) / "draw.db"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _db_path = str(path)
     return _db_path
 
 

@@ -112,6 +112,8 @@ config/naturel_gpt_config.yml
 config/personas/
 ```
 
+ATRI 配置了多接入点时，新会话以该接入点的 `nickname` 优先匹配同名人格，找不到再使用 `DEFAULT_PERSONA`。会话和统计保存在该接入点的 `NG_DATA_PATH/archives/<昵称>/`。在本文件显式填写 `nickname: ["兔酱"]` 会覆盖 Bot 昵称并使用默认 `NG_DATA_PATH` 存档，重启生效。画图记录、NAS 同步数据和主配置旁的 `personas/` 可跨接入点共用。详见[多接入点配置](../../../README.md#多接入点与-qq-官方机器人)。
+
 运行数据：
 
 ```text
@@ -600,14 +602,34 @@ rg help                 # 帮助
 
 #### 上下文压缩与摘要
 
-- 当真实对话轮数超过 `CONTEXT_WINDOW_SIZE + CONTEXT_WINDOW_SIZE * CONTEXT_COMPRESS_THRESHOLD_RATIO` 时，触发异步摘要。
+```yaml
+CONTEXT_TOKEN_BUDGET: 32768
+CONTEXT_WINDOW_SIZE: 10
+CONTEXT_COMPRESS_THRESHOLD_RATIO: 1.0
+CONTEXT_SUMMARY:
+  enabled: true
+  target_chars: 800
+  pressure:
+    max_rounds: 30
+    round_headroom: 2
+    token_budget_ratio: 0.875
+  idle:
+    minutes: 30
+    keep_rounds: 5
+    min_saved_tokens: 2048
+```
+
+- **连续对话**：示例中，请求最多取 30 轮。达到第 28 轮，或本地估算达到 token 预算的 87.5%，可以启动异步摘要，保留最近至少 `CONTEXT_WINDOW_SIZE` 轮原始对话。
+- **空闲对话**：从回复与循环邮箱收尾时开始计时。静默满 30 分钟，预计净省至少 2,048 token 时才启动，保留最近至少 5 轮原始对话。成功后直接应用新摘要。有新触发时取消等待。
+- **兼容旧配置**：旧版 `CONTEXT_SUMMARY_ENABLED` 和 `CONTEXT_SUMMARY_TARGET_CHARS` 分别迁移到 `enabled` 和 `target_chars`，新节中明确填写的值优先。`pressure.max_rounds` 省略或设为 `null` 时，沿用基础窗口加 3–10 轮的推导方式。`idle.keep_rounds` 省略或设为 `null` 时，取 `CONTEXT_WINDOW_SIZE` 的一半并向上取整。
+- 基础窗口 = `CONTEXT_WINDOW_SIZE + int(CONTEXT_WINDOW_SIZE × CONTEXT_COMPRESS_THRESHOLD_RATIO)`，用于非触发消息缓冲、关闭摘要时的轮数上限，以及推导省略的 `pressure.max_rounds`。
 - 摘要只针对**溢出的完整轮次**生成；生成成功后删除这些完整轮次（`context_only` 消息不豁免，随溢出区间一并删除）。
 - 摘要 prompt 按职责分层，与其它记忆层互不重复：
   - 摘要只记会话/群层面内容：当前话题进展与演变、群事件、约定和决策。
   - 性格、兴趣、说话风格等个人特质属于 `[用户印象]` 的职责，不重复记录。
   - 称呼、生日等长期事实属于 remember 记忆工具的职责；已保存的群记忆会一并交给摘要模型，避免重复。
   - 新信息覆盖旧摘要中重复或过时的部分，避免同一件事反复累积。
-- 摘要字数软目标由 `CONTEXT_SUMMARY_TARGET_CHARS`（默认 800）控制，profile 的 `max_summary_tokens` 可覆盖；硬截断为软目标的 2 倍，防止摘要无限膨胀。
+- 摘要字数软目标由 `CONTEXT_SUMMARY.target_chars`（默认 800）控制，profile 的 `max_summary_tokens` 可覆盖。硬截断为软目标的 2 倍。
 
 #### 用户印象更新
 

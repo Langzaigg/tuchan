@@ -33,6 +33,8 @@ class Chat(ChatMemoryMixin, ChatSummaryMixin, ChatHistoryMixin, ChatPromptMixin)
         self._chat_data = chat_data  # 当前对话关联的数据
         # 实例变量初始化（避免类变量共享状态）
         self._compress_task = None        # 正在运行的消息摘要任务
+        self._idle_compress_task = None   # 当前预设等待空闲的摘要任务
+        self._compress_preset = None      # pending 与运行中的摘要所属预设
         self._pending_overflow_text: str = ""  # 摘要任务运行期间累积的溢出文本
         self._pending_overflow_user_ids: set = None  # 溢出文本中涉及的用户 ID
         self._pending_overflow_item_ids: set = set()  # 已累积待摘要的消息 id，避免摘要任务运行中重复累积

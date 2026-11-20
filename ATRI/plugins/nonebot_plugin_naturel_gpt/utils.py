@@ -9,6 +9,7 @@ from nonebot.adapters import Bot
 from nonebot.adapters import Event
 from nonebot.rule import Rule
 from nonebot.permission import SUPERUSER
+from nonebot.adapters.onebot.v11.exception import ActionFailed, ApiNotAvailable, NetworkError
 from nonebot.adapters.onebot.v11.permission import GROUP_ADMIN, GROUP_OWNER
 from nonebot.adapters.onebot.v11 import Message, MessageEvent, PrivateMessageEvent, GroupMessageEvent, MessageSegment, GroupIncreaseNoticeEvent
 
@@ -341,10 +342,18 @@ async def get_user_name(event: Union[MessageEvent, GroupIncreaseNoticeEvent], bo
         return f'[匿名]{event.anonymous.name}'
 
     if (isinstance(event, GroupMessageEvent) or isinstance(event, GroupIncreaseNoticeEvent)):
-        user_info = await bot.get_group_member_info(group_id=event.group_id, user_id=user_id, no_cache=False)
+        try:
+            user_info = await bot.get_group_member_info(group_id=event.group_id, user_id=user_id, no_cache=False) or {}
+        except (ActionFailed, ApiNotAvailable, NetworkError):
+            user_info = {}
         user_name = user_info.get('nickname', None)
         if config.GROUP_CARD:
             user_name = user_info.get('card', None) or user_name
+        if not user_name and isinstance(event, GroupMessageEvent) and event.user_id == user_id:
+            sender = event.sender
+            if sender:
+                user_name = (sender.card if config.GROUP_CARD else None) or sender.nickname
+        user_name = user_name or str(user_id)
     else:
         user_name = event.sender.nickname if event.sender else event.get_user_id()
 

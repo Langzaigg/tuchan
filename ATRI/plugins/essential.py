@@ -26,6 +26,7 @@ from nonebot.adapters.onebot.v11 import (
     MessageSegment,
     Message,
 )
+from nonebot.adapters.onebot.v11.exception import ActionFailed, ApiNotAvailable, NetworkError
 
 import ATRI
 from ATRI.service import Service
@@ -45,6 +46,21 @@ TEMP_PATH = Path(".") / "data" / "temp"
 os.makedirs(ESSENTIAL_DIR, exist_ok=True)
 os.makedirs(MANEGE_DIR, exist_ok=True)
 os.makedirs(TEMP_PATH, exist_ok=True)
+
+
+async def _notify_superusers(bot: Bot, message: str) -> None:
+    if not BotSelfConfig.notify_superusers:
+        return
+    recipients = {
+        int(user_id)
+        for entry in BotSelfConfig.superusers
+        if (user_id := entry.removeprefix("onebot:")).isascii() and user_id.isdecimal()
+    }
+    for user_id in recipients:
+        try:
+            await bot.send_private_msg(user_id=user_id, message=message)
+        except (ActionFailed, ApiNotAvailable, NetworkError) as exc:
+            log.warning(f"超级用户通知发送失败（{user_id}）：{exc}")
 
 
 @driver.on_startup
@@ -158,8 +174,7 @@ async def _friend_add(bot: Bot, event: FriendRequestEvent):
         f"申请码：{apply_code}\n"
         "Tip：好友申请 帮助"
     )
-    for superuser in BotSelfConfig.superusers:
-        await bot.send_private_msg(user_id=superuser, message=repo)
+    await _notify_superusers(bot, repo)
 
 
 group_invite_event = Essential().on_request("邀请入群", "被邀请入群检测")
@@ -204,8 +219,7 @@ async def _group_invite(bot: Bot, event: GroupRequestEvent):
         f"申请码：{apply_code}\n"
         "Tip：群聊邀请 帮助"
     )
-    for superuser in BotSelfConfig.superusers:
-        await bot.send_private_msg(user_id=superuser, message=repo)
+    await _notify_superusers(bot, repo)
 
 
 group_member_event = Essential().on_notice("群成员变动", "群成员变动检测")
@@ -232,10 +246,7 @@ async def _group_admin_event(bot: Bot, event: GroupAdminNoticeEvent):
     if not event.is_tome():
         return
 
-    for superuser in BotSelfConfig.superusers:
-        await bot.send_private_msg(
-            user_id=int(superuser), message=f"好欸！主人！我在群 {event.group_id} 成为了管理！！"
-        )
+    await _notify_superusers(bot, f"好欸！主人！我在群 {event.group_id} 成为了管理！！")
 
 
 group_ban_event = Essential().on_notice("群禁言变动", "群禁言变动检测")
@@ -252,12 +263,9 @@ async def _group_ban_event(bot: Bot, event: GroupBanNoticeEvent):
             f"咱在群 {event.group_id} 被 {event.operator_id} 塞上了口球...\n"
             f"时长...是 {event.duration} 秒"
         )
-        for superuser in BotSelfConfig.superusers:
-            await bot.send_private_msg(user_id=int(superuser), message=msg)
     else:
         msg = "好欸！主人\n" f"咱在群 {event.group_id} 的口球被 {event.operator_id} 解除了！"
-        for superuser in BotSelfConfig.superusers:
-            await bot.send_private_msg(user_id=int(superuser), message=msg)
+    await _notify_superusers(bot, msg)
 
 
 _acc_recall = True

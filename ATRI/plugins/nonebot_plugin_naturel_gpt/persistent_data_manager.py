@@ -4,13 +4,15 @@ import os
 import pickle
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any, Dict, List, Optional
 
 from nonebot import get_driver
 from typing_extensions import Self, override
 
-from .config import PresetConfig, config
+from .config import PresetConfig, config, get_archive_dir, get_archive_nicknames, global_config
 from .logger import logger
 from .singleton import Singleton
 from .store import StoreEncoder, StoreSerializable
@@ -397,8 +399,108 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
     _inited: bool
     _filename = "naturel_gpt"
 
+    @staticmethod
+    def _persona_record(raw) -> dict:
+        return raw if isinstance(raw, dict) else vars(raw) if isinstance(raw, StoreSerializable) else {}
+
+    def _filter_initial_archive(
+        self, raw: dict, nicknames: tuple[str, ...], *, same_endpoint: bool = False,
+    ) -> dict:
+        migrated = {}
+        matching_users, other_users = set(), set()
+        chat_fields = {item.name for item in fields(ChatData)}
+        for chat_key, record in raw.items():
+            if chat_key.startswith("__"):
+                continue
+            old = self._persona_record(record)
+            if not old:
+                continue
+            preserved = {}
+            has_other_records = False
+            for key, value in (old.get("preset_datas") or {}).items():
+                preset = self._persona_record(value)
+                matching = key in nicknames
+                users = matching_users if matching else other_users
+                users.update(str(uid) for uid in (preset.get("chat_impressions") or {}))
+                users.update(str(uid) for uid in (preset.get("user_memories") or {}))
+                for message in preset.get("prompt_messages") or ():
+                    if uid := self._persona_record(message).get("user_id"):
+                        users.add(str(uid))
+                if matching:
+                    preserved[key] = dict(preset)
+                elif any(preset.get(field) for field in (
+                    "prompt_messages", "chat_impressions", "chat_memory", "_legacy_chat_memory",
+                    "user_memories", "context_summary", "tool_call_summary",
+                )):
+                    has_other_records = True
+
+            matching_only = bool(preserved) and not has_other_records and old.get("active_preset", "") in ("", *nicknames)
+            keep_chat_memory = matching_only or (same_endpoint and bool(preserved))
+            chat = {key: value for key, value in old.items() if key in chat_fields}
+            chat.pop("enable_auto_switch_identity", None)
+            chat["active_preset"] = next((key for key in nicknames if key in preserved), "")
+            chat["preset_datas"] = {
+                key: {**preset.dict(), **preserved.pop(key, {}), "is_default": preset.is_default}
+                for key, preset in config.PRESETS.items()
+            }
+            chat["preset_datas"].update(preserved)
+            if not matching_only:
+                chat.pop("chat_image_history", None)
+                chat.pop("next_message_index", None)
+            if not keep_chat_memory:
+                chat.pop("chat_memory", None)
+            elif "global_chat_memory" in old:
+                chat["global_chat_memory"] = old["global_chat_memory"]
+            migrated[chat_key] = chat
+
+        if isinstance(nick := raw.get("__custom_nicknames"), dict):
+            migrated["__custom_nicknames"] = nick
+        if isinstance(memories := raw.get("__global_user_memories"), dict):
+            users = matching_users if same_endpoint else matching_users - other_users
+            migrated["__global_user_memories"] = {uid: value for uid, value in memories.items() if str(uid) in users}
+        return migrated
+
+    def _initialize_archive(self) -> None:
+        names = get_archive_nicknames()
+        archive = get_archive_dir()
+        if not names or any((archive / f"{self._filename}{suffix}").is_file() for suffix in (".json", ".pkl")):
+            return
+        preferred = ".pkl" if config.NG_DATA_PICKLE else ".json"
+        alternate = ".json" if config.NG_DATA_PICKLE else ".pkl"
+        endpoint_root = Path(config.NG_DATA_PATH).resolve()
+        roots = [endpoint_root]
+        if global_config.ng_archive_fallback_dir:
+            roots.append(Path(global_config.ng_archive_fallback_dir))
+        sources = (root / f"{self._filename}{suffix}" for root in roots for suffix in (preferred, alternate))
+        source = next((path for path in sources if path.is_file()), None)
+        if source is None:
+            return
+
+        if source.suffix == ".pkl":
+            with source.open("rb") as file:
+                raw = pickle.load(file)
+        else:
+            raw = json.loads(source.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError(f"旧存档内容格式错误：{source}")
+        # 同一接入点的群记忆和个人记忆由会话、用户共享，切换过人格也应保留。
+        migrated = self._filter_initial_archive(raw, names, same_endpoint=source.parent.resolve() == endpoint_root)
+        archive.mkdir(parents=True, exist_ok=True)
+        file = NamedTemporaryFile(dir=archive, delete=False)
+        scratch = Path(file.name)
+        try:
+            with file:
+                if config.NG_DATA_PICKLE:
+                    pickle.dump(migrated, file)
+                else:
+                    file.write(json.dumps(migrated, ensure_ascii=False, cls=StoreEncoder).encode("utf-8"))
+            scratch.replace(archive / f"{self._filename}{preferred}")
+        finally:
+            scratch.unlink(missing_ok=True)
+        logger.info(f"已从默认存档初始化 {names[0]} 的人格存档")
+
     def backup_file(self, suffix: str):
-        base_path = config.NG_DATA_PATH
+        base_path = get_archive_dir()
         file_path = os.path.join(base_path, self._filename)
         if not os.path.isfile(f"{file_path}{suffix}"):
             return
@@ -411,7 +513,7 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
             logger.warning(f"文件 `{file_path}{suffix}` 备份失败，可能导致数据异常或丢失: {e}")
 
     def _compatibility_load(self) -> bool:
-        base_path = config.NG_DATA_PATH
+        base_path = get_archive_dir()
         file_path = os.path.join(base_path, self._filename)
 
         if os.path.exists(f"{file_path}.pkl") and os.path.exists(f"{file_path}.json"):
@@ -438,7 +540,7 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
         return True
 
     def _load_from_file_pickle(self):
-        file_path = os.path.join(config.NG_DATA_PATH, f"{self._filename}.pkl")
+        file_path = os.path.join(get_archive_dir(), f"{self._filename}.pkl")
         self._file_path = file_path
         if not os.path.exists(file_path):
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -468,7 +570,7 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
         logger.info("读取历史数据成功 (pickle)")
 
     def _load_from_file_json(self):
-        file_path = os.path.join(config.NG_DATA_PATH, f"{self._filename}.json")
+        file_path = os.path.join(get_archive_dir(), f"{self._filename}.json")
         self._file_path = file_path
         if not os.path.exists(file_path):
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -521,6 +623,9 @@ class PersistentDataManager(Singleton["PersistentDataManager"]):
     def load_from_file(self):
         self._inited = False
         self._datas = {}
+        self._global_user_memories = {}
+        self._custom_nicknames = {}
+        self._initialize_archive()
         if not self._compatibility_load():
             if config.NG_DATA_PICKLE:
                 self._load_from_file_pickle()

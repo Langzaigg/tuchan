@@ -2,6 +2,7 @@
 # 注意：pydantic 必须保持 v1（hikari-core 钉死 <2.0），fastapi 不可升过 0.141（强制 pydantic>=2.9）
 nonebot2==2.5.0
 nonebot-adapter-onebot==2.4.6
+nonebot-adapter-qq==1.7.4
 nonebot-plugin-apscheduler==0.2.0
 fastapi==0.110.1
 uvicorn==0.29.0

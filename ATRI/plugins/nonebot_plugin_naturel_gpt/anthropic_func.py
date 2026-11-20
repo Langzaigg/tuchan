@@ -38,6 +38,14 @@ _IMAGE_MEDIA_TYPES = {
     "image/jpeg", "image/png", "image/gif", "image/webp",
 }
 
+# 历史窗口可能从印象或人设开始，首个 user 之前也可能有轮次资料。
+_TURN_SYSTEM_PREFIXES = (
+    "[用户印象", "[impression]", "[人设资料]",
+    "[调用结果]", "[搜索工具摘要]", "[作画记录]",
+    "[当前触发]", "[记忆提醒]", "[新消息提醒]",
+)
+_MUTABLE_HEADER_PREFIXES = ("[压缩上下文摘要]", "[当前状态]")
+
 
 def _flatten_text(content: Any) -> str:
     """把 OpenAI 风格的 content（字符串 / 文本块列表）压成纯文本。"""
@@ -149,9 +157,11 @@ def _convert_tool_choice(tool_choice: Any) -> Optional[Dict[str, Any]]:
 
 
 def split_messages(messages: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict[str, Any]]]:
-    """OpenAI messages → (system 文本列表, Anthropic messages)。"""
+    """只将开头的系统指令提升到顶层，轮次资料留在对应的对话位置。"""
     system_texts: List[str] = []
     out: List[Dict[str, Any]] = []
+    conversation_started = False
+    pending_notes: List[Dict[str, Any]] = []
 
     for msg in messages or []:
         if not isinstance(msg, dict):
@@ -161,10 +171,17 @@ def split_messages(messages: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict
 
         if role == "system":
             text = _flatten_text(content)
-            if text:
+            if not text:
+                continue
+            if not conversation_started and not text.lstrip().startswith(_TURN_SYSTEM_PREFIXES):
                 system_texts.append(text)
+            else:
+                # CC 不接受 messages 内的 system 角色。用显式文本块保留原位置。
+                conversation_started = True
+                pending_notes.append({"type": "text", "text": f"[系统补充]\n{text}"})
             continue
 
+        conversation_started = True
         if role == "tool":
             block = {
                 "type": "tool_result",
@@ -173,6 +190,11 @@ def split_messages(messages: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict
             }
             _append_blocks(out, "user", [block])
             continue
+
+        # tool_result 必须排在合并后的 user 消息最前面，提示要等整批结果写完。
+        if pending_notes:
+            _append_blocks(out, "user", pending_notes)
+            pending_notes.clear()
 
         if role == "assistant":
             blocks: List[Dict[str, Any]] = []
@@ -208,6 +230,8 @@ def split_messages(messages: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict
         blocks = _content_to_blocks(content)
         _append_blocks(out, "user", blocks)
 
+    _append_blocks(out, "user", pending_notes)
+
     # 首条必须是 user：个别网关对 assistant 开头直接 400
     if out and out[0]["role"] == "assistant":
         out.insert(0, {"role": "user", "content": [{"type": "text", "text": "继续"}]})
@@ -226,16 +250,21 @@ def _build_url(base_url: str) -> str:
 
 
 # ---- prompt caching（11-17 实测 CC：**顶层 cache_control 无效，必须逐块打点**）----
-# 打点后 run1 产出 cache_creation 2617、run2/3 变成 cache_read 2617 + input 15，
-# 也就是历史前缀几乎零成本。两个断点足够：system 末尾 + 上一轮历史的末尾。
 CACHE_CONTROL = {"type": "ephemeral"}
 
 
 def _system_blocks(system_texts: List[str]) -> List[Dict[str, Any]]:
-    """system 拆成 blocks 并给最后一块打缓存断点（顶层 cache_control 在 CC 上会被忽略）。"""
+    """缓存整个头部，并在摘要或状态变动时保留稳定的头部前缀。"""
     blocks = [{"type": "text", "text": text} for text in system_texts if text]
-    if blocks:
-        blocks[-1]["cache_control"] = dict(CACHE_CONTROL)
+    if not blocks:
+        return blocks
+
+    blocks[-1]["cache_control"] = dict(CACHE_CONTROL)
+    for idx, block in enumerate(blocks):
+        if block["text"].lstrip().startswith(_MUTABLE_HEADER_PREFIXES):
+            if idx:
+                blocks[idx - 1]["cache_control"] = dict(CACHE_CONTROL)
+            break
     return blocks
 
 
@@ -246,10 +275,10 @@ def _apply_cache_breakpoints(conv: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     只有一条消息（单轮）时不打历史断点，system 那个已经够用。
     """
     if len(conv) >= 2:
-        prev = conv[-2]
-        blocks = prev.get("content") or []
-        if blocks and isinstance(blocks[-1], dict):
-            blocks[-1]["cache_control"] = dict(CACHE_CONTROL)
+        for block in reversed(conv[-2]["content"]):
+            if block.get("type") in {"text", "image", "tool_use", "tool_result"}:
+                block["cache_control"] = dict(CACHE_CONTROL)
+                break
     return conv
 
 

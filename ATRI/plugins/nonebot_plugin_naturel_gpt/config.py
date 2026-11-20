@@ -1,11 +1,13 @@
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 from nonebot.config import Config as NBConfig
-from pydantic import BaseModel, Extra
+from pydantic import BaseModel, Extra, Field, validator
 from nonebot import get_driver
 from .logger import logger
+from tempfile import NamedTemporaryFile
 import yaml
 from pathlib import Path
 from .persona_loader import load_personas_from_directory
+from ATRI.naturel_gpt_storage import nickname_directory
 
 class GlobalConfig(NBConfig, extra=Extra.allow):
     """Plugin Config Here
@@ -15,6 +17,16 @@ class GlobalConfig(NBConfig, extra=Extra.allow):
     """
     ng_config_path: str = "config/naturel_gpt_config.yml"
     ng_dev_mode: bool = False
+    ng_endpoint_nicknames: Optional[List[str]] = None
+    ng_persona_dir: Optional[str] = None
+    ng_endpoint_data_dir: Optional[str] = None
+    ng_endpoint_proxy: str = ""
+    ng_archive_fallback_dir: Optional[str] = None
+    ng_shared_draw_db: Optional[str] = None
+    ng_base_config_path: Optional[str] = None
+    """接入点覆盖层模式下的主配置路径；为空表示 ng_config_path 就是完整配置（单文件模式）。"""
+    ng_shared_nas: Optional[Dict[str, str]] = None
+    """NaturelGPTShared/主配置解析出的 NAS 共用字段，加载时覆盖进生效配置（不回写文件）。"""
 
 class PresetConfig(BaseModel, extra=Extra.ignore):
     """人格预设配置项"""
@@ -24,6 +36,33 @@ class PresetConfig(BaseModel, extra=Extra.ignore):
     is_only_private:bool = False
     """此预设是否仅限私聊"""
     bot_self_introl:str = ''
+
+
+class ContextSummaryPressureConfig(BaseModel, extra=Extra.forbid):
+    max_rounds: Optional[int] = Field(None, ge=2)
+    """请求侧硬轮数上限；null 按基础窗口和连续对话余量推导。"""
+    round_headroom: int = Field(2, ge=0)
+    """距硬轮数上限还有多少轮时可以启动摘要。"""
+    token_budget_ratio: float = Field(0.875, gt=0, le=1)
+    """估算输入达到 token 预算的此比例时可以启动摘要。"""
+
+
+class ContextSummaryIdleConfig(BaseModel, extra=Extra.forbid):
+    minutes: float = Field(30, gt=0)
+    """会话及邮箱收尾后等待的静默分钟数。"""
+    keep_rounds: Optional[int] = Field(None, ge=1)
+    """空闲压缩保留的原始轮数；null 保留正常目标的一半（向上取整）。"""
+    min_saved_tokens: int = Field(2048, ge=0)
+    """发起空闲压缩前预计至少净省的 token 数。"""
+
+
+class ContextSummaryConfig(BaseModel, extra=Extra.forbid):
+    enabled: bool = False
+    target_chars: int = 800
+    """摘要字数软目标，profile 的 max_summary_tokens 可覆盖。"""
+    pressure: ContextSummaryPressureConfig = Field(default_factory=ContextSummaryPressureConfig)
+    idle: ContextSummaryIdleConfig = Field(default_factory=ContextSummaryIdleConfig)
+
 
 # profile 的 `postprocess` 数组支持的开关（顺序仅作文档展示，含义见 AGENTS.md）
 PROFILE_FLAG_CHOICES = (
@@ -106,7 +145,12 @@ class Config(BaseModel, extra=Extra.ignore):
 
         注意：返回值恒为 dict，调用方不需要再判断 OPENAI_PROFILES 里存的是不是指针。"""
         value = (self.OPENAI_PROFILES or {}).get(self.resolve_profile_name(name))
-        return dict(value) if isinstance(value, dict) else {}
+        if not isinstance(value, dict):
+            return {}
+        profile = dict(value)
+        if global_config.ng_endpoint_proxy and not profile.get("proxy"):
+            profile["proxy"] = global_config.ng_endpoint_proxy
+        return profile
 
     def profile_flags(self, profile: Dict[str, Any]) -> Dict[str, bool]:
         """把 profile 的后处理开关归一成布尔字典。
@@ -144,6 +188,7 @@ class Config(BaseModel, extra=Extra.ignore):
     PRESETS: Dict[str, PresetConfig] = {}
     """运行时动态人格预设；不再从配置文件手写人格来源读取"""
     DEFAULT_PERSONA: str
+    nickname: Optional[Union[str, List[str]]] = None
     """默认人格名；为空或不存在时使用首个已加载人格"""
     IGNORE_PREFIX: str
     """忽略前缀 以该前缀开头的消息将不会被处理"""
@@ -166,13 +211,20 @@ class Config(BaseModel, extra=Extra.ignore):
     CONTEXT_TOKEN_BUDGET: int
     """上下文窗口token预算，控制prompt最大token数"""
     CONTEXT_WINDOW_SIZE: int
-    """上下文窗口大小（对话轮数），每轮=1条用户消息+1条回复"""
-    CONTEXT_SUMMARY_ENABLED: bool
-    """是否启用上下文摘要压缩，启用后超窗口的历史会被压缩为摘要"""
+    """窗口压力触发摘要后保留的原始轮数，每条触发用户消息算一轮。"""
     CONTEXT_COMPRESS_THRESHOLD_RATIO: float
-    """压缩触发阈值乘数，溢出超过窗口*此比例才触发摘要生成，默认0.5"""
-    CONTEXT_SUMMARY_TARGET_CHARS: int = 800
-    """上下文摘要目标字数（提示词软限制，硬截断为2倍）；profile 的 max_summary_tokens 可覆盖"""
+    """基础上下文窗口可额外保留的轮数比例，默认0.5"""
+    CONTEXT_SUMMARY: ContextSummaryConfig = Field(default_factory=ContextSummaryConfig)
+
+    @validator("CONTEXT_SUMMARY")
+    def _validate_context_summary_windows(cls, summary: ContextSummaryConfig, values: Dict[str, Any]) -> ContextSummaryConfig:
+        target_rounds = max(1, values.get("CONTEXT_WINDOW_SIZE", 1))
+        if summary.pressure.max_rounds is not None and summary.pressure.max_rounds <= target_rounds:
+            raise ValueError("pressure.max_rounds 必须大于 CONTEXT_WINDOW_SIZE")
+        if summary.idle.keep_rounds is not None and summary.idle.keep_rounds > target_rounds:
+            raise ValueError("idle.keep_rounds 不能大于 CONTEXT_WINDOW_SIZE")
+        return summary
+
     IMPRESSION_TARGET_CHARS: int = 200
     """用户印象目标字数（提示词软限制，硬截断为2倍）"""
     TOOL_CONTEXT_TOKEN_BUDGET: int
@@ -345,10 +397,9 @@ CONFIG_TEMPLATE = {
     'CHAT_MAX_SUMMARY_TOKENS': 512,  # 旧格式兼容
     'REPLY_MAX_TOKENS': 1024,  # 旧格式兼容
     'CONTEXT_TOKEN_BUDGET': 4096,  # 上下文窗口token预算
-    'CONTEXT_WINDOW_SIZE': 16,  # 上下文窗口大小（对话轮数），每轮=1条用户消息+1条回复
-    'CONTEXT_SUMMARY_ENABLED': False,  # 是否启用上下文摘要压缩
-    'CONTEXT_COMPRESS_THRESHOLD_RATIO': 0.5,  # 压缩触发阈值乘数，溢出超过窗口*此比例才触发摘要生成
-    'CONTEXT_SUMMARY_TARGET_CHARS': 800,  # 上下文摘要目标字数（提示词软限制，硬截断为2倍）；profile 的 max_summary_tokens 可覆盖
+    'CONTEXT_WINDOW_SIZE': 16,  # 窗口压力触发摘要后的保留轮数
+    'CONTEXT_COMPRESS_THRESHOLD_RATIO': 0.5,  # 基础上下文窗口可额外保留的轮数比例
+    'CONTEXT_SUMMARY': ContextSummaryConfig().dict(),
     'IMPRESSION_TARGET_CHARS': 200,  # 用户印象目标字数（提示词软限制，硬截断为2倍）
     'TOOL_CONTEXT_TOKEN_BUDGET': 16384,  # 工具循环内工具+思考 token 预算，超出时进入终端轮收尾
 
@@ -441,6 +492,9 @@ driver = get_driver()
 global_config = GlobalConfig.parse_obj(driver.config)
 config_path = global_config.ng_config_path
 config:Config = None # type: ignore
+# 覆盖层模式（config/bots/<昵称>/<接入点>.yml）：该文件只写与主配置不同的键，
+# 加载时并自主配置，保存时只回写这些键。None 表示单文件模式。
+_overlay_keys: Optional[frozenset] = None
 
 def get_config() ->Config:
     """获取config数据（为了能够reload建议使用此函数获取对象）"""
@@ -448,21 +502,35 @@ def get_config() ->Config:
 
 
 def get_persona_dir() -> Path:
-    """人格目录固定为 naturel_gpt_config.yml 所在目录下的 personas 子目录。"""
+    """已命名的接入点共用主配置旁的人格目录。"""
+    if global_config.ng_persona_dir:
+        return Path(global_config.ng_persona_dir)
     return Path(config_path).resolve().parent / "personas"
 
 
-def _apply_default_persona(personas: Dict[str, PresetConfig], default_persona: str) -> None:
-    """Mark one loaded persona as default, falling back to the first loaded persona."""
-    if not personas:
-        return
-    selected = default_persona if default_persona in personas else next(iter(personas))
-    for preset_key, preset in personas.items():
-        preset.is_default = preset_key == selected
+def _endpoint_nicknames() -> Tuple[str, ...]:
+    names = global_config.ng_endpoint_nicknames
+    if names is None:
+        names = sorted(driver.config.nickname)
+    return tuple(name.strip() for name in names if name and name.strip())
 
 
-def load_dynamic_persona_presets() -> Dict[str, PresetConfig]:
-    """从配置文件同级的 personas 子目录动态加载 md/skill 人格。"""
+def _nickname_values(value: Optional[Union[str, List[str]]]) -> Tuple[str, ...]:
+    names = (value,) if isinstance(value, str) else value or ()
+    return tuple(str(name).strip() for name in names if str(name).strip())
+
+
+def get_archive_nicknames() -> Tuple[str, ...]:
+    return () if "nickname" in config.__fields_set__ else _endpoint_nicknames()
+
+
+def get_archive_dir() -> Path:
+    root = Path(config.NG_DATA_PATH)
+    nicknames = get_archive_nicknames()
+    return root / "archives" / nickname_directory(nicknames[0]) if nicknames else root
+
+
+def _load_persona_presets(default_persona: str, nicknames: Tuple[str, ...]) -> Dict[str, PresetConfig]:
     persona_presets: Dict[str, PresetConfig] = {}
     for preset_key, persona_text in load_personas_from_directory(str(get_persona_dir())).items():
         persona_presets[preset_key] = PresetConfig(
@@ -472,9 +540,17 @@ def load_dynamic_persona_presets() -> Dict[str, PresetConfig]:
             is_only_private=False,
             bot_self_introl=persona_text,
         )
-    if config:
-        _apply_default_persona(persona_presets, config.DEFAULT_PERSONA)
+    candidates = [*nicknames, default_persona]
+    selected = next((name for name in candidates if name in persona_presets), next(iter(persona_presets), ""))
+    if selected:
+        persona_presets[selected].is_default = True
     return persona_presets
+
+
+def load_dynamic_persona_presets() -> Dict[str, PresetConfig]:
+    """从人格目录动态加载 md/skill 人格。"""
+    names = _nickname_values(config.nickname) if config and "nickname" in config.__fields_set__ else _endpoint_nicknames()
+    return _load_persona_presets(config.DEFAULT_PERSONA if config else "", names)
 
 
 def reload_dynamic_personas() -> int:
@@ -497,34 +573,56 @@ def reload_dynamic_personas() -> int:
 
 def _load_config_obj_from_file()->Config:
     """从配置文件加载Config对象"""
+    global _overlay_keys
     # 读取配置文件
     with open(config_path, 'r', encoding='utf-8') as f:
         try:
-            config_obj_from_file:Dict = yaml.safe_load(f)
+            config_obj_from_file:Dict = yaml.safe_load(f) or {}
+            # 覆盖层模式：接入点文件只写与主配置不同的键，先并自主配置再走后续兼容与默认值回填
+            base_config_path = (global_config.ng_base_config_path or "").strip()
+            if base_config_path and Path(base_config_path).resolve() != Path(config_path).resolve():
+                overlay_keys = set(config_obj_from_file)
+                if overlay_keys.intersection(("CONTEXT_SUMMARY_ENABLED", "CONTEXT_SUMMARY_TARGET_CHARS")):
+                    overlay_keys.add("CONTEXT_SUMMARY")
+                _overlay_keys = frozenset(overlay_keys)
+                with open(base_config_path, 'r', encoding='utf-8') as bf:
+                    base_obj = yaml.safe_load(bf) or {}
+                base_obj.update(config_obj_from_file)
+                config_obj_from_file = base_obj
+            else:
+                _overlay_keys = None
+            if global_config.ng_shared_nas:
+                config_obj_from_file.update(global_config.ng_shared_nas)
+            # 兼容旧扁平字段；混用时以新节中明确填写的值为准。
+            legacy_summary = {
+                field: config_obj_from_file[legacy]
+                for field, legacy in (
+                    ("enabled", "CONTEXT_SUMMARY_ENABLED"),
+                    ("target_chars", "CONTEXT_SUMMARY_TARGET_CHARS"),
+                )
+                if legacy in config_obj_from_file
+            }
+            if legacy_summary:
+                summary_section = config_obj_from_file.setdefault("CONTEXT_SUMMARY", {})
+                if isinstance(summary_section, dict):
+                    for field, value in legacy_summary.items():
+                        summary_section.setdefault(field, value)
+
             for k in CONFIG_TEMPLATE.keys():
                 if not k in config_obj_from_file.keys():
                     config_obj_from_file[k] = CONFIG_TEMPLATE[k]
                     if k not in _LEGACY_FIELDS or not config_obj_from_file.get("OPENAI_PROFILES"):
                         logger.info(f"Naturel GPT 配置文件缺少 {k} 项，将使用默认值")
 
-            # 人格来源固定为 naturel_gpt_config.yml 同级的 personas 子目录。
-            # 配置文件中的 PRESETS 不再作为输入来源，保留字段仅用于运行时承载动态人格。
-            config_obj_from_file["PRESETS"] = {}
+            if global_config.ng_endpoint_data_dir:
+                data_dir = Path(global_config.ng_endpoint_data_dir)
+                config_obj_from_file["NG_DATA_PATH"] = str(data_dir)
+                config_obj_from_file["NG_LOG_PATH"] = str(data_dir / "logs")
 
-            for preset_key, persona_text in load_personas_from_directory(str(get_persona_dir())).items():
-                config_obj_from_file["PRESETS"][preset_key] = {
-                    "preset_key": preset_key,
-                    "is_locked": False,
-                    "is_default": False,
-                    "is_only_private": False,
-                    "bot_self_introl": persona_text,
-                }
-            if config_obj_from_file["PRESETS"]:
-                selected_persona = config_obj_from_file.get("DEFAULT_PERSONA", "")
-                if selected_persona not in config_obj_from_file["PRESETS"]:
-                    selected_persona = next(iter(config_obj_from_file["PRESETS"]))
-                for preset_key, preset in config_obj_from_file["PRESETS"].items():
-                    preset["is_default"] = preset_key == selected_persona
+            # PRESETS 只在运行时承载由文件加载的人格。
+            names = (_nickname_values(config_obj_from_file["nickname"])
+                     if "nickname" in config_obj_from_file else _endpoint_nicknames())
+            config_obj_from_file["PRESETS"] = _load_persona_presets(config_obj_from_file["DEFAULT_PERSONA"], names)
             if not config_obj_from_file["PRESETS"]:
                 config_obj_from_file["PRESETS"]["default"] = {
                     "preset_key": "default",
@@ -613,18 +711,34 @@ def save_config():
     get_persona_dir().mkdir(parents=True, exist_ok=True)
 
     # 保存配置文件（有 OPENAI_PROFILES 时剔除旧格式兼容字段）
-    with open(config_path, 'w', encoding='utf-8') as f:
-        config_dict = config.dict()
-        config_dict["PRESETS"] = {}
-        if config_dict.get("OPENAI_PROFILES"):
-            for field in _LEGACY_FIELDS:
-                config_dict.pop(field, None)
-        yaml.dump(config_dict, f, allow_unicode=True, sort_keys=False)
+    config_dict = config.dict()
+    if "nickname" not in config.__fields_set__:
+        config_dict.pop("nickname", None)
+    config_dict["PRESETS"] = {}
+    if config_dict.get("OPENAI_PROFILES"):
+        for field in _LEGACY_FIELDS:
+            config_dict.pop(field, None)
+    if _overlay_keys is not None:
+        # 覆盖层模式：只回写接入点自己声明过的键，主配置的键不落到覆盖层文件
+        config_dict = {k: v for k, v in config_dict.items() if k in _overlay_keys}
+    path = Path(config_path)
+    file = NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False)
+    tmp_path = Path(file.name)
+    try:
+        with file:
+            if _overlay_keys is not None:
+                file.write("# 接入点覆盖层：只写与主配置不同的键，未写的键自动共用主配置\n")
+            yaml.dump(config_dict, file, allow_unicode=True, sort_keys=False)
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 def load_config_from_file_then_save():
     """加载配置文件，然后保存回文件"""
     global config
     config = _load_config_obj_from_file()
+    if "nickname" in config.__fields_set__:
+        driver.config.nickname = set(_nickname_values(config.nickname))
 
     save_config()
     logger.info('Naturel GPT 配置文件加载成功')

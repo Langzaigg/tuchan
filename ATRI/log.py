@@ -12,17 +12,20 @@ LOGGER_DIR.parent.mkdir(exist_ok=True, parents=True)
 
 NOW_TIME = datetime.now().strftime("%Y%m%d-%H")
 
-log_format = (
-    "\033[36mATRI\033[0m "
+log_body_format = (
     "| <g>{time:MM-DD HH:mm:ss}</g> "
     "| <lvl>{level}</lvl> "
     "<c><u>{name}</u></c> >> "
     "{message}"
 )
+log_format = "\033[36mATRI\033[0m " + log_body_format
+console_format = "\033[36m{extra[bot_nickname]}\033[0m " + log_body_format
+bot_nickname = next(iter(BotSelfConfig.nicknames), "ATRI")
 
 
 class LoguruNameDealer:
     def __call__(self, record):
+        record["extra"]["bot_nickname"] = bot_nickname
         log_handle = record["name"]
         if "nonebot.plugin.manager" in log_handle:
             plugin_name = log_handle.split(".")[-1]
@@ -42,7 +45,7 @@ logger.add(
     level="DEBUG" if BotSelfConfig.debug else "INFO",
     colorize=True,
     filter=LoguruNameDealer(),
-    format=log_format,
+    format=console_format,
 )
 
 logger.add(
