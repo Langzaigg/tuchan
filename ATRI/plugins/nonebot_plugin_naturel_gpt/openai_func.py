@@ -385,6 +385,7 @@ _FORCE_DRAW_HINT_TEXT = (
     "当前用户明确要求作画。你必须通过 tool_calls 调用 generate_anima_image 工具完成作画，"
     "禁止只在文字里说「画了」「在画了」「等图吧」而不实际调用工具；任务编号只能由工具返回，禁止编造。"
 )
+_FORCE_MANGA_DRAW_HINT_TEXT = "当前用户明确要求作画。请按漫画模式的画图规则选择工具，并通过 tool_calls 完成作画。"
 # force 模式 + 触发句同时提到 moss 与画图意图（画/p/图/换…）时改注入这条：
 # 用户点名要 moss 就不能推回 generate_anima_image（MOSS 的画面内文字/分格能力是这次请求的重点）
 _FORCE_MOSS_HINT_TEXT = (
@@ -590,6 +591,7 @@ def sanitize_internal_control_text(content: str) -> str:
     content = content.replace(_TOTAL_TOOL_LIMIT_TEXT, "")
     content = content.replace(_SEARCH_TOOL_LIMIT_TEXT, "")
     content = content.replace(_TOOL_LOOP_TIMEOUT_TEXT, "")
+    content = content.replace(_FORCE_MANGA_DRAW_HINT_TEXT, "")
     content = content.replace(_ROUND_LIMIT_TEXT, "")
     content = content.replace(_MARKUP_LEAK_NO_TOOLS_TEXT, "")
     content = content.replace(_MARKUP_LEAK_WITH_TOOLS_TEXT, "")
@@ -673,6 +675,20 @@ def strip_chat_markdown(content: str) -> str:
 # 交给分段逻辑切成多条消息。只匹配「整行只由分隔符字符组成」的行，表格分隔线（|---|---|）
 # 和正文里的破折号（——、「-40」）不受影响。
 _SEPARATOR_LINE_RE = re.compile(r'^[ \t]*(?:[-—–_*=][ \t]*){3,}$', re.M)
+
+
+_MANGA_SENTENCE = re.compile(r"([^\n。！？!?]+)[。！？!?]*")
+
+
+def strip_repeated_manga_text(text: str, spoken_parts: List[str]) -> str:
+    """去掉续话里与图前已发送内容完全相同的句子。"""
+    spoken_sentences = {
+        sentence[1].strip() for part in spoken_parts
+        for sentence in _MANGA_SENTENCE.finditer(part) if sentence[1].strip()
+    }
+    return _MANGA_SENTENCE.sub(
+        lambda sentence: "" if sentence[1].strip() in spoken_sentences else sentence[0], text,
+    ).strip()
 
 
 def normalize_reply_separators(content: str) -> str:
@@ -1752,6 +1768,7 @@ class TextGenerator(Singleton["TextGenerator"]):
         on_reasoning: Optional[ChunkCallback] = None,
         on_tool_call: Optional[Callable] = None,
         on_reply_complete: Optional[Callable[[str, List[Dict[str, Any]], Optional[List[Dict[str, Any]]]], Awaitable[None]]] = None,
+        before_manga_draw: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> Tuple[str, bool, List[Dict[str, Any]], str]:
         custom = custom or {}
         # 逐 dict 浅拷贝即可：循环内对消息的所有改动（reasoning pop、图片剥离、空 content 填充）
@@ -1862,7 +1879,12 @@ class TextGenerator(Singleton["TextGenerator"]):
         # 调用时机改由工具 description 与 S1 画图行为规则约束，保持 tools 数组稳定以最大化缓存命中
         from .llm_tool_plugins import anima_generate as _ag
         _draw_mode = _ag.get_chat_mode(request_chat_key) if request_chat_key else "auto"
-        _is_manga = _ag.get_manga_mode(request_chat_key) if request_chat_key else False
+        send_context = _ag.current_send_context()
+        _is_manga = (
+            bool(send_context.get("manga_mode"))
+            if request_chat_key and send_context.get("chat_key") == request_chat_key
+            else bool(request_chat_key and _ag.get_manga_mode(request_chat_key))
+        )
         if not _is_manga and _draw_mode == "off":
             # danbooru_search 只服务于画图时的作画标签确定，随画图工具一起进出，避免闲聊轮白占工具位
             tool_schemas = [s for s in tool_schemas if s.get("function", {}).get("name") not in _DRAW_ONLY_TOOLS]
@@ -1886,19 +1908,24 @@ class TextGenerator(Singleton["TextGenerator"]):
 
         _all_reply_texts: List[str] = []  # 本次循环已完成的全部回复文本（逐轮落库，返回值保留全部文本）
         _entries_for_next_reply: List[Dict[str, Any]] = []  # 上一回复边界插入的邮箱批次（下一个回复所应答的新消息）
+        manga_draw_attempted = False
+        manga_image_sent = False
 
-        async def _emit_reply(merged_text: str) -> None:
+        async def _emit_reply(merged_text: str) -> bool:
             """一个回复完成（无 tool_calls 的最终文本轮）：累计文本并立即回调 matcher 逐轮落库。
             每个完成的回复恰好回调一次（含因插入而继续前的这一轮与整个循环的最终轮）。
             reply_entries 为本回复应答的邮箱插入批次（空 → None，表示应答原始触发消息）。"""
             nonlocal _entries_for_next_reply
-            if not merged_text or not merged_text.strip():
-                return
+            has_text = bool(merged_text and merged_text.strip())
+            if not has_text and not manga_image_sent:
+                return False
             _round_fx["text"] = True  # 已落库 → 本轮不可再重试
-            _all_reply_texts.append(merged_text)
+            if has_text:
+                _all_reply_texts.append(merged_text)
             if on_reply_complete:
                 await on_reply_complete(merged_text, list(tool_messages), list(_entries_for_next_reply) or None)
             _entries_for_next_reply = []
+            return True
 
         def _joined_reply_text(fallback: str) -> str:
             """返回全部已完成回复的合并文本（无已完成回复时回退本轮 merged）。"""
@@ -1912,6 +1939,7 @@ class TextGenerator(Singleton["TextGenerator"]):
             reply_completed=True 表示上一轮产出了最终文本（无 tool_calls，回复已完成）；
             False 表示上一轮以 tool_calls 结束（被插入打断的触发尚未完成回复）。"""
             nonlocal round_idx, loop_start, intermediate_texts, tool_messages, _entries_for_next_reply, _round_limit_injected
+            nonlocal manga_draw_attempted, manga_image_sent
             if not request_chat_key or not hasattr(self, "_loop_mailbox"):
                 return False
             if _allow_terminal_tools or _terminal_wrapup_pending:
@@ -1983,6 +2011,8 @@ class TextGenerator(Singleton["TextGenerator"]):
             if reply_completed:
                 intermediate_texts = []
                 tool_messages = []
+                manga_draw_attempted = False
+                manga_image_sent = False
             # 记录本批次 entry，随下一个完成的回复回调给 matcher（该回复应答的就是这批新消息）
             _entries_for_next_reply = list(entries)
             logger.info(
@@ -2013,13 +2043,13 @@ class TextGenerator(Singleton["TextGenerator"]):
                         internal_control_injected = True
                     round_idx = max_rounds
                     _allow_terminal_tools = True
+                    _terminal_wrapup_pending = manga_draw_attempted
 
                 # force 模式：不使用 tool_choice 强制指定（主流 provider 在思考模式下均不兼容，
                 # 会 400），改为在消息尾部注入强制画图提示（仅一次；尾部追加不破坏历史前缀缓存；
                 # 末尾是 assistant(tool_calls) 时跳过注入，避免 system 隔断 tool_calls → tool 响应的
                 # 连续配对）。模型仍不调用时由 matcher 的伪造编号拦截/漫画强制画图兜底。
-                # 触发句同时提到 moss 且有画图意图（画/p/图/换…）时改注入 MOSS 版提示，
-                # 避免模型把请求推回 generate_anima_image。
+                # 点名 MOSS 时用专用提示。漫画模式的其他请求按画图规则选工具。
                 _force_moss_request = (
                     type == "chat"
                     and _draw_mode == "force"
@@ -2034,12 +2064,20 @@ class TextGenerator(Singleton["TextGenerator"]):
                     _force_draw_hint_injected = True
                     _tail_msg = messages[-1] if messages else {}
                     if not (_tail_msg.get("role") == "assistant" and _tail_msg.get("tool_calls")):
+                        hint = _FORCE_DRAW_HINT_TEXT
+                        draw_tool = "anima"
+                        if _force_moss_request:
+                            hint = _FORCE_MOSS_HINT_TEXT
+                            draw_tool = "moss"
+                        elif _is_manga:
+                            hint = _FORCE_MANGA_DRAW_HINT_TEXT
+                            draw_tool = "漫画模式"
                         messages.append({
                             "role": "system",
-                            "content": _FORCE_MOSS_HINT_TEXT if _force_moss_request else _FORCE_DRAW_HINT_TEXT,
+                            "content": hint,
                         })
                         logger.info(
-                            f"force 模式：已在尾部注入强制画图提示（{'moss' if _force_moss_request else 'anima'}）"
+                            f"force 模式：已在尾部注入强制画图提示（{draw_tool}）"
                             f" | type={type} | 会话: {request_chat_key or 'unknown'}"
                         )
 
@@ -2300,7 +2338,7 @@ class TextGenerator(Singleton["TextGenerator"]):
                         final_reasoning_content = reasoning_content or ""
                         # 工具调用后续轮返回空内容：可能是图片撑爆上下文导致，
                         # 剥离图片后重试（兜底，正常情况下 except 分支已处理异常场景）
-                        if not content.strip() and not intermediate_texts and tool_messages and not _image_stripped:
+                        if not content.strip() and not intermediate_texts and tool_messages and not _image_stripped and not manga_image_sent:
                             _image_stripped = True
                             for m in messages:
                                 if isinstance(m.get("content"), list):
@@ -2317,10 +2355,10 @@ class TextGenerator(Singleton["TextGenerator"]):
                             await _flush_control_stream_buffer()
                         merged_reply = _merge_intermediate(content)
                         # 逐轮落库：本回复完成，立即回调 matcher 落库（每个回复恰好一次）
-                        await _emit_reply(merged_reply)
+                        reply_completed = await _emit_reply(merged_reply)
                         # 回复完成边界：邮箱有新触发消息则批量插入并继续循环（终端阶段内部跳过）
                         if await _insert_mailbox_entries(
-                            reply_completed=bool(merged_reply and merged_reply.strip()),
+                            reply_completed=reply_completed,
                             round_content=content,
                             round_reasoning=reasoning_content or "",
                         ):
@@ -2340,11 +2378,11 @@ class TextGenerator(Singleton["TextGenerator"]):
                         final_reasoning_content = reasoning_content or ""
                         if control_stream_buf is not None:
                             await _flush_control_stream_buffer()
-                        if content or intermediate_texts:
+                        if content or intermediate_texts or manga_image_sent:
                             merged_reply = _merge_intermediate(content)
-                            await _emit_reply(merged_reply)
+                            reply_completed = await _emit_reply(merged_reply)
                             if await _insert_mailbox_entries(
-                                reply_completed=bool(merged_reply and merged_reply.strip()),
+                                reply_completed=reply_completed,
                                 round_content=content,
                                 round_reasoning=reasoning_content or "",
                             ):
@@ -2454,10 +2492,10 @@ class TextGenerator(Singleton["TextGenerator"]):
                             await on_text(safe_content)
                         merged_reply = _merge_intermediate(content)
                         # 逐轮落库：本回复完成，立即回调 matcher 落库（每个回复恰好一次）
-                        await _emit_reply(merged_reply)
+                        reply_completed = await _emit_reply(merged_reply)
                         # 回复完成边界：邮箱有新触发消息则批量插入并继续循环（终端阶段内部跳过）
                         if await _insert_mailbox_entries(
-                            reply_completed=bool(merged_reply and merged_reply.strip()),
+                            reply_completed=reply_completed,
                             round_content=content,
                             round_reasoning=final_reasoning_content or "",
                         ):
@@ -2478,11 +2516,11 @@ class TextGenerator(Singleton["TextGenerator"]):
                         safe_content = sanitize_draw_reply_text(content, allow_task_ids=has_draw_call)
                         if on_text and safe_content:
                             await on_text(safe_content)
-                        if content or intermediate_texts:
+                        if content or intermediate_texts or manga_image_sent:
                             merged_reply = _merge_intermediate(content)
-                            await _emit_reply(merged_reply)
+                            reply_completed = await _emit_reply(merged_reply)
                             if await _insert_mailbox_entries(
-                                reply_completed=bool(merged_reply and merged_reply.strip()),
+                                reply_completed=reply_completed,
                                 round_content=content,
                                 round_reasoning=message_dict.get("reasoning_content", "") or "",
                             ):
@@ -2536,6 +2574,7 @@ class TextGenerator(Singleton["TextGenerator"]):
 
                 # 检查工具调用限制
                 # 终端工具轮：过滤掉非终端工具调用，只执行允许的终端工具
+                tool_result_start = len(messages)
                 if is_last_round and _allow_terminal_tools:
                     _filtered = [tc for tc in tool_calls if _get(_get(tc, "function", {}), "name", "") in TERMINAL_TOOLS]
                     if len(_filtered) < len(tool_calls):
@@ -2590,14 +2629,30 @@ class TextGenerator(Singleton["TextGenerator"]):
                 total_tool_calls += current_tool_count
                 search_tool_calls += current_search_count
 
+                tool_names = {_get(_get(tc, "function", {}), "name", "") for tc in tool_calls}
+                manga_draw_this_round = type == "chat" and _is_manga and "generate_anima_image" in tool_names
+                if manga_draw_this_round:
+                    manga_draw_attempted = True
+                    if _round_used_stream:
+                        await _flush_control_stream_buffer()
+                    elif on_text:
+                        safe_content = sanitize_draw_reply_text(safe_intermediate, allow_task_ids=has_draw_call)
+                        if safe_content:
+                            _round_fx["text"] = True
+                            await on_text(safe_content)
+                    if before_manga_draw:
+                        await before_manga_draw()
+
                 self._current_chat_key = request_chat_key
                 self._current_trigger_userid = request_trigger_userid
                 await self._execute_tool_calls(messages, tool_calls, plugin_config)
                 _round_fx["tools"] = True  # 工具已执行（画图等有副作用）→ 本轮不可再重试
                 # 收集tool消息
-                for msg in messages:
-                    if msg.get("role") == "tool" and msg not in tool_messages:
+                for msg in messages[tool_result_start:]:
+                    if msg.get("role") == "tool":
                         tool_messages.append(msg)
+                        if manga_draw_this_round and msg.get("name") == "generate_anima_image":
+                            manga_image_sent |= msg["content"].startswith(_ag.MANGA_IMAGE_SENT)
 
                 # 终端阶段只允许单次终端工具调用：本轮以终端模式进入且已执行完毕
                 # （含非终端调用全部被过滤的情况），下一轮进入无工具收尾轮（tool_choice="none"）
@@ -2622,16 +2677,17 @@ class TextGenerator(Singleton["TextGenerator"]):
                         _allow_terminal_tools = True
 
                 # 中间轮结束后输出分隔符，与最终轮分段
-                if on_text and not is_last_round:
+                if on_text and not is_last_round and not manga_draw_this_round:
                     await on_text("\n\n")
 
                 # 判断是否计入轮数：只有包含非 memory 工具时才增加轮数计数
-                tool_names = {_get(_get(tc, "function", {}), "name", "") for tc in tool_calls}
                 if tool_names - {"remember"}:
                     round_idx += 1
 
                 # 工具轮边界：批量插入循环邮箱中的新触发消息（回复未完成版标记；终端阶段内部跳过）
-                await _insert_mailbox_entries(reply_completed=False)
+                # 续接图前的话题后，再处理等待出图期间收到的新消息。
+                if not manga_draw_attempted:
+                    await _insert_mailbox_entries(reply_completed=False)
             except Exception as e:
                 # ⚠️ 必须带上异常类名：httpx 的 ConnectError('') / ReadTimeout('') / ConnectTimeout('')
                 # 的 str(e) 是**空串**（日志里看到的是 repr，含类名），只用 str(e) 会让所有

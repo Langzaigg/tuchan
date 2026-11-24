@@ -94,8 +94,11 @@ def init():
     if not any(plugin.name == "nonebot_plugin_naturel_gpt" for plugin in plugins):
         raise RuntimeError(f"接入点 {endpoint_name} 无法加载 Naturel GPT")
     import_draw_history(shared_draw_db, Path(driver().config.ng_archive_fallback_dir) / "draw.db", endpoints_dir)
-    if BotSelfConfig.hikari_enabled:
-        nonebot.load_plugin("hikari_bot")
+    if BotSelfConfig.hikari_enabled and nonebot.load_plugin("hikari_bot"):
+        scheduler = nonebot.require("nonebot_plugin_apscheduler").scheduler
+        for job in scheduler.get_jobs():
+            if job.func_ref == "hikari_bot:job_listen_battle":
+                job.modify(misfire_grace_time=15)
     if default_onebot and InlineGoCQHTTP.enabled:
         nonebot.load_plugin("nonebot_plugin_gocqhttp")
         nonebot.load_plugin("nonebot_plugin_test")

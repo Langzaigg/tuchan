@@ -1,69 +1,80 @@
-from typing import Tuple, List
+import asyncio
 import sys
 import traceback
+from collections import Counter
+from typing import List, Tuple
+
+import httpx
 import nonebot
-from nonebot.log import logger
 from nonebot.adapters.onebot.v11 import MessageSegment
-from nonebot.adapters.onebot.v11.adapter import Adapter
-from .basicFunc import *
-from .exception import *
-import asyncio
+from nonebot.log import logger
+
 from .bili_client import bili_client
 from .bili_task import bili_task_manager
+from .exception import (
+    BiliAPIRetCodeError,
+    BiliConnectionError,
+    BiliDatebaseError,
+    BiliNoLiveRoom,
+    BiliStatusCodeError,
+)
+
 __PLUGIN_NAME = "[bilibilibot~直播]"
+
+
 async def check_bili_live() -> None:
-    """
-    @description  :
-    检查数据库中所有主播的开播状态
-    如果关注的主播开播，则通知所有关注的用户
-    如果主播开播状态改变,则更新数据库
-    ---------
-    @param  :
-    -------
-    @Returns  :
-    -------
-    """
+    """检查关注的直播间，更新已确认的状态并通知订阅者。"""
     liver_list = list(bili_task_manager.liver_list.values())
-    
+    if not liver_list:
+        return
+
     sched_bot = nonebot.get_bot()
-    
-    """results = await asyncio.gather(
-        *[bili_client.get_live_status(liver_info[0], liver_info[3]) for liver_info in liver_list],
-        return_exceptions=True
-    )"""
-    async with httpx.AsyncClient(headers={"User-Agent":"Mozilla/5.0"}) as client:
+    async with httpx.AsyncClient(headers=bili_client.headers) as client:
         results = await asyncio.gather(
-            *[bili_client.get_live_status(client, liver_info["liver_uid"], liver_info["room_id"]) for liver_info in liver_list],
-            return_exceptions=True
+            *(
+                bili_client.get_live_status(client, liver["liver_uid"], liver["room_id"])
+                for liver in liver_list
+            ),
+            return_exceptions=True,
         )
-    for i in range(len(liver_list)):
-        if isinstance(results[i], tuple):
-            if results[i][0] and not liver_list[i]["is_live"]:
-                logger.info(f'[{__PLUGIN_NAME}]检测到主播 <{liver_list[i]["liver_name"]}> 已开播！')
-                text_msg = '【直播动态】\n<{}>正在直播!\n标题: {}\n链接: {}'.format(liver_list[i]["liver_name"], results[i][1], f"https://live.bilibili.com/{liver_list[i]['room_id']}")
-                reported_msg = text_msg + MessageSegment.image(results[i][2])
-                logger.info(f'[{__PLUGIN_NAME}]向粉丝发送开播通知')
-                bili_task_manager.update_liver_info(liver_list[i]["liver_uid"], True)
-                #bili_database.update_info(1, 1, liver_list[i][0])
 
-                user_list = liver_list[i]["user_follower"]
-                await asyncio.gather(*[sched_bot.send_msg(message=reported_msg, user_id=user_id) for user_id in user_list])
-                group_list = liver_list[i]["group_follower"]
-                await asyncio.gather(*[sched_bot.send_msg(message=reported_msg, group_id=group_id) for group_id in group_list])
+    connection_errors = Counter(result.reason for result in results if isinstance(result, BiliConnectionError))
+    if connection_errors:
+        details = "，".join(f"{reason} ×{count}" for reason, count in connection_errors.items())
+        logger.error(
+            f"{__PLUGIN_NAME} {sum(connection_errors.values())}/{len(liver_list)} 个直播间请求失败，"
+            f"保留这些直播间的原状态，下轮再查（{details}）"
+        )
 
-            elif not results[i][0] and liver_list[i]["is_live"]:
-                logger.info(f'[{__PLUGIN_NAME}]检测到主播 <{liver_list[i]["liver_name"]}> 已下播')
-                bili_task_manager.update_liver_info(liver_list[i]["liver_uid"], False)
-                text_msg = '【直播动态】\n<{}>直播结束!'.format(liver_list[i]["liver_name"])
-                user_list = liver_list[i]["user_follower"]
-                await asyncio.gather(*[sched_bot.send_msg(message=text_msg, user_id=user_id) for user_id in user_list])
-                group_list = liver_list[i]["group_follower"]
-                await asyncio.gather(*[sched_bot.send_msg(message=text_msg, group_id=group_id) for group_id in group_list])
+    for liver, result in zip(liver_list, results):
+        if isinstance(result, BiliConnectionError):
+            continue
+        uid, name, room_id = liver["liver_uid"], liver["liver_name"], liver["room_id"]
+        if isinstance(result, BaseException):
+            logger.error(
+                f"{__PLUGIN_NAME} 检测主播 <{name}> 开播情况失败（{result.__class__.__name__}: {result}）"
+            )
+            continue
+        is_live, title, cover_url = result
+        if bili_task_manager.liver_list.get(uid) is not liver or is_live == liver["is_live"]:
+            continue
 
-        elif isinstance(results[i], (BiliAPIRetCodeError, BiliStatusCodeError, BiliConnectionError)):
-            exception_msg = f'[错误报告]\n检测主播 <{liver_list[i]["liver_name"]}> 开播情况时发生错误\n错误类型: {type(results[i])}\n错误信息: {results[i]}'
-            logger.error(f"[{__PLUGIN_NAME}]" + exception_msg)
-    
+        if is_live:
+            logger.info(f"{__PLUGIN_NAME} 检测到主播 <{name}> 已开播！")
+            message = f"【直播动态】\n<{name}>正在直播!\n标题: {title}\n链接: https://live.bilibili.com/{room_id}"
+            message += MessageSegment.image(cover_url)
+        else:
+            logger.info(f"{__PLUGIN_NAME} 检测到主播 <{name}> 已下播")
+            message = f"【直播动态】\n<{name}>直播结束!"
+        bili_task_manager.update_liver_info(uid, is_live)
+        await asyncio.gather(*(
+            sched_bot.send_msg(message=message, user_id=user_id) for user_id in liver["user_follower"]
+        ))
+        await asyncio.gather(*(
+            sched_bot.send_msg(message=message, group_id=group_id) for group_id in liver["group_follower"]
+        ))
+
+
 async def follow_liver(uid: str, user_id: str, user_type: int) -> Tuple[bool, str]:
     '''根据用户/群关注主播，修改数据库
 

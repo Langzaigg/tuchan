@@ -89,9 +89,12 @@ def format_response_rules(rules: List[Optional[str]]) -> str:
 class ChatPromptMixin:
     """Prompt 构造 Mixin，提供对话 prompt 模板生成功能"""
 
-    async def get_chat_prompt_template(self, userid: str, chat_type: str = '', include_images: bool = True, has_draw_request: bool = False) -> List[Dict[str, Any]]:
+    async def get_chat_prompt_template(self, userid: str, chat_type: str = '', include_images: bool = True, has_draw_request: bool = False, trigger_msg: Optional['ChatMessageData'] = None) -> List[Dict[str, Any]]:
         """对话 prompt 模板生成。has_draw_request 保留用于调用方兼容，不再影响 prompt
         （画图触发时机约束已迁至 generate_anima_image 的 schema description 与 S1 画图行为规则）。
+        trigger_msg：邮箱残留重处理时本轮要回应的那条已落库消息（recorded_msg）。
+        默认（None）触发消息取历史中最后一条 user；显式传入时 [当前触发] 标记和裁剪保护
+        都按它在历史中的序位定位，避免重放较早 entry 时标记错套到更新消息上。
         个人印象不再在此处集中注入：印象 system 由 update_chat_history_row 在触发用户消息前按需插入 prompt_messages，
         绑定到该用户首次触发的轮次，随对应轮次一同裁剪/摘要。这样同一角色的印象在整个上下文中只出现一次，
         历史轮一旦写入即固定不变，从而保证多人使用时历史前缀稳定、prompt 缓存可稳定命中。"""
@@ -223,7 +226,19 @@ class ChatPromptMixin:
         # 触发标记同槽位（不落库）：context_only 块已改为 user 角色以就地携带图片，
         # 需显式标出哪条是本轮要回应的消息、来自谁；背景消息只用于理解语境。并存时与记忆提醒合并为一条。
         tail_notes: List[str] = []
-        trigger_item = self._last_trigger_item()
+        # 邮箱残留重处理：触发消息以调用方传入的 recorded_msg 为准，否则取历史中最后一条 user。
+        # 序位从尾部计数（倒数第几条非 context_only user）：窗口裁剪只砍头部，尾序位不受影响；
+        # 该消息在 reset/摘要后可能已不在历史里，此时查找返回 None 并回退到最后一条。
+        trigger_ordinal: Optional[int] = None
+        if trigger_msg is not None:
+            _n = 0
+            for _item in reversed(self.chat_preset.prompt_messages):
+                if isinstance(_item, ChatMessageData) and _item.role == 'user' and not _item.context_only:
+                    _n += 1
+                    if _item is trigger_msg:
+                        trigger_ordinal = _n
+                        break
+        trigger_item = trigger_msg if (trigger_msg is not None and trigger_ordinal is not None) else self._last_trigger_item()
         trigger_sender = ((trigger_item.sender or "").strip() if trigger_item else "") or "用户"
         trigger_has_images = bool(trigger_item and any(self._is_supported_image_url(u) for u in (trigger_item.images or [])))
         # 该标记不落库：只进本次请求的 messages；循环邮箱插入新消息时由 openai_func 去掉，避免错套到新消息
@@ -237,11 +252,13 @@ class ChatPromptMixin:
         )
         if memory_reminder:
             tail_notes.append(memory_reminder.strip())
-        insert_idx = self._find_trigger_msg_idx(messages)
+        insert_idx = self._find_trigger_msg_idx(messages, trigger_ordinal)
+        if insert_idx < 0 and trigger_ordinal is not None:
+            insert_idx = self._find_trigger_msg_idx(messages)
         if insert_idx >= 0:
             messages.insert(insert_idx, {'role': 'system', 'content': "\n".join(tail_notes)})
 
-        self._trim_messages_to_request_budget(messages)
+        self._trim_messages_to_request_budget(messages, trigger_ordinal)
 
         # 清除不在上下文中的图片缓存
         active_urls = image_cache.collect_active_urls(self.chat_preset.prompt_messages)
@@ -583,11 +600,16 @@ class ChatPromptMixin:
         return text.startswith(_CONTEXT_ONLY_PREFIX)
 
     @classmethod
-    def _find_trigger_msg_idx(cls, messages: List[Dict[str, Any]]) -> int:
-        """最后一条非 context_only 的 user 消息下标（触发消息），找不到返回 -1。"""
+    def _find_trigger_msg_idx(cls, messages: List[Dict[str, Any]], target_ordinal: Optional[int] = None) -> int:
+        """触发消息下标。target_ordinal 为 None 时取最后一条非 context_only 的 user；
+        否则按倒数序位（target_ordinal=1 即最后一条）定位非 context_only 的 user，找不到返回 -1。
+        倒数序位对头部窗口裁剪不敏感（裁剪只删最旧轮次）。"""
+        n = 0
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user" and not cls._is_context_only_message(messages[i]):
-                return i
+                n += 1
+                if target_ordinal is None or n == target_ordinal:
+                    return i
         return -1
 
     def _last_trigger_item(self) -> Optional[ChatMessageData]:
@@ -762,17 +784,22 @@ class ChatPromptMixin:
             trigger_idx = self._find_trigger_msg_idx(messages)
         return messages
 
-    def _trim_messages_to_request_budget(self, messages: List[Dict[str, Any]]) -> None:
-        """智能截断：优先删除最旧的普通历史消息，保护系统消息、触发消息和工具调用链完整性"""
+    def _trim_messages_to_request_budget(self, messages: List[Dict[str, Any]], trigger_ordinal: Optional[int] = None) -> None:
+        """智能截断：优先删除最旧的普通历史消息，保护系统消息、触发消息和工具调用链完整性。
+        trigger_ordinal 与 _find_trigger_msg_idx 一致：指定触发消息的序位（邮箱重放场景）。"""
         tg = TextGenerator.instance
         token_budget = get_config().CONTEXT_TOKEN_BUDGET
 
-        # 找到触发消息（最后一条非 context_only 的 user），保护它不被删除
-        trigger_idx = self._find_trigger_msg_idx(messages)
+        # 找到触发消息（默认最后一条非 context_only 的 user），保护它不被删除
+        trigger_idx = self._find_trigger_msg_idx(messages, trigger_ordinal)
+        if trigger_idx < 0 and trigger_ordinal is not None:
+            trigger_idx = self._find_trigger_msg_idx(messages)
 
         while len(messages) > 3 and tg.cal_token_count(messages) > token_budget:
             removed = self._drop_oldest_removable_round(messages, trigger_idx)
             if not removed:
                 logger.warning("上下文 token 预算仍超限，但只剩系统消息、触发消息或工具链，停止继续裁剪")
                 break
-            trigger_idx = self._find_trigger_msg_idx(messages)
+            trigger_idx = self._find_trigger_msg_idx(messages, trigger_ordinal)
+            if trigger_idx < 0 and trigger_ordinal is not None:
+                trigger_idx = self._find_trigger_msg_idx(messages)

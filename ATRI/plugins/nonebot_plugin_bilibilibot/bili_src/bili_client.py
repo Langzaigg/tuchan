@@ -286,10 +286,19 @@ class BiliClient():
         -------
         """
         
-        try:
-            response = await client.get(self.API["get_live_info_by_room_id"], params={"room_id": room_id})
-        except Exception as e:
-            raise BiliConnectionError(1, uid, e.args[0])
+        for attempt in range(2):
+            try:
+                response = await client.get(self.API["get_live_info_by_room_id"], params={"room_id": room_id})
+                break
+            except httpx.RequestError as error:
+                retryable = isinstance(error, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError))
+                if attempt == 0 and retryable:
+                    await asyncio.sleep(uniform(0.25, 0.75))
+                    continue
+                reason = error.__class__.__name__
+                if str(error):
+                    reason = f"{reason}: {error}"
+                raise BiliConnectionError(1, uid, reason) from error
         
         if response.status_code != 200:
             raise BiliStatusCodeError(1, uid, response.status_code)

@@ -156,6 +156,12 @@ class ChatSummaryMixin:
         other_entries: List[Dict[str, Any]] = []
         draw_descs: List[str] = []  # 作画留痕：直接取调用的 tags/nltags 作为历史作画内容摘要（不调 LLM）
         tavily_ai_answers: List[str] = []  # 收集 tavily_search 返回的 AI 摘要
+        failed_anima_calls = set()
+        for msg in tool_messages:
+            if msg.get("role") == "tool" and msg.get("name") == "generate_anima_image":
+                from .llm_tool_plugins.anima_generate import MANGA_IMAGE_FAILED
+                if (msg.get("content") or "").startswith(MANGA_IMAGE_FAILED):
+                    failed_anima_calls.add(msg.get("tool_call_id"))
         for msg in tool_messages:
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
@@ -168,6 +174,8 @@ class ChatSummaryMixin:
                     if name in IGNORED_TOOLS:
                         if isinstance(args, dict):
                             if name == "generate_anima_image":
+                                if tc.get("id") in failed_anima_calls:
+                                    continue
                                 desc_parts = [str(args.get(k)).strip() for k in ("tags", "nltags") if str(args.get(k) or "").strip()]
                                 draw_descs.append("；".join(desc_parts) if desc_parts else "（无画面描述）")
                             else:

@@ -33,6 +33,7 @@ from .openai_func import (
     normalize_reply_separators,
     strip_chat_markdown,
     strip_edge_commas,
+    strip_repeated_manga_text,
     contains_tool_call_xml,
     strip_tool_call_xml,
 )
@@ -638,6 +639,12 @@ def _normalize_reply_segment(text: str) -> str:
     text = _strip_markdown(text)
     text = re.sub(r"\n{2,}", "\n", text)
     return text.strip().strip("*';；").rstrip("。").strip()
+
+
+_MANGA_DRAW_REQUEST = re.compile(
+    r"\bdraw\b|画一?[个张幅只套]|(?:帮我|给我|想看你|请你|麻烦你|试着|能不能)画|改图|重画|来一张|整一张",
+    re.IGNORECASE,
+)
 
 
 # 各种括号配对（含全半角），用于识别"整条被一对括号包围"的噪音分段
@@ -1345,7 +1352,7 @@ async def do_msg_response(
     # 个人印象不再根据触发句中提到的角色逐个列出，而是固定只注入触发者的印象：
     # 由 update_chat_history_row 在触发消息前按需注入一条印象 system，绑定到该轮，
     # 随轮次一同裁剪/摘要，保证一个角色印象只注入一次且历史前缀稳定命中缓存。
-    prompt_template = await chat.get_chat_prompt_template(userid=trigger_userid, chat_type=chat_type, has_draw_request=_has_draw_request)
+    prompt_template = await chat.get_chat_prompt_template(userid=trigger_userid, chat_type=chat_type, has_draw_request=_has_draw_request, trigger_msg=recorded_user_msg)
 
     # 注册 Anima 发送上下文，供后台作画任务完成后直接通过 OneBot 发送图片
     from .llm_tool_plugins import anima_generate
@@ -1409,6 +1416,10 @@ async def do_msg_response(
     # 避免同一触发在回复回调与尾部重复触发 manga_idle_draw 导致连画多张。
     _manga_replies_checked = 0
     _manga_tool_dirty = False
+    manga_mode = anima_generate.current_send_context()["manga_mode"]
+    manga_draw_started = False
+    manga_spoken_parts: List[str] = []
+    manga_lead_in: List[str] = []
 
     # 近期上下文中的发送者昵称集合：用于剥离回复开头的「名字：」说话人前缀
     _speaker_names: Set[str] = set()
@@ -1441,46 +1452,29 @@ async def do_msg_response(
         sent_segments = 0
         _tool_rounds += 1
 
-    def _maybe_manga_autodraw(draw_reqs: List[str], tool_msgs) -> None:
-        """漫画模式自动画图检查（每个回复/每次尾部补查至多执行一次）：
-        有画图请求但该段回复未实际调用画图工具 → 用 mini 模型强制画图兜底，锚定该段请求；
-        否则按空闲策略兜底。两种兜底提交前都 mark_manga_drawn 重置空闲计时，
-        保证同一触发内回复回调与尾部检查不会重复触发（否则一条消息会连画多张）。
-        moss 走的是另一条通道，调用过 generate_moss_image 即视为已画：既不补画，也不触发空闲兜底。"""
-        from .llm_tool_plugins import anima_generate
-        if not anima_generate.get_manga_mode(chat_key):
+    async def _maybe_manga_autodraw(draw_reqs: List[str], tool_msgs) -> None:
+        """在需要补图时等待补图结束，再处理下一条触发消息。"""
+        if not manga_mode or not anima_generate.get_manga_mode(chat_key):
             return
-        # 两个画图工具都算「已画」：MOSS 出手后同样不能再用漫画兜底补一张
-        _DRAW_TOOL_NAMES = {"generate_anima_image", "generate_moss_image"}
-        _moss_drew = False
-        for tm in tool_msgs or []:
-            if isinstance(tm, dict):
-                for tc in tm.get("tool_calls", []) or []:
-                    _name = tc.get("function", {}).get("name") if isinstance(tc, dict) else ""
-                    if _name == "generate_moss_image":
-                        _moss_drew = True
-        if _moss_drew:
-            # MOSS 已经出图：重新计时并直接返回，draw_reqs / 空闲两条兜底都不再触发
+        tool_names = {tm.get("name") for tm in tool_msgs if tm.get("role") == "tool"}
+        if "generate_moss_image" in tool_names:
             anima_generate.mark_manga_drawn(chat_key)
             return
-        if draw_reqs:
-            _drew = False
-            for tm in tool_msgs or []:
-                if isinstance(tm, dict):
-                    for tc in tm.get("tool_calls", []) or []:
-                        if isinstance(tc, dict) and tc.get("function", {}).get("name") in _DRAW_TOOL_NAMES:
-                            _drew = True
-                            break
-            if not _drew:
-                logger.info(f"[漫画强制画图] 群 {chat_key} manga 模式，触发句含画图关键词但该回复未画，强制画图兜底")
-                anima_generate.mark_manga_drawn(chat_key)
-                asyncio.create_task(anima_generate.manga_idle_draw(
-                    chat_key, chat, config, bot,
-                    pending_request="\n".join(draw_reqs),
-                ))
-        elif anima_generate.should_inject_manga_idle(chat_key):
+        if "generate_anima_image" in tool_names:
+            return
+        if draw_reqs or anima_generate.should_inject_manga_idle(chat_key):
+            # 提交前重置补图间隔，失败时也保留冷却。
             anima_generate.mark_manga_drawn(chat_key)
-            asyncio.create_task(anima_generate.manga_idle_draw(chat_key, chat, config, bot))
+            await anima_generate.manga_idle_draw(
+                chat_key, chat, config, request_profile, pending_request="\n".join(draw_reqs),
+            )
+
+    def _manga_image_was_sent(tool_msgs: List[Dict[str, Any]]) -> bool:
+        return any(
+            msg.get("name") == "generate_anima_image"
+            and (msg.get("content") or "").startswith(anima_generate.MANGA_IMAGE_SENT)
+            for msg in tool_msgs if msg.get("role") == "tool"
+        )
 
     async def send_segment(segment: str) -> None:
         nonlocal sent_segments, last_send_time
@@ -1500,6 +1494,8 @@ async def do_msg_response(
         if is_provider_rejection_text(reply_text):
             logger.warning(f"[审核拒绝兜底] 拦截上游拒绝文案分段: {reply_text!r}")
             return
+        if manga_lead_in:
+            reply_text = strip_repeated_manga_text(reply_text, manga_lead_in)
         if not reply_text:
             return
         if re.match(r'^[^\u4e00-\u9fa5\w]{1}$', reply_text):
@@ -1515,6 +1511,8 @@ async def do_msg_response(
         if wait_time > 0:
             await asyncio.sleep(wait_time)
         await matcher.send(f"{reply_prefix}{reply_text}")
+        if manga_mode:
+            manga_spoken_parts.append(reply_text)
         sent_segments += 1
         last_send_time = time.time()
 
@@ -1593,13 +1591,23 @@ async def do_msg_response(
         _tool_called = False
         _tool_rounds = 0
 
+    async def _before_manga_draw() -> None:
+        nonlocal stream_buffer, manga_draw_started, _in_think, _think_buffer
+        if stream_buffer.strip():
+            await _send_buffer_segmented(stream_buffer)
+        stream_buffer = ""
+        _in_think = False
+        _think_buffer = ""
+        manga_draw_started = True
+        manga_lead_in[:] = manga_spoken_parts
+
     async def _on_reply_complete(reply_text: str, reply_tool_messages: List[Dict[str, Any]],
                                  reply_entries: Optional[List[Dict[str, Any]]] = None) -> None:
         """stream_response 逐轮回复完成回调：流式收尾 + 工具图发送 + 落库，每个回复恰好执行一次。
         覆盖因邮箱插入而继续前的回复与整个循环的最终回复。
         reply_entries 为本回复应答的邮箱插入批次（None 表示应答原始触发消息），
         用于漫画兜底画图按批次锚定正确的用户请求。"""
-        nonlocal stream_buffer, _manga_replies_checked, _manga_tool_dirty
+        nonlocal _manga_replies_checked, _manga_tool_dirty, manga_draw_started
         text = sanitize_internal_control_text(reply_text or "")
         text = sanitize_draw_reply_text(text, allow_task_ids=True)
         text, _ = _strip_think_tags(text)
@@ -1609,10 +1617,18 @@ async def do_msg_response(
             text = strip_chat_markdown(text)
         text = strip_edge_commas(_strip_speaker_prefix(text))
         text = text.strip()
-        if not text:
+        image_sent = manga_draw_started and _manga_image_was_sent(reply_tool_messages)
+        if not text and not image_sent:
             return
         # 流式收尾：发送该回复最后一段并重置分段计数器与 _tool_called 等 per-reply 状态
         await _flush_reply_stream_buffer()
+        if manga_draw_started:
+            text = "\n\n".join(manga_spoken_parts)
+            if image_sent and not text:
+                text = "[作画记录] 已发送图片。"
+        manga_draw_started = False
+        manga_lead_in.clear()
+        manga_spoken_parts.clear()
         raw_parts.clear()  # 该回复已落库，失败路径只保留未落库的增量
         # 工具产生的图片（如 pixiv 搜图）随该回复发送
         await _send_tool_image_outputs(chat_key, matcher)
@@ -1664,18 +1680,17 @@ async def do_msg_response(
         )
         # 漫画模式：按回复维度增加轮数计数；本回复的画图兜底检查（每个回复恰好一次）。
         # 锚定本回复应答的请求：原始触发消息，或邮箱插入批次中含画图关键词的新消息。
-        from .llm_tool_plugins import anima_generate
         anima_generate.increment_manga_round(chat_key)
         _manga_replies_checked += 1
         _manga_tool_dirty = False
         if reply_entries is None:
-            _reply_draw_reqs = [f"{sender_name}: {trigger_text}"] if _has_draw_request else []
+            _reply_draw_reqs = [f"{sender_name}: {trigger_text}"] if _MANGA_DRAW_REQUEST.search(trigger_text or "") else []
         else:
             _reply_draw_reqs = [
                 f"{e.get('sender')}: {e.get('raw_text')}" for e in reply_entries
-                if any(kw in str(e.get('raw_text') or '').lower() for kw in _DRAWING_KEYWORDS)
+                if _MANGA_DRAW_REQUEST.search(str(e.get('raw_text') or ''))
             ]
-        _maybe_manga_autodraw(_reply_draw_reqs, reply_tool_messages)
+        await _maybe_manga_autodraw(_reply_draw_reqs, reply_tool_messages)
 
     try:
         # 生成对话结果（含图片 400 重试 + 空响应上下文清理重试）
@@ -1694,6 +1709,7 @@ async def do_msg_response(
                     on_reasoning=on_reasoning_chunk,
                     on_tool_call=_on_tool_call,
                     on_reply_complete=_on_reply_complete,
+                    before_manga_draw=_before_manga_draw,
                 )
             except Exception as e:
                 # 兜底：stream_response 内部一旦自己抛异常（例如错误处理分支里写错），
@@ -1727,7 +1743,8 @@ async def do_msg_response(
 
             # 成功时检查是否含有工具调用 XML 泄漏
             if success:
-                if contains_tool_call_xml(raw_res or "") and _retry < MAX_RETRIES:
+                manga_reply_started = manga_mode and (_manga_replies_checked or manga_draw_started)
+                if not manga_reply_started and contains_tool_call_xml(raw_res or "") and _retry < MAX_RETRIES:
                     logger.warning(f"模型在 content 中输出了工具调用 XML（第 {_retry + 1} 次），清理并重试...")
                     raw_parts.clear()
                     stream_buffer = ""
@@ -1740,6 +1757,10 @@ async def do_msg_response(
                         ),
                     })
                     continue
+                break
+
+            if manga_draw_started:
+                # 图前文字或图片可能已经发出，禁止从头重跑这一轮对话。
                 break
 
             # 空响应（token 超限兜底）：清理上下文后重试一次
@@ -1756,6 +1777,7 @@ async def do_msg_response(
                     chat_type=chat_type,
                     include_images=False,
                     has_draw_request=_has_draw_request,
+                    trigger_msg=recorded_user_msg,
                 )
                 continue
 
@@ -1811,6 +1833,7 @@ async def do_msg_response(
                 chat_type=chat_type,
                 include_images=False,
                 has_draw_request=_has_draw_request,
+                trigger_msg=recorded_user_msg,
             )
 
         # 回复完成日志：成功的回复已由 _on_reply_complete 逐回复各记一次（含 token 统计）；
@@ -1894,6 +1917,10 @@ async def do_msg_response(
                 raw_res_for_save = strip_edge_commas(_strip_speaker_prefix(raw_res_for_save))
                 if is_model_request_error_text(raw_res_for_save):
                     raw_res_for_save = ""
+            if manga_draw_started:
+                raw_res_for_save = "\n\n".join(manga_spoken_parts)
+                if not raw_res_for_save and _manga_image_was_sent(tool_messages):
+                    raw_res_for_save = "[作画记录] 已发送图片。"
             if raw_res_for_save:
                 await chat.update_chat_history_row(sender=chat.preset_key, msg=raw_res_for_save, require_summary=False, record_time=False, is_bot_reply=True)
                 if config.DEBUG_LEVEL > 0:
@@ -1909,6 +1936,9 @@ async def do_msg_response(
                 failure_cost,
                 success,
             )
+            if manga_draw_started and raw_res_for_save:
+                PersistentDataManager.instance.save_to_file()
+                return
             # 上游内容审查拦截（DataInspectionFailed）：openai_func 已按「关流式 → 换摘要模型
             # → 剥离图片」逐级重试，仍不放行才走到这里。不做上下文清理（既不是上下文/参数问题）、
             # 不发审核文案，改发一张随机表情，别让群里干等着。必须放在 400 分支之前，
@@ -1982,11 +2012,10 @@ async def do_msg_response(
         # 各完成的回复已在 _on_reply_complete 逐个检查过，此处仅补查两种漏网情况：
         # 1) 整个循环没有任何完成的回复（全空回复），画图请求尚未被任何检查覆盖；
         # 2) 最近一次回复检查后又发生了新工具调用（最终工具轮无文本，其 tool_calls 未被检查）。
-        from .llm_tool_plugins import anima_generate
-        anima_generate.increment_manga_round(chat_key)
         if _manga_replies_checked == 0 or _manga_tool_dirty:
-            _maybe_manga_autodraw(
-                [f"{sender_name}: {trigger_text}"] if _has_draw_request else [],
+            anima_generate.increment_manga_round(chat_key)
+            await _maybe_manga_autodraw(
+                [f"{sender_name}: {trigger_text}"] if _MANGA_DRAW_REQUEST.search(trigger_text or "") else [],
                 tool_messages,
             )
 
@@ -2000,5 +2029,5 @@ async def do_msg_response(
         await _finalize_chat_task(chat, matcher, chat_type, bot)
         # 注销 Anima 发送上下文
         from .llm_tool_plugins import anima_generate
-        anima_generate.unregister_send_context(chat_key)
+        anima_generate.unregister_send_context()
 

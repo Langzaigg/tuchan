@@ -100,8 +100,9 @@ def enable_anima_tool() -> bool:
     default_schema = anima_generate.get_schema(anima_generate.get_default_model())
     if default_schema and "generate_anima_image" not in TOOL_REGISTRY:
         TOOL_REGISTRY["generate_anima_image"] = (default_schema, anima_generate.run)
-        # 提示词反推工具随画图功能一起注册（参考图作画的前置步骤）
-        TOOL_REGISTRY["anima_reverse_tag"] = (anima_reverse_tag.schema, anima_reverse_tag.run)
+        # 提示词反推工具已暂时停用（2026-11，使用频率低；恢复时取消下一行注释即可，
+        # 并同步还原 get_draw_s1_rules 的参考图规则文案）
+        # TOOL_REGISTRY["anima_reverse_tag"] = (anima_reverse_tag.schema, anima_reverse_tag.run)
         return True
     return False
 

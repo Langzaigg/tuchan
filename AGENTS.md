@@ -112,7 +112,7 @@ data/                                         # 运行数据，勿直接编辑�
 
 ## 图片与视觉
 
-- 图片留在原消息，不搬到触发句；文本使用 `[图片N]`，可见编号表经 `chat._visible_images` → `tg._visible_images` 供 vision、AnimeTrace、反推和 MOSS 使用。
+- 图片留在原消息，不搬到触发句；文本使用 `[图片N]`，可见编号表经 `chat._visible_images` → `tg._visible_images` 供 vision、AnimeTrace 和 MOSS 使用（anima_reverse_tag 反推已于 2026-11 暂时停用）。
 - 触发消息图片始终可见。历史图片有过期时间，非触发来源只取最近两条消息；超过 `MULTIMODAL_MAX_IMAGES` 时优先保留触发图，无触发图则保留最新历史图。
 - `multimodal: false` 只剥请求中的 image_url，不破坏编号表；纯文本模型可通过 `vision` 获取文字描述。
 - 公开 HTTP 图片优先直传；QQ 私有域、内网及视觉/识图工具使用 base64。下载失败不回退坏 URL。
@@ -131,7 +131,7 @@ data/                                         # 运行数据，勿直接编辑�
 
 - `tavily_search` 是唯一搜索 schema，失败时内部回退博查。外部事实不确定时先搜索再回答。
 - `browse_url` 按短链、SSR、Playwright、正文抽取等既有链路降级。小红书桌面/移动页面使用各自 UA，保留 `xsec_token`；配图经 `into_context` 注入，视频字幕失败不影响正文。
-- AnimeTrace、提示词反推、vision 都按可见编号取图。用户要求参考图作画时先 `anima_reverse_tag`，再结合原图和需求生成。
+- AnimeTrace、vision 都按可见编号取图。`anima_reverse_tag` 反推工具已暂时停用（`llm_tool_plugins/__init__.py` 注释掉注册，恢复时同步还原 `get_draw_s1_rules` 文案）；参考图作画直接综合原图与用户需求调 generate_anima_image。
 - **Anima**：启动动态拉取工作流和知识，`rg draw` 管理模式；任务编号必须告知，预计时间只顺带提及。漫画模式可使用 mini 模型空闲补画。
 - **MOSS**：主模型只提供成品 `idea` 和参考/改图编号，`model_mini` 独立生成 Layout/tag 并提交。工具常驻暴露，群内开关和 `rg moss` 指令见 matcher。
 - MOSS 参考图在任何 await 前快照编号，按任务独立落盘。改图走 VAE，固定 `edit_denoise=0.70`、步数至少 6；不要用 1.0，也不要靠放大分辨率解决文字问题。

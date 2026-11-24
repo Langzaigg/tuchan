@@ -7,8 +7,7 @@
 - 真正的提示词由摘要模型（profile.model_mini）在 MOSS 专属画图知识（/moss/knowledge）
   下独立编写，写完直接调 /moss/generate 出图。MOSS 的 Layout JSON / tag 体系因此不会
   进入主模型上下文，避免污染主模型（用户明确要求的边界）。
-- 触发面很窄：仅当触发句提到 moss 时 get_tool_schemas 才暴露本工具，run() 再用
-  ContextVar 二次校验；另外支持 `moss <画面描述>` 指令直接作画（不经主模型）。
+- 聊天里的调用时机由会话对应的 schema 约束。`rg moss <画面描述>` 可以直接作画，不经主模型。
 - 参考图：从 [图片N] 编号取图 → 经 image_cache 规范化后落盘（ComfyUI 与本机同机时
   传绝对路径，上游会按内容哈希复制进 input 目录）→ 作为 reference_images 送 MOSS
   文本编码器的视觉分支（Picture 1..N，最多 4 张）。
@@ -199,6 +198,16 @@ def _is_local_service() -> bool:
 # 主模型可见的 schema（刻意精简：不含任何 MOSS 提示词知识）
 # =========================
 
+_MOSS_TOOL_GUIDE = (
+    "你只需要把画面构思交给它：画谁/画什么、在做什么、场景与气氛；"
+    "不要写 tag 串、不要写排版坐标/JSON、不要自己编造提示词——MOSS 的提示词由后台专门的模型按它的画图知识独立撰写。"
+    "用户发图要求参考/照着画时，把图片编号填进 reference_images。"
+    "用户要求改已有图（p图、换装、换表情、改背景、把图里某人/某个名字/头像/文字换成别的、保留原构图）时填 edit_image，"
+    "它走 VAE 潜空间、保持原图宽高比，比 reference_images 贴近原图得多；"
+    "reference_images 是「照着这个画一张新的」，edit_image 是「在这张上改」。"
+    "图片生成完成后会自动发送，不要只回复文字而不调用工具。"
+)
+
 schema = {
     "type": "function",
     "function": {
@@ -208,13 +217,7 @@ schema = {
             "用户提到 moss（如「用moss画」「moss 画一张」）时调用；"
             "用户需要画面里出现准确文字、分格漫画、海报级排版或精确构图时也调用。"
             "普通插画、随手画图请求优先用 generate_anima_image。"
-            "你只需要把画面构思交给它：画谁/画什么、在做什么、场景与气氛；"
-            "不要写 tag 串、不要写排版坐标/JSON、不要自己编造提示词——MOSS 的提示词由后台专门的模型按它的画图知识独立撰写。"
-            "用户发图要求参考/照着画时，把图片编号填进 reference_images。"
-            "用户要求改已有图（p图、换装、换表情、改背景、把图里某人/某个名字/头像/文字换成别的、保留原构图）时填 edit_image，"
-            "它走 VAE 潜空间、保持原图宽高比，比 reference_images 贴近原图得多；"
-            "reference_images 是「照着这个画一张新的」，edit_image 是「在这张上改」。"
-            "图片生成完成后会自动发送，不要只回复文字而不调用工具。"
+            + _MOSS_TOOL_GUIDE
         ),
         "parameters": {
             "type": "object",
@@ -251,6 +254,14 @@ schema = {
         },
     },
 }
+
+
+def get_manga_tool_schema() -> Dict[str, Any]:
+    """漫画模式使用独立的调用说明，保留 MOSS 的参数和后台出图方式。"""
+    from .anima_generate import MANGA_MOSS_TRIGGER_RULE
+
+    description = "MOSS 异步画图。" + MANGA_MOSS_TRIGGER_RULE + _MOSS_TOOL_GUIDE
+    return {**schema, "function": {**schema["function"], "description": description}}
 
 
 # =========================

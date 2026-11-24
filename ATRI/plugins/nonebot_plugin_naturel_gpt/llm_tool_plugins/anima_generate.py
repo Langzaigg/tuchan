@@ -126,30 +126,32 @@ def get_default_model() -> str:
 # auto:  仅在用户消息含画图关键词时注入工具（默认）
 # off:   关闭
 
-# 漫画模式规则（开启时追加到 turbo knowledge 末尾）
+# 漫画模式规则（开启时追加到默认工作流的 schema description）
 MANGA_RULES = (
     "## 漫画模式规则\n"
-    "- 你拥有画图能力，应该积极主动地调用 generate_anima_image。把画图当作你表达自己的主要方式，就像真人聊天发表情包/图片一样自然。\n"
-    "- 不需要等待用户发出画图指令，你应该主动寻找画图的机会。几乎每轮对话都可以尝试画点什么。\n"
-    "- 画图时不需要在回复中描述画面细节或生成任务编号，直接调用工具即可。工具调用后图片会自动发送。\n"
-    "- 调用画图工具前后不要声明自己正在画图（如「我来画一个」「等我画一下」「在画了」「好了画完了」），图片会自动发出，直接继续正常对话即可。\n"
-    "- 调用画图工具时不要重复已经说过的话。如果要调用工具，先把话说完再调用，或者调用完后继续说新内容，不要复读。\n"
-    "- 使用英文自然语言描述 tags，注重场景氛围和角色情感表达。tags 应包含场景描述、角色动作/表情、环境氛围、光影效果等元素。\n"
-    "- 如果存在「自定义画风」设定，必须在每次画图的 tags 中融入该画风风格，确保所有图片保持统一的画风。\n"
-    "\n"
-    "### 应该画图的情况（包括但不限于）\n"
-    "- 用户打招呼/夸你/骂你/调侃/发有趣内容时 → 画你相应的表情反应（开心、害羞、委屈、无语等）\n"
-    "- 用户提到食物/地点/天气/游戏/动漫时 → 画你在对应场景中的状态\n"
-    "- 用户累了/难过了/开心了/说正事时 → 画你关心、倾听或一起讨论的姿态\n"
-    "- 讲故事/描述场景/表达观点时 → 画对应的画面或你的肢体语言\n"
-    "- 用户发了图片/问你在干嘛/对话告一段落时 → 画你的反应或收尾画面\n"
-    "- 任何你觉得「这里画一张会很有趣」的时刻\n"
-    "- 可以画自己的表情神态，如微笑、思考、发呆、打哈欠、伸懒腰等日常状态\n"
-    "\n"
-    "### 画图的尺度\n"
-    "- 平均 2-4 句话画一次是比较自然的频率，不要连续每句都画，也不要太保守。\n"
-    "- 刚画过可以间隔几轮，但对话变化快时随时可以画。简单的回应（嗯、好的、哈哈）可以不画。"
+    "- 明确的作画请求优先按用户要求调用工具。闲聊中可把图片当作表情或动作来用，例如忍笑、歪头、伸懒腰、递杯热茶。"
+    "当一个神态或动作比说出来更能接住情绪或包袱时，直接让图片承担这部分表达。\n"
+    "- 群友互动只在当前话题有具体互动可画时配图，例如递东西、击掌或一起参与正在聊的场景。"
+    "只画相关的人，群友的外观用已提供的参考或人设，缺少资料时可用背影、手部或视角表现。\n"
+    "- 简单问答和已经用一句话说清的回应照常聊天。主动配图一张就够，不必为每条消息找画面。\n"
+    "- 把画面插在自然停顿处。图前有话就说完整，图承担动作、神态或笑点，出图后接当前话题中还没说的部分。"
+    "不播报画图进度或任务编号，不复述图前的话，也不把画面再用文字讲一遍。\n"
+    "- 使用英文自然语言描述 tags，重点写清角色、动作、表情与场景；有自定义画风时融入画风设定。"
 )
+
+MANGA_MOSS_TRIGGER_RULE = (
+    "漫画模式只在当前用户点名用 MOSS 作画，或成图需要复杂配字时调用 generate_moss_image。"
+    "复杂配字包括多句气泡对白、多个指定位置的文字区，以及需要准确排版的标题与正文。"
+    "普通插画、动作神态、群友互动、无字分格和简单配字用 generate_anima_image。"
+)
+
+MANGA_IMAGE_SENT = "漫画图片已发送。"
+MANGA_IMAGE_FAILED = "漫画图片未发送。"
+_DRAW_CONTENT_FIELDS = ("character", "appearance", "nltags", "artist", "series", "tags", "style", "environment")
+
+
+def _has_drawing_content(args: Any) -> bool:
+    return isinstance(args, dict) and any(args.get(field) for field in _DRAW_CONTENT_FIELDS)
 
 # 漫画模式解锁内容限制规则（UNLOCK_CONTENT_LIMIT 开启时追加）
 MANGA_UNLOCK_RULES = (
@@ -343,8 +345,8 @@ def should_inject_manga_idle(chat_key: str) -> bool:
     return time_exceeded or rounds_exceeded
 
 
-async def manga_idle_draw(chat_key: str, chat, config, bot=None, pending_request: str = "") -> None:
-    """漫画模式下超过 5 分钟未画图时，用 mini 模型生成一张画；pending_request 非空时严格按该未完成的用户请求画"""
+async def manga_idle_draw(chat_key: str, chat, config, request_profile, pending_request: str = "") -> None:
+    """用 mini 模型补做用户请求或绘制机器人的当前场景。"""
     try:
         from ..openai_func import TextGenerator
         from ..llm_tools import get_tool_schemas, execute_tool
@@ -417,11 +419,9 @@ async def manga_idle_draw(chat_key: str, chat, config, bot=None, pending_request
             {"role": "system", "content": f"你正在以第一人称扮演指定角色参与聊天。\n[角色设定]\n{persona}"},
             {"role": "system", "content": f"[你的漫画技能]\n{manga_knowledge}"},
             {"role": "system", "content": (
-                "请根据当前对话内容和角色设定，通过 tool_calls 调用 generate_anima_image 来展现一个合适的场景。"
-                "可以画你的神态动作、用户的请求内容、或你和用户的互动场景，根据上下文灵活决定。"
-                "如果最近对话中有用户明确提出的画图请求还没被画出来，必须优先严格按照该请求的画面来画，不得自由发挥成无关内容。"
-                "选择能体现当前对话氛围的画面，使用英文自然语言描述 tags。"
-                "只需要调用工具，不需要输出其他文字内容。"
+                "本轮必须生成一张图。按当前用户明确的作画意图出图，保留用户指定的角色、动作与场景。"
+                "没有明确作画请求时，画符合最近对话的机器人动作、神态或具体互动。对话信息少时，画当前角色自然的日常状态。"
+                "只调用一次 generate_anima_image，使用英文自然语言描述 tags。"
             )},
         ]
         if memory_text:
@@ -433,21 +433,21 @@ async def manga_idle_draw(chat_key: str, chat, config, bot=None, pending_request
             messages.append({"role": "system", "content": history_text})
         if pending_request:
             messages.append({"role": "system", "content": (
-                f"[未完成的画图请求]\n{pending_request}\n"
-                "以上是用户刚才明确提出但还没画出来的画图请求。本次必须严格按照该请求的画面调用 generate_anima_image，"
-                "如实描述用户要求的角色、服装、动作和场景，不得替换成无关画面。"
+                f"[待判断的作画请求]\n{pending_request}\n"
+                "如果用户在上面明确请你作画，按要求调用 generate_anima_image，保留用户指定的角色、动作和场景。"
+                "如果只是聊到画画或作品，按当前对话画机器人的场景。"
             )})
         messages.append({"role": "user", "content": "[系统自动触发画图]"})
         
         # 获取 mini 模型配置
-        request_state = tg._request_state()
+        request_state = tg._request_state(request_profile)
         request_config = request_state.get("config", {})
         model_mini = request_config.get("model_mini", "") or request_config.get("model", "")
         
         if not model_mini:
             return
         
-        # 构建 kwargs（不用 tool_choice，thinking 模式不支持）
+        # 仅把 Anima 暴露给 mini 模型。
         kwargs = {
             "model": model_mini,
             "messages": messages,
@@ -461,10 +461,6 @@ async def manga_idle_draw(chat_key: str, chat, config, bot=None, pending_request
         if request_state.get("proxy"):
             kwargs["proxy"] = request_state["proxy"]
         
-        # 直接调用 API
-        response = await tg._request_openai_compatible(kwargs)
-        
-        # 准备日志数据
         log_data = {
             "chat_key": chat_key,
             "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -476,50 +472,54 @@ async def manga_idle_draw(chat_key: str, chat, config, bot=None, pending_request
             "tool_calls": [],
         }
         
-        if not response:
-            log_data["error"] = "API 返回空响应"
-            _save_manga_draw_log(chat_key, log_data)
-            return
-        
-        # 解析 tool_calls
-        choices = response.get("choices", [])
-        if not choices:
-            log_data["error"] = "API 无返回 choices"
-            log_data["response"] = response
-            _save_manga_draw_log(chat_key, log_data)
-            return
-        
-        message = choices[0].get("message", {})
-        tool_calls = message.get("tool_calls", [])
-        log_data["response"] = message.get("content", "")
-        
-        for tc in tool_calls:
+        draw_tool = "generate_anima_image"
+        tool_choice = {"type": "function", "function": {"name": draw_tool}}
+        try:
+            response = await tg._request_openai_compatible({**kwargs, "tool_choice": tool_choice})
+        except RuntimeError as e:
+            error = str(e).lower()
+            if not error.startswith(("http 400:", "http 422:")) or not any(
+                keyword in error for keyword in ("tool_choice", "tool choice", "thinking", "function calling")
+            ):
+                raise
+            response = {}
+
+        choices = (response or {}).get("choices") or []
+        message = choices[0].get("message", {}) if choices else {}
+        args = {}
+        for tc in message.get("tool_calls") or []:
             func = tc.get("function", {})
-            if func.get("name") == "generate_anima_image":
+            if func.get("name") == draw_tool:
                 try:
                     args = json.loads(func.get("arguments", "{}"))
-                except json.JSONDecodeError:
-                    args = {}
-                
-                log_data["tool_calls"].append({"function": "generate_anima_image", "arguments": args})
-                
-                if args:
-                    # 注册发送上下文供工具使用
-                    chat_type, chat_id = chat_key.split("_", 1) if "_" in chat_key else ("group", chat_key)
-                    register_send_context(
-                        chat_key=chat_key,
-                        bot_id=str(bot.self_id) if bot else "",
-                        group_id=chat_id if chat_type == "group" else None,
-                        user_id=chat_id if chat_type == "private" else None,
-                    )
-                    result, _ = await execute_tool("generate_anima_image", args, config)
-                    log_data["success"] = True
-                    log_data["tool_result"] = result
-                    if pending_request:
-                        logger.info(f"[漫画自动画图] 群 {chat_key} 强制画图兜底（未完成的画图请求），已调用画图工具 | 请求: {pending_request[:60]}")
-                    else:
-                        logger.info(f"[漫画自动画图] 群 {chat_key} 空闲触发（{getattr(config, 'MANGA_IDLE_MINUTES', 5)}分钟无画图），已自动调用画图工具")
-        
+                except (TypeError, ValueError):
+                    continue
+                if _has_drawing_content(args):
+                    break
+
+        if not _has_drawing_content(args):
+            # 部分 thinking 端点拒绝强制工具。让 mini 直接生成英文作画提示词，再由程序提交。
+            manga_style = get_manga_style(chat_key)
+            tags_instruction = "[系统自动触发画图] 按上面的要求构思一张图。直接输出可交给 Anima 的英文画面提示词，只写角色外观、动作、表情与环境描述。"
+            if manga_style:
+                tags_instruction += f"\n融入此画风：{manga_style}"
+            tags_request = {
+                **kwargs, "tools": [],
+                "messages": [*messages[:-1], {"role": "user", "content": tags_instruction}],
+            }
+            response = await tg._request_openai_compatible(tags_request)
+            choices = (response or {}).get("choices") or []
+            message = choices[0].get("message", {}) if choices else {}
+            tags = str(message.get("content") or "").strip()
+            if tags:
+                args = {"tags": tags}
+
+        log_data["response"] = message.get("content", "")
+        if _has_drawing_content(args) and get_manga_mode(chat_key):
+            log_data["tool_calls"].append({"function": draw_tool, "arguments": args})
+            result, _ = await execute_tool(draw_tool, args, config)
+            log_data["success"] = result.startswith(MANGA_IMAGE_SENT)
+            log_data["tool_result"] = result
         _save_manga_draw_log(chat_key, log_data)
         
     except Exception as e:
@@ -557,25 +557,19 @@ def register_send_context(chat_key: str, bot_id: str, group_id: Optional[str] = 
         "bot_id": bot_id,
         "group_id": group_id,
         "user_id": user_id,
+        "manga_mode": get_manga_mode(chat_key),
     }
 
 
 def current_send_context() -> Dict[str, Any]:
-    """当前请求的发送上下文（chat_key / bot_id / group_id / user_id），无则空 dict。
+    """当前请求的发送上下文及漫画模式快照，无则空 dict。
     其他画图通道（MOSS）复用同一份会话信息，避免各自维护一份 Task 映射。"""
     return dict(_send_context.get(asyncio.current_task(), {}))
 
 
-def unregister_send_context(chat_key: str) -> None:
-    """注销发送上下文。由 matcher 在请求结束后调用。
-    遍历找到匹配 chat_key 的条目删除（因为 key 是 Task 对象）。"""
-    to_remove = None
-    for task, ctx in _send_context.items():
-        if ctx.get("chat_key") == chat_key:
-            to_remove = task
-            break
-    if to_remove is not None:
-        del _send_context[to_remove]
+def unregister_send_context() -> None:
+    """释放当前回复任务的发送上下文。"""
+    _send_context.pop(asyncio.current_task(), None)
 
 
 def health_check_sync() -> Tuple[bool, str]:
@@ -705,17 +699,26 @@ _COMMON_DRAW_RULES = (
 def get_draw_s1_rules(is_manga: bool) -> str:
     """S1 工具段的画图行为短规则（常驻注入，条件：本群画图工具实际可用，即 draw_mode != "off" 或漫画模式）。
     只保留行为约束；参数文档类内容在 generate_anima_image 的 schema description 内。"""
-    rules = ""
-    if not is_manga:
-        # 漫画模式的主动画图由 schema description 末尾的 MANGA_RULES 约束，不下发本条
-        rules += "仅当用户明确要求作画（画/来一张/draw/改图/重画等）时才调用 generate_anima_image，普通闲聊不要主动画图。\n"
-    rules += (
+    rules = (
         "调用 generate_anima_image 必须走 tool_calls，只在文字里说「在画了」不算画画；任务编号只能由工具返回，禁止编造，等工具返回后再引用编号。\n"
         "历史消息中的「在画了」「等出图」是上一轮的结果，每次新的作画请求必须重新调用工具。\n"
-        "用户发图要求参考/照着某张图作画时，先调 anima_reverse_tag 反推该图标签，再综合反推结果、图片本身和用户需求调 generate_anima_image。\n"
+        # 反推工具已停用（2026-11，参考图直接按看到的画面作画；恢复时同时还原 enable_anima_tool 的注册）
+        "选用 Anima 参考用户发的图时，直接综合图片本身和用户需求调 generate_anima_image，不要在回复里说要去反推标签。\n"
         "人称对应：用户消息里的「我」指这条消息的发送者本人，「你」才指你（当前角色），画谁不要搞反。\n"
-        "调用画图工具前不做画面描述，调用后用第一人称自然描述，不提及工具或系统；用户提出修改意见时立即重新调用。\n"
     )
+    if is_manga:
+        rules += (
+            MANGA_MOSS_TRIGGER_RULE + "\n"
+            "把 Anima 图片放在回复中自然停顿的位置，用图表达自己的动作、神态或当前话题里的具体互动。"
+            "工具会等到图片发送后才返回结果。续接图前的话题，只说还没说的新内容；有图就够时直接结束。"
+            "主动配图失败时照常接话，用户明确要求的图片没发出时简短说明。\n"
+        )
+    else:
+        rules += (
+            "用户明确请求时按要求作画。当前话题有适合用图片表现的动作、神态或具体互动时，也可主动调用 Anima 配图。\n"
+            "调用画图工具前不做画面描述，调用后用第一人称自然描述，不提及工具或系统。\n"
+        )
+    rules += "用户提出修改意见时立即重新调用。\n"
     return "[画图规则]\n" + rules
 
 
@@ -860,8 +863,8 @@ def _enhance_schema(schema_data: Dict[str, Any], knowledge: str = "") -> Dict[st
     data = dict(schema_data)
     original_desc = data.get("description", "")
     desc = (
-        "画图工具。仅当用户明确要求作画（画/画一个/draw/改图/重画等）时调用（漫画模式下可按漫画规则主动调用），"
-        "普通闲聊不要主动画图；调用时必须通过 tool_calls，禁止只发文字不调用。"
+        "画图工具。按用户明确请求作画，也可在当前话题适合用图片表达时主动配图。"
+        "调用时必须通过 tool_calls，禁止只发文字不调用。"
         "任务编号只能由工具返回，禁止编造。"
         + (f" {original_desc}" if original_desc else "")
     )
@@ -876,17 +879,14 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
     base_url = getattr(config, "COMFYUI_BASE_URL", "http://127.0.0.1:8188")
     set_base_url(base_url)
 
-    # 校验参数：至少需要一个有效字段（character / appearance / nltags / artist / series / tags / style / environment）
-    _meaningful_keys = ("character", "appearance", "nltags", "artist", "series", "tags", "style", "environment")
-    if not args or not any(args.get(k) for k in _meaningful_keys):
-        return "参数为空，无法生成图片。请根据用户描述提供作画参数，然后重新调用工具。", []
-
-    current_task = asyncio.current_task()
-    send_ctx = dict(_send_context.get(current_task, {}))
-
-    # 判断是否漫画模式（漫画模式使用默认工作流）
+    send_ctx = current_send_context()
     chat_key = send_ctx.get("chat_key", "")
-    is_manga = get_manga_mode(chat_key) if chat_key else False
+    is_manga = bool(send_ctx.get("manga_mode"))
+
+    if not _has_drawing_content(args):
+        prefix = MANGA_IMAGE_FAILED if is_manga else ""
+        return prefix + "参数为空，无法生成图片。请根据用户描述提供作画参数，然后重新调用工具。", []
+
     # 确定画图模型：漫画模式用动态选择的默认工作流（首选 fuse），否则用会话所选模型
     model = get_default_model() if is_manga else (get_draw_model(chat_key) if chat_key else get_default_model())
     mc = MODEL_CONFIG.get(model) or MODEL_CONFIG[get_default_model()]
@@ -894,7 +894,6 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
     # 参数字段不再按工作流做硬编码映射，透传给上游（字段集以各工作流 schema 为准）
     args_for_api = dict(args)
 
-    positive_desc = _build_positive(args_for_api)
     steps = args_for_api.get("steps") or mc["default_steps"]
 
     # 尝试查询队列状态
@@ -908,7 +907,7 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
             content = (
                 f"当前画图队列繁忙（{qlen} 个任务，预计等待 {mins} 分钟），请稍后再试。"
             )
-            return content, []
+            return (MANGA_IMAGE_FAILED + content if is_manga else content), []
         # 队列正常，后端返回的时长已包含当前任务耗时
         est_seconds = queue_info.get("estimated_remaining_seconds", 60)
         # 计算预计生成时间：当前图片预计生成时间 + n*一分半 - 30秒
@@ -925,27 +924,23 @@ async def run(args: Dict[str, Any], config) -> Tuple[str, List[Dict[str, Any]]]:
         est_seconds = mc.get("est_seconds") or int(60 + (int(steps) - 35) * 1.5)
         est_minutes = max(1, round(est_seconds / 60))
 
-    # 生成随机的6位字母数字任务编号
-    task_id = _generate_task_id()
-
-    # 保存提示词到数据库（漫画模式不保存）
-    if not is_manga:
-        from ..draw_db import save_prompt
-        save_prompt(task_id, args)
-
     if is_manga:
-        # 漫画模式：图片会自动发送，模型不需要告知任务编号或描述画面
-        content = "图片正在生成中，会自动发送。不要重复之前说过的内容，继续正常对话。"
-        mark_manga_drawn(chat_key)  # 记录画图时间
-    else:
-        content = (
-            f"你正在画一幅插画：{positive_desc}。任务编号：{task_id}，预计{est_seconds}秒完成。"
-            f"任务编号必须告知用户，这是确认任务已成功提交的唯一凭证；预计时间顺带提一句就够，不要每次都说「X秒出图、画好会自动发给你」。"
-            f"用第一人称自然地告诉用户你正在作画，不要提到工具或系统。"
-            f"注意：调用工具前不要对画面做出描述；调用后描述画面一两句即可，只讲最值得说的点，不复述用户已经提过的细节。"
-        )
+        sent = await _do_generate(args_for_api, send_ctx, model=model, is_manga=True)
+        if sent:
+            mark_manga_drawn(chat_key)
+            return MANGA_IMAGE_SENT + "接着回应图前的话题，只说还没说的新内容，不复述已经发出的文字或画面；说完即可结束。", []
+        return MANGA_IMAGE_FAILED + "图片生成或发送失败。继续当前对话，不要声称图片已发出。", []
 
-    _schedule_bg(_do_generate(args_for_api, config, send_ctx, task_id, timeout=600, model=model, is_manga=is_manga))
+    from ..draw_db import save_prompt
+    task_id = _generate_task_id()
+    save_prompt(task_id, args)
+    content = (
+        f"你正在画一幅插画：{_build_positive(args_for_api)}。任务编号：{task_id}，预计{est_seconds}秒完成。"
+        f"任务编号必须告知用户，这是确认任务已成功提交的唯一凭证；预计时间顺带提一句就够，不要每次都说「X秒出图、画好会自动发给你」。"
+        f"用第一人称自然地告诉用户你正在作画，不要提到工具或系统。"
+        f"注意：调用工具前不要对画面做出描述；调用后描述画面一两句即可，只讲最值得说的点，不复述用户已经提过的细节。"
+    )
+    _schedule_bg(_do_generate(args_for_api, send_ctx, task_id, model=model))
     return content, []
 
 
@@ -978,8 +973,9 @@ async def _check_queue(steps: int) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def _do_generate(args: Dict[str, Any], config, send_ctx: Optional[Dict[str, Any]] = None, task_id: str = "", timeout: int = 600, model: str = "", is_manga: bool = False) -> None:
-    """后台执行生成，完成后通过 OneBot 直接发送图片。"""
+async def _do_generate(args: Dict[str, Any], send_ctx: Dict[str, Any], task_id: str = "", timeout: int = 600, model: str = "", is_manga: bool = False) -> int:
+    """生成并发送图片，返回发送成功的张数。"""
+    sent_count = 0
     try:
         # 统一主端点：POST /anima/generate，body 顶层带 workflow 字段
         if model not in MODEL_CONFIG:
@@ -989,12 +985,12 @@ async def _do_generate(args: Dict[str, Any], config, send_ctx: Optional[Dict[str
         data = await _request(mc["endpoint"], method="POST", json=payload, timeout=timeout)
         if not data.get("success"):
             logger.warning(f"Anima 后台生成失败: {data}")
-            return
+            return 0
 
         images = data.get("images", [])
         if not images:
             logger.warning("Anima 后台生成成功但未返回图片")
-            return
+            return 0
 
         prompt_text = data.get("positive", "")
         seed = data.get("seed")
@@ -1015,7 +1011,9 @@ async def _do_generate(args: Dict[str, Any], config, send_ctx: Optional[Dict[str
             # 漫画模式不拼接任务编号，普通模式拼接
             task_info = "" if is_manga else (f"任务编号：{task_id}" if task_id else "")
             sent = await _send_image_with_ctx(send_ctx, image_url, prompt_text, task_info)
-            if not sent:
+            if sent:
+                sent_count += 1
+            elif not is_manga:
                 _pending_results.append({
                     "type": "image",
                     "url": image_url,
@@ -1028,8 +1026,9 @@ async def _do_generate(args: Dict[str, Any], config, send_ctx: Optional[Dict[str
                     "task_id": task_id,
                 })
                 logger.warning(f"Anima 图片 {i+1} 直接发送失败，已存入 pending 队列等待兜底消费")
-    except Exception as e:
-        logger.exception("Anima 后台生成任务失败")
+    except Exception:
+        logger.exception("Anima 生成或发送图片失败")
+    return sent_count
 
 
 async def _send_image_with_ctx(send_ctx: Optional[Dict[str, Any]], image_url: Optional[str], prompt_text: str = "", task_info: str = "") -> bool:
