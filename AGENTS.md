@@ -71,6 +71,7 @@ data/                                         # 运行数据，勿直接编辑�
 - key 每次从索引 0 开始，仅跳过冷却或本请求已试过的 key；禁止粘性轮询。视觉 key 使用独立 scope。
 - 仅鉴权、额度、限流等 key 级错误（通常 401/402/403/429）顺延；参数错误、超时、上下文或图片问题不得换 key。
 - 瞬时网络/网关故障在当前轮内原样重试，已有文字或工具副作用时不得重试。不要移到 matcher 外层重放整个工具循环。
+- 流式超时两层计时：首 token 30s 无任何 chunk 判上游挂起（`FirstTokenTimeoutError`）；思考阶段保底为 profile `timeout`（含 reasoning，自请求起算），正文或 tool_calls 一开始输出即停表（`ThinkPhaseTimeoutError`）。两者均走瞬时错误原样重试。
 - 异常分类文本必须包含 `e.__class__.__name__`，不能依赖可能为空的 `str(e)`；相关函数有形参 `type`，禁止误写 `type(e)`。
 - 图片 400：公开 URL 直传失败后原位转 base64 一次，再剥图重试；拉图超时可在当前轮静默剥图。网络类图片失败不清理历史。
 - 内容审查依次尝试：同模型关流式 → 换 `model_mini`（保留图）→ 恢复原模型并剥图 → 失败兜底。审查失败不得清上下文。
@@ -131,7 +132,7 @@ data/                                         # 运行数据，勿直接编辑�
 
 - `tavily_search` 是唯一搜索 schema，失败时内部回退博查。外部事实不确定时先搜索再回答。
 - `browse_url` 按短链、SSR、Playwright、正文抽取等既有链路降级。小红书桌面/移动页面使用各自 UA，保留 `xsec_token`；配图经 `into_context` 注入，视频字幕失败不影响正文。
-- AnimeTrace、vision 都按可见编号取图。`anima_reverse_tag` 反推工具已暂时停用（`llm_tool_plugins/__init__.py` 注释掉注册，恢复时同步还原 `get_draw_s1_rules` 文案）；参考图作画直接综合原图与用户需求调 generate_anima_image。
+- AnimeTrace、vision 都按可见编号取图。`anima_reverse_tag` 反推工具已暂时停用（`llm_tool_plugins/__init__.py` 注释掉注册，恢复时取消注释即可）。反推的使用指引只写在该工具自身的 schema description 里，S1/AGENTS 等外部文案一律不提反推，启停完全由注册开关控制。
 - **Anima**：启动动态拉取工作流和知识，`rg draw` 管理模式；任务编号必须告知，预计时间只顺带提及。漫画模式可使用 mini 模型空闲补画。
 - **MOSS**：主模型只提供成品 `idea` 和参考/改图编号，`model_mini` 独立生成 Layout/tag 并提交。工具常驻暴露，群内开关和 `rg moss` 指令见 matcher。
 - MOSS 参考图在任何 await 前快照编号，按任务独立落盘。改图走 VAE，固定 `edit_denoise=0.70`、步数至少 6；不要用 1.0，也不要靠放大分辨率解决文字问题。

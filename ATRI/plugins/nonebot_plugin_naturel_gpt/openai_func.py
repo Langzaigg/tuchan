@@ -246,6 +246,19 @@ _TRANSIENT_UPSTREAM_TEXT_MARKERS = (
 # 同一轮请求的瞬时错误重试退避（共 len() 次）：先等一下看是否抖过去，第二次拉长到 5s
 _TRANSIENT_RETRY_DELAYS = (1.5, 5.0)
 
+
+class FirstTokenTimeoutError(RuntimeError):
+    """流式首 token 超时（默认 30s 内无任何 chunk）：判为上游挂起，走瞬时错误原样重试。"""
+
+
+class ThinkPhaseTimeoutError(RuntimeError):
+    """思考阶段保底超时（含 reasoning，默认取 profile timeout）：正文/工具输出开始即停表。
+    超时后同样按瞬时错误原样重试——此时尚无任何对外副作用。"""
+
+
+# 流式首 token 超时（秒）：超过则判定上游挂起，原样重发本轮
+FIRST_TOKEN_TIMEOUT_SECONDS = 30.0
+
 # 内容审查拦截的降级阶梯（见 stream_response 的 except 分支）：
 #   ① 保留图片，改走**本群 profile 的 `model_mini`（摘要模型）**重试本轮——审查按上游/路由生效，
 #      mini 模型通常落在另一条通道上，换过去就有机会放行（不写死模型名，随各群 profile 走）；
@@ -1554,7 +1567,41 @@ class TextGenerator(Singleton["TextGenerator"]):
             stream_iter = self._stream_iter_gemini(kwargs, gemini_sig)
         else:
             stream_iter = self._stream_iter_openai(kwargs)
-        async for chunk in stream_iter:
+        # 流式超时语义（2026-11）：两层计时，正文/工具输出开始即全部停表——
+        # 1) 首 token：FIRST_TOKEN_TIMEOUT_SECONDS 内无任何 chunk → 首 token 超时；
+        # 2) 思考阶段保底：自请求起算累计不超过 profile timeout（含 reasoning 与首 token 等待），
+        #    期间只收到 reasoning 未收到正文/工具输出，超时 → ThinkPhaseTimeoutError。
+        # 正文（content）或工具输出（tool_calls）一旦开始，本轮不再计时（由 httpx read
+        # 超时兜底连接级死等）。
+        _think_timeout = float(kwargs.get("timeout") or 180)
+        _stream_start = time.monotonic()
+        _first_chunk_seen = False
+        _output_started = False
+        _stream_aiter = stream_iter.__aiter__()
+        while True:
+            if not _first_chunk_seen:
+                _wait: Optional[float] = FIRST_TOKEN_TIMEOUT_SECONDS
+            elif not _output_started:
+                _wait = max(0.1, _think_timeout - (time.monotonic() - _stream_start))
+            else:
+                _wait = None
+            try:
+                if _wait is None:
+                    chunk = await _stream_aiter.__anext__()
+                else:
+                    chunk = await asyncio.wait_for(_stream_aiter.__anext__(), timeout=_wait)
+            except asyncio.TimeoutError as _te:
+                if not _first_chunk_seen:
+                    raise FirstTokenTimeoutError(
+                        f"流式首 token 超过 {FIRST_TOKEN_TIMEOUT_SECONDS:.0f}s 未到达，判定上游挂起"
+                    ) from _te
+                raise ThinkPhaseTimeoutError(
+                    f"思考阶段超过 {_think_timeout:.0f}s 未产出正文，判定本轮超时"
+                ) from _te
+            except StopAsyncIteration:
+                break
+            if not _first_chunk_seen:
+                _first_chunk_seen = True
             # provider 以 HTTP 200 在流内下发上游错误（该 chunk 既无 choices 也无 usage）：
             # 若继续静默跳过，本轮会以空内容“成功”返回，上层拿不到任何错误、也不会重试，
             # 表现为机器人一声不吭。抬成异常交由 stream_response 的 except 统一处理。
@@ -1569,6 +1616,9 @@ class TextGenerator(Singleton["TextGenerator"]):
                     last_usage = usage
                 continue
             delta = _get(choices[0], "delta", {})
+            # 正文或工具输出开始 → 思考阶段计时停止（此后不再计本轮超时）
+            if _get(delta, "content") or _get(delta, "tool_calls"):
+                _output_started = True
 
             reasoning = _get(delta, "reasoning_content") or _get(delta, "reasoning") or ""
             if reasoning:
@@ -2844,7 +2894,8 @@ class TextGenerator(Singleton["TextGenerator"]):
                 # 退避 1.5s → 5s；**本轮一旦已有副作用（文字已流出 / 工具已执行 / 已落库）就不重试**，
                 # 否则会重复发消息、重复跑画图。用完次数仍失败才按常规错误上报。
                 if (
-                    is_transient_upstream_error(err_text)
+                    (is_transient_upstream_error(err_text)
+                     or isinstance(e, (FirstTokenTimeoutError, ThinkPhaseTimeoutError)))
                     and _transient_retries < len(_TRANSIENT_RETRY_DELAYS)
                     and not _round_fx["text"]
                     and not _round_fx["tools"]
