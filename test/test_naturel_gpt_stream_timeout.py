@@ -118,6 +118,21 @@ class StreamTimeoutTests(unittest.IsolatedAsyncioTestCase):
         text, _, _ = await tg._stream_once([], "chat", None, None, None)
         self.assertEqual(text, "你好")
 
+    async def test_first_token_retry_budget_override(self):
+        """重试时经 request_state 放宽首 token 预算：默认预算会超时，放宽后成功。"""
+        tg = make_generator()
+        tg._stream_iter_openai = lambda kwargs: scripted_stream([
+            (0.4, chunk(content="来了")),
+        ])()
+        with patch.object(of, "FIRST_TOKEN_TIMEOUT_SECONDS", 0.2):
+            # 默认 0.2s 预算 → 超时
+            with self.assertRaises(of.FirstTokenTimeoutError):
+                await tg._stream_once([], "chat", None, None, None, request_state={})
+            # 重试放宽到 0.6s → 成功
+            state = {"_first_token_timeout": 0.6}
+            text, _, _ = await tg._stream_once([], "chat", None, None, None, request_state=state)
+            self.assertEqual(text, "来了")
+
 
 if __name__ == "__main__":
     unittest.main()

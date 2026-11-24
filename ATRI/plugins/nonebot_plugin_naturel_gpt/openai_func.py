@@ -258,6 +258,8 @@ class ThinkPhaseTimeoutError(RuntimeError):
 
 # 流式首 token 超时（秒）：超过则判定上游挂起，原样重发本轮
 FIRST_TOKEN_TIMEOUT_SECONDS = 30.0
+# 首 token 首次超时后的专属重试预算（秒）：放宽到 60s 原样重发一次，再失败即放弃
+FIRST_TOKEN_RETRY_TIMEOUT_SECONDS = 60.0
 
 # 内容审查拦截的降级阶梯（见 stream_response 的 except 分支）：
 #   ① 保留图片，改走**本群 profile 的 `model_mini`（摘要模型）**重试本轮——审查按上游/路由生效，
@@ -1574,13 +1576,17 @@ class TextGenerator(Singleton["TextGenerator"]):
         # 正文（content）或工具输出（tool_calls）一旦开始，本轮不再计时（由 httpx read
         # 超时兜底连接级死等）。
         _think_timeout = float(kwargs.get("timeout") or 180)
+        # 首 token 预算：默认 30s；超时后 stream_response 会置 request_state 覆盖为 60s 重试一次
+        _first_token_budget = FIRST_TOKEN_TIMEOUT_SECONDS
+        if request_state is not None:
+            _first_token_budget = float(request_state.get("_first_token_timeout") or FIRST_TOKEN_TIMEOUT_SECONDS)
         _stream_start = time.monotonic()
         _first_chunk_seen = False
         _output_started = False
         _stream_aiter = stream_iter.__aiter__()
         while True:
             if not _first_chunk_seen:
-                _wait: Optional[float] = FIRST_TOKEN_TIMEOUT_SECONDS
+                _wait: Optional[float] = _first_token_budget
             elif not _output_started:
                 _wait = max(0.1, _think_timeout - (time.monotonic() - _stream_start))
             else:
@@ -1593,7 +1599,7 @@ class TextGenerator(Singleton["TextGenerator"]):
             except asyncio.TimeoutError as _te:
                 if not _first_chunk_seen:
                     raise FirstTokenTimeoutError(
-                        f"流式首 token 超过 {FIRST_TOKEN_TIMEOUT_SECONDS:.0f}s 未到达，判定上游挂起"
+                        f"流式首 token 超过 {_first_token_budget:.0f}s 未到达，判定上游挂起"
                     ) from _te
                 raise ThinkPhaseTimeoutError(
                     f"思考阶段超过 {_think_timeout:.0f}s 未产出正文，判定本轮超时"
@@ -1900,6 +1906,7 @@ class TextGenerator(Singleton["TextGenerator"]):
         _markup_leak_retries = 0  # 正文泄漏工具调用标记（DSML/XML）后的重试次数（≤1）
         _drop_tools_this_round = False  # 泄漏重试轮：整段去掉 tools（一次性标志，读取后即清零）
         _transient_retries = 0  # 上游瞬时故障（5xx/连接断开）已重试次数，上限 len(_TRANSIENT_RETRY_DELAYS)
+        _first_token_retried = False  # 首 token 超时的专属重试（放宽到 60s）是否已用过
         # 思考泄漏重试（profile `think_leak_retry`，默认仅 kimi 系）：没收到 reasoning_content
         # 却输出了长正文 → 判定思考混进了正文，丢弃本轮文本原样重发一次（整个请求只重发一次）。
         # no_think=true 的 profile 本来就不该回 reasoning，不参与判定；摘要/印象等后台任务也不做
@@ -2893,9 +2900,27 @@ class TextGenerator(Singleton["TextGenerator"]):
                 # 同一轮原样重发即可（messages 未被改动，工具与文本都还没产出）。
                 # 退避 1.5s → 5s；**本轮一旦已有副作用（文字已流出 / 工具已执行 / 已落库）就不重试**，
                 # 否则会重复发消息、重复跑画图。用完次数仍失败才按常规错误上报。
+                # 首 token 超时专属重试：30s 判定上游挂起后，放宽到 60s 原样重发**一次**。
+                # 不走下面的通用瞬时重试、也不叠加次数：60s 还没反应说明上游确实挂着，
+                # 反复排队重发只会把会话拖死。此刻尚无文字/工具副作用，重发安全。
+                if (
+                    isinstance(e, FirstTokenTimeoutError)
+                    and not _first_token_retried
+                    and not _round_fx["text"]
+                    and not _round_fx["tools"]
+                ):
+                    _first_token_retried = True
+                    if request_state is not None:
+                        request_state["_first_token_timeout"] = FIRST_TOKEN_RETRY_TIMEOUT_SECONDS
+                    logger.warning(
+                        f"流式首 token 超时，放宽至 {FIRST_TOKEN_RETRY_TIMEOUT_SECONDS:.0f}s 原样重试一次: {str(e)[:160]}"
+                    )
+                    await asyncio.sleep(_TRANSIENT_RETRY_DELAYS[0])
+                    loop_start += _TRANSIENT_RETRY_DELAYS[0]
+                    continue
                 if (
                     (is_transient_upstream_error(err_text)
-                     or isinstance(e, (FirstTokenTimeoutError, ThinkPhaseTimeoutError)))
+                     or isinstance(e, ThinkPhaseTimeoutError))
                     and _transient_retries < len(_TRANSIENT_RETRY_DELAYS)
                     and not _round_fx["text"]
                     and not _round_fx["tools"]

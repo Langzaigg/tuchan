@@ -71,7 +71,7 @@ data/                                         # 运行数据，勿直接编辑�
 - key 每次从索引 0 开始，仅跳过冷却或本请求已试过的 key；禁止粘性轮询。视觉 key 使用独立 scope。
 - 仅鉴权、额度、限流等 key 级错误（通常 401/402/403/429）顺延；参数错误、超时、上下文或图片问题不得换 key。
 - 瞬时网络/网关故障在当前轮内原样重试，已有文字或工具副作用时不得重试。不要移到 matcher 外层重放整个工具循环。
-- 流式超时两层计时：首 token 30s 无任何 chunk 判上游挂起（`FirstTokenTimeoutError`）；思考阶段保底为 profile `timeout`（含 reasoning，自请求起算），正文或 tool_calls 一开始输出即停表（`ThinkPhaseTimeoutError`）。两者均走瞬时错误原样重试。
+- 流式超时两层计时：首 token 30s 无任何 chunk 判上游挂起（`FirstTokenTimeoutError`），随后放宽到 60s 原样重发**一次**，再失败即放弃；思考阶段保底为 profile `timeout`（含 reasoning，自请求起算），正文或 tool_calls 一开始输出即停表（`ThinkPhaseTimeoutError`，走瞬时错误原样重试）。
 - 异常分类文本必须包含 `e.__class__.__name__`，不能依赖可能为空的 `str(e)`；相关函数有形参 `type`，禁止误写 `type(e)`。
 - 图片 400：公开 URL 直传失败后原位转 base64 一次，再剥图重试；拉图超时可在当前轮静默剥图。网络类图片失败不清理历史。
 - 内容审查依次尝试：同模型关流式 → 换 `model_mini`（保留图）→ 恢复原模型并剥图 → 失败兜底。审查失败不得清上下文。
